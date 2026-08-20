@@ -1,0 +1,268 @@
+package config
+
+// defaultYAML 是内置的默认依赖配置，与仓库根目录 Tools/BuildHelper/deps.yaml 保持一致。
+const defaultYAML = `# ============================================================================
+# EnderEngine BuildHelper 依赖配置
+# 修改本文件后，在 GUI 中点击「重新加载配置」即可生效。
+#
+# 字段说明:
+#   kind        : git(克隆 git 仓库) | archive(下载 release 压缩包) |
+#                 userpath(用户手动构建，工具按路径导入产物)
+#   path        : userpath 类型的构建产物目录（绝对路径，或相对引擎根）
+#   ref         : git 的 tag / 分支 / commit
+#   archiveFile : archive 类型下载后的文件名（用于断点续传/跳过重复下载）
+#   submodules  : 是否需要初始化 git 子模块（如 DiligentEngine / PhysX）
+#   build       : cmake | none（none = 仅同步文件，如头文件库）
+#   sourceSubdir: 仓库内 CMakeLists.txt 所在的子目录（如 PhysX 的 physx）
+#   cmakeOptions: 传给 cmake configure 的额外参数
+#   installMode : cmake（安装到 .work/stage/<name>/<Config>）|
+#                 buildtree（直接从构建目录拷贝产物）
+#   target      : 产物最终放置位置（相对引擎根目录）
+#   layout      : 产物放置规则列表
+#       configs : 适用的构建配置；["*"] 表示只执行一次（archive/头文件库用）
+#       from    : 相对 source 根的源路径（"." 表示整个目录）
+#       to      : 相对引擎根目录的目标路径
+#       pattern : 文件名匹配（filepath.Match 语法），空 = 全部
+#       source  : stage(安装/解压目录) | repo(仓库) | build(构建目录) |
+#                 auto(依次尝试 build、repo)；空 = 按依赖类型自动推断
+# ============================================================================
+
+engine:
+  root: ""                    # 引擎根目录；留空 = 自动推断（BuildHelper 的上级目录）
+  generator: ""               # CMake 生成器；留空 = 自动检测已安装的 VS 版本
+                              #   （如 VS 2022 → "Visual Studio 17 2022"、VS 2026 → "Visual Studio 18 2026"）
+  arch: "x64"
+  configs: ["Debug", "Release"]
+
+tools:
+  git: "git"
+  curl: "curl"
+  cmake: "cmake"
+
+dependencies:
+  # --------------------------------------------------------------------------
+  # ThirdParty
+  # --------------------------------------------------------------------------
+
+  - name: spdlog
+    kind: git
+    url: https://github.com/gabime/spdlog.git
+    ref: v1.17.0
+    build: cmake
+    target: ThirdParty/spdlog
+    cmakeOptions:
+      - -DSPDLOG_BUILD_EXAMPLE=OFF
+      - -DSPDLOG_BUILD_TESTS=OFF
+      - -DSPDLOG_BUILD_BENCH=OFF
+      - -DSPDLOG_BUILD_SHARED=OFF
+    layout:
+      - {configs: ["Debug", "Release"], from: "include", to: "include"}
+      - {configs: ["Debug"], from: "lib", to: "lib"}
+      - {configs: ["Release"], from: "lib", to: "lib"}
+      - {configs: ["Debug", "Release"], from: "LICENSE", to: "LICENSE"}
+      - {configs: ["Debug", "Release"], from: "README.md", to: "README.md"}
+
+  - name: glfw
+    kind: archive
+    url: https://github.com/glfw/glfw/releases/download/3.4/glfw-3.4.bin.WIN64.zip
+    archiveFile: glfw-3.4.bin.WIN64.zip
+    build: none
+    target: ThirdParty/glfw
+    layout:
+      - {configs: ["*"], from: ".", to: ".", source: stage}
+
+  - name: fastgltf
+    kind: git
+    url: https://github.com/spnda/fastgltf.git
+    ref: v0.9.0
+    build: cmake
+    target: ThirdParty/fastgltf
+    # simdjson 依赖：git 子模块在本机不可靠，改用直接下载单头文件到 deps/simdjson
+    fetchFiles:
+      - {url: "https://raw.githubusercontent.com/simdjson/simdjson/master/singleheader/simdjson.h", dest: "deps/simdjson/simdjson.h"}
+      - {url: "https://raw.githubusercontent.com/simdjson/simdjson/master/singleheader/simdjson.cpp", dest: "deps/simdjson/simdjson.cpp"}
+    cmakeOptions:
+      - -DFASTGLTF_COMPILE_AS_CPP20=OFF
+    layout:
+      - {configs: ["Debug", "Release"], from: "include", to: "include"}
+      # Debug/Release 生成的静态库同名（均为 fastgltf.lib），Debug 复制时改名为
+      # fastgltfd.lib 以匹配 xmake 的链接名；缺失路径会自动跳过（兼容已带 d 后缀的版本）。
+      - {configs: ["Debug"], from: "lib/fastgltf.lib", to: "lib/fastgltfd.lib"}
+      - {configs: ["Debug"], from: "lib/fastgltfd.lib", to: "lib/fastgltfd.lib"}
+      - {configs: ["Release"], from: "lib/fastgltf.lib", to: "lib/fastgltf.lib"}
+
+  - name: gtest
+    kind: git
+    url: https://github.com/google/googletest.git
+    ref: release-1.11.0
+    build: cmake
+    target: ThirdParty/gtest
+    cmakeOptions:
+      - -Dgtest_force_shared_crt=ON
+    layout:
+      - {configs: ["Debug", "Release"], from: "include", to: "include"}
+      - {configs: ["Debug"], from: "lib", to: "lib"}
+      - {configs: ["Release"], from: "lib", to: "lib"}
+
+  - name: FreeType
+    kind: git
+    url: https://github.com/freetype/freetype.git
+    ref: VER-2-14-3
+    build: cmake
+    target: ThirdParty/FreeType
+    cmakeOptions:
+      - -DBUILD_SHARED_LIBS=ON
+    layout:
+      - {configs: ["Debug", "Release"], from: "include", to: "include"}
+      - {configs: ["Debug"], from: "lib", to: "lib"}
+      - {configs: ["Release"], from: "lib", to: "lib"}
+      - {configs: ["Debug"], from: "bin", to: "bin"}
+      - {configs: ["Release"], from: "bin", to: "bin"}
+
+  - name: libspng
+    kind: git
+    url: https://github.com/randy408/libspng.git
+    ref: v0.7.4
+    build: cmake
+    target: ThirdParty/libspng
+    cmakeOptions:
+      - -DSPNG_STATIC=ON
+      - -DSPNG_SHARED=ON
+      - -DSPNG_BUILD_EXAMPLES=OFF
+    layout:
+      - {configs: ["Debug", "Release"], from: "include", to: "include"}
+      - {configs: ["Debug"], from: "lib", to: "lib/Debug"}
+      - {configs: ["Release"], from: "lib", to: "lib/Release"}
+      - {configs: ["Debug"], from: "bin", to: "bin/Debug"}
+      - {configs: ["Release"], from: "bin", to: "bin/Release"}
+      - {configs: ["Debug", "Release"], from: "LICENSE", to: "LICENSE"}
+      - {configs: ["Debug", "Release"], from: "README.md", to: "README.md"}
+      - {configs: ["Debug", "Release"], from: "SECURITY.md", to: "SECURITY.md"}
+      - {configs: ["Debug", "Release"], from: "docs", to: "docs"}
+
+  - name: EnderVFiles
+    kind: git
+    url: https://github.com/sally4953/EnderVFiles.git
+    ref: main
+    build: cmake
+    target: ThirdParty/EnderVFiles
+    cmakeOptions: []
+    layout:
+      - {configs: ["Debug", "Release"], from: "include", to: "include"}
+      - {configs: ["Debug"], from: "bin", to: "bin"}
+      - {configs: ["Release"], from: "bin", to: "bin"}
+      - {configs: ["Debug", "Release"], from: "LICENSE", to: "LICENSE"}
+      - {configs: ["Debug", "Release"], from: "README.md", to: "README.md"}
+
+  - name: cxxopts
+    kind: git
+    url: https://github.com/jarro2783/cxxopts.git
+    ref: v3.3.1
+    build: none
+    target: ThirdParty/cxxopts
+    layout:
+      - {configs: ["*"], from: ".", to: ".", source: repo}
+
+  - name: glm
+    kind: git
+    url: https://github.com/g-truc/glm.git
+    ref: 1.1.0
+    build: none
+    target: ThirdParty/glm
+    layout:
+      - {configs: ["*"], from: ".", to: ".", source: repo}
+
+  - name: stb
+    kind: git
+    url: https://github.com/nothings/stb.git
+    ref: master
+    build: none
+    target: ThirdParty/stb
+    layout:
+      - {configs: ["*"], from: ".", to: ".", source: repo}
+
+  - name: uuid_v4
+    kind: git
+    url: https://github.com/crashoz/uuid_v4.git
+    ref: master
+    build: none
+    target: ThirdParty/uuid_v4
+    layout:
+      - {configs: ["*"], from: ".", to: ".", source: repo}
+
+  # --------------------------------------------------------------------------
+  # Backends
+  # --------------------------------------------------------------------------
+
+  # DiligentEngine 使用官方 Release 完整工程 zip（含 ThirdParty 子模块源码），
+  # 避免 github.com 受限时 git clone 卡死；下载后直接 cmake 构建。
+  # 若网络受限下载失败：手动把 zip 放到 .work/downloads/DiligentEngine_v2.5.6.zip 后重试（已存在则跳过下载）。
+  # layout: Debug/Release 复制的是 cmake 安装产物（.work/stage/DiligentEngine/<Config>，
+  # 内部已按 Debug/RELEASE 分目录），NvApi/Licenses/README/LICENSE 等从解压源码复制。
+  - name: DiligentEngine
+    kind: archive
+    url: https://github.com/DiligentGraphics/DiligentEngine/releases/download/v2.5.6/DiligentEngine_v2.5.6.zip
+    archiveFile: DiligentEngine_v2.5.6.zip
+    build: cmake
+    target: Backends/DiligentEngine
+    cleanTarget: true           # 同步前清空目标目录（避免混入解压源码等杂物）
+    cmakeOptions:
+      - -DDILIGENT_BUILD_TESTS=OFF
+      - -DDILIGENT_BUILD_SAMPLES=OFF
+      - -DDILIGENT_BUILD_DEMOS=OFF
+      - -DDILIGENT_BUILD_TOOLS=ON
+      - -DDILIGENT_BUILD_FX=ON
+      - -DDILIGENT_INSTALL=ON
+      - -DDILIGENT_NO_FORMAT_VALIDATION=ON
+    layout:
+      - {configs: ["Debug"], from: ".", to: "."}
+      - {configs: ["Release"], from: ".", to: "."}
+      - {configs: ["*"], from: "ThirdParty/NvApi", to: "lib/NvApi", source: repo}
+      - {configs: ["*"], from: "Licenses", to: "Licenses", source: repo}
+      - {configs: ["*"], from: "LICENSE.txt", to: "LICENSE.txt", source: repo}
+      - {configs: ["*"], from: "ThirdPartyNOTICES.txt", to: "ThirdPartyNOTICES.txt", source: repo}
+      - {configs: ["*"], from: "README.md", to: "README.md", source: repo}
+      # Diligent-Imgui.lib 不随 cmake install 安装，需从构建树直接复制
+      # （Debug/Release 同名，按目录区分）
+      - {configs: ["Debug"], from: "DiligentTools/Imgui/Debug/Diligent-Imgui.lib", to: "lib/DiligentTools/Debug/Diligent-Imgui.lib", source: build}
+      - {configs: ["Release"], from: "DiligentTools/Imgui/Release/Diligent-Imgui.lib", to: "lib/DiligentTools/RELEASE/Diligent-Imgui.lib", source: build}
+
+  # PhysX 5 使用官方 generate_projects.bat 流程由用户手动构建
+  # （需修改编译器配置以支持 VS 18 2026；静态库注意 /MD(Release) /MDd(Debug)）。
+  # 构建完成后在 GUI 中选中 PhysX →「选择路径…」→ 选择 PhysX 仓库根目录，
+  # 工具将按 layout 规则把产物复制到 Backends/PhysX。
+  # 目录结构若与下方规则不同，可自行修改 layout 的 from。
+  - name: PhysX
+    kind: userpath
+    path: ""
+    target: Backends/PhysX
+    layout:
+      - {configs: ["*"], from: "include", to: "include"}
+      - {configs: ["*"], from: "pvdruntime/include", to: "pvdruntime/include"}
+      - {configs: ["*"], from: "bin/win.x86_64.vc143.md/debug", to: "bin/win.x86_64.vc143.md/debug"}
+      - {configs: ["*"], from: "bin/win.x86_64.vc143.md/release", to: "bin/win.x86_64.vc143.md/release"}
+
+  - name: OIS
+    kind: git
+    url: https://github.com/wgois/OIS.git
+    ref: master
+    build: cmake
+    target: Backends/OIS
+    cmakeOptions:
+      - -DOIS_BUILD_DEMOS=OFF
+    layout:
+      - {configs: ["Debug", "Release"], from: "include", to: "include"}
+      - {configs: ["Debug"], from: "bin", to: "bin"}
+      - {configs: ["Release"], from: "bin", to: "bin"}
+      - {configs: ["Debug"], from: "lib", to: "lib"}
+      - {configs: ["Release"], from: "lib", to: "lib"}
+
+  - name: SteamAudio
+    kind: archive
+    url: https://github.com/ValveSoftware/steam-audio/releases/download/v4.8.1/steam-audio-4.8.1-windows.zip
+    archiveFile: steam-audio-4.8.1-windows.zip
+    build: none
+    target: Backends/SteamAudio
+    layout:
+      - {configs: ["*"], from: ".", to: ".", source: stage}
+`

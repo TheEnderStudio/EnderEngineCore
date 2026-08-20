@@ -1,0 +1,11 @@
+.xmake/
+Backends/
+Binary/
+build/
+Object/
+ThirdParty/
+Tools/BuildHelper/.work
+Tools/BuildHelper/BuildHelper.exe
+Tools/BuildHelper/go.sum
+vsxmake2026/
+compile_commands.json
