@@ -8,16 +8,17 @@ EnderEngineCore is a library that capsulates a set of low-level APIs and has som
 **This version doesn't have pre-compiled release at present, so you need to build from source.**
 
 ### Before Building
-You need to comfirm that you have installed the following items:
-- Microsoft Visual Studio 18 2026
-- MinGW (for CGO)
-- Xmake
-- CMake
-- zlib (Can be recognized by CMake)
-- OpenSSL (Can be recognized by CMake)
-- Golang
-- Git
-- PhysX 5.6.1
+**Please ensure that there is at least 25GB of space available on the disk you are using.**
+You need to confirm that you have installed the following items:
+- Microsoft Visual Studio 18 2026 `https://visualstudio.microsoft.com/downloads/`
+- MinGW (for CGO) `https://www.mingw-w64.org/downloads/`
+- Xmake `https://github.com/xmake-io/xmake/`
+- CMake `https://cmake.org/download/`
+- zlib (Can be recognized by CMake) `https://github.com/madler/zlib`
+- OpenSSL (Can be recognized by CMake) `https://github.com/openssl/openssl`
+- Golang `https://go.dev/dl/`
+- Git `https://git-scm.com/install/`
+- PhysX 5.6.1 `https://github.com/NVIDIA-Omniverse/PhysX`
 ### Building
 Clone first:
 ```cmd
@@ -79,21 +80,21 @@ This project is under MIT license, see `LICENSE` for more details.
 ## The Use of Third-Party Libraries
 
 This project utilizes the following third-party libraries:
-- Diligent Engine `https://github.com/DiligentGraphics/DiligentEngine`
-- OIS `https://github.com/wgois/OIS`
-- PhysX `https://github.com/NVIDIA-Omniverse/PhysX`
-- SteamAudio `https://github.com/ValveSoftware/steam-audio`
-- cxxopts `https://github.com/jarro2783/cxxopts`
-- EnderVFiles `https://github.com/sally4953/EnderVFiles`
-- fastgltf `https://github.com/spnda/fastgltf`
-- FreeType `https://github.com/freetype/freetype`
-- glfw `https://github.com/glfw/glfw`
-- glm `https://github.com/g-truc/glm`
-- gtest `https://github.com/google/googletest`
-- libspng `https://github.com/randy408/libspng`
-- spdlog `https://github.com/gabime/spdlog`
-- stb `https://github.com/nothings/stb`
-- uuid_v4 `https://github.com/crashoz/uuid_v4`
+- Diligent Engine `https://github.com/DiligentGraphics/DiligentEngine` (Apache-2.0 license)
+- OIS `https://github.com/wgois/OIS` (Zlib license)
+- PhysX `https://github.com/NVIDIA-Omniverse/PhysX` (BSD-3-Claude license)
+- SteamAudio `https://github.com/ValveSoftware/steam-audio` (Apache-2.0 license)
+- cxxopts `https://github.com/jarro2783/cxxopts` (MIT license)
+- EnderVFiles `https://github.com/sally4953/EnderVFiles` (MIT license)
+- fastgltf `https://github.com/spnda/fastgltf` (MIT license)
+- FreeType `https://github.com/freetype/freetype` (FreeType License)
+- glfw `https://github.com/glfw/glfw` (Zlib license)
+- glm `https://github.com/g-truc/glm` (MIT license)
+- gtest `https://github.com/google/googletest` (BSD-3-Claude license)
+- libspng `https://github.com/randy408/libspng` (BSD-2-Claude license)
+- spdlog `https://github.com/gabime/spdlog` (MIT license)
+- stb `https://github.com/nothings/stb` (MIT license)
+- uuid_v4 `https://github.com/crashoz/uuid_v4` (MIT license)
 
 ### Third-Party Licenses
 See `ThirdPartyLicenses.txt` for more details.
