@@ -34,12 +34,12 @@ TextureSRV ShadowSubsystem::getSRV() const { return m_impl->mgr.GetSRV(); }
 TextureDSV ShadowSubsystem::getCascadeDSV(UInt32 c) const { return m_impl->mgr.GetCascadeDSV(c); }
 
 Mat4 ShadowSubsystem::getCascadeTransform(UInt32 c) const {
-	const auto& xf = m_impl->mgr.GetCascadeTransform(c).WorldToLightProjSpace;
+	const auto& xf = m_impl->mgr.GetCascadeTranform(c).WorldToLightProjSpace;
 	return *reinterpret_cast<const Mat4*>(&xf);
 }
 
 Mat4 ShadowSubsystem::getWorldToShadowMapUVDepth(UInt32 ci) const {
-	const auto& xf = m_impl->mgr.GetCascadeTransform(ci).WorldToLightProjSpace;
+	const auto& xf = m_impl->mgr.GetCascadeTranform(ci).WorldToLightProjSpace;
 	Mat4 wlp = *reinterpret_cast<const Mat4*>(&xf);
 	Mat4 p2uv = Mat4(1.0f);
 	p2uv[0][0] = 0.5f; p2uv[1][1] = -0.5f; p2uv[2][2] = 1.0f;
