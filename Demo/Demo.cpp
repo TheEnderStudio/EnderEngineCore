@@ -1040,19 +1040,19 @@ HALT
 				compute.updateBuffer(argsBuf, argsTmpl, sizeof(argsTmpl));
 				compute.updateCullingCB(cullCBBuf, fp, 1000,
 					argsTmpl[0].indexCount, argsTmpl[0].firstIndex, argsTmpl[0].baseVertex);
-			}
-			// Clear counter before dispatch
-			{ UInt32 zero = 0; compute.updateBuffer(counterBuf, &zero, sizeof(zero)); }
-			compute.dispatchCullingCompact(cullInstBuf, cullCBBuf, cullVisBuf, indicesBuf, counterBuf, 1000);
-			// Copy instanceCount to all mesh entries
-			{
-				UInt32 visCount = 0;
-				compute.readback(cullStgBuf, counterBuf, sizeof(UInt32), &visCount);
-				gpuVisCount = visCount;
-				for (size_t mi = 0; mi < model.size() && mi < 8; mi++) {
-					argsTmpl[mi].instanceCount = visCount;
+				// Clear counter before dispatch
+				{ UInt32 zero = 0; compute.updateBuffer(counterBuf, &zero, sizeof(zero)); }
+				compute.dispatchCullingCompact(cullInstBuf, cullCBBuf, cullVisBuf, indicesBuf, counterBuf, 1000);
+				// Copy instanceCount to all mesh entries
+				{
+					UInt32 visCount = 0;
+					compute.readback(cullStgBuf, counterBuf, sizeof(UInt32), &visCount);
+					gpuVisCount = visCount;
+					for (size_t mi = 0; mi < model.size() && mi < 8; mi++) {
+						argsTmpl[mi].instanceCount = visCount;
+					}
+					compute.updateBuffer(argsBuf, argsTmpl, sizeof(argsTmpl));
 				}
-				compute.updateBuffer(argsBuf, argsTmpl, sizeof(argsTmpl));
 			}
 			for (size_t mi = 0; mi < model.size(); mi++)
 				renderer.drawMeshInstancedIndirect(model[mi], wmSRV, idxSRV, argsBuf, static_cast<UInt32>(mi * sizeof(IndirectDrawArgs)));

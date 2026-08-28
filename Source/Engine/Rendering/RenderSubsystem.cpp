@@ -490,6 +490,7 @@ struct RenderSubsystem::RenderBackend {
 	UInt8 msaaSamples = 1;
 	// Ray tracing device feature request + reported capabilities.
 	bool requestRayTracing = true;
+	bool rtFeatureEnabled = false; ///< Whether the device actually enabled the ray tracing feature.
 	RayTracingCaps rtCaps = RayTracingCaps::None;
 	UInt32 rtMaxRecursionDepth = 0;
 	UInt32 rtMaxInstancesPerTLAS = 0;
@@ -586,7 +587,9 @@ struct RenderSubsystem::RenderBackend {
 
 		// Read ray tracing capabilities reported by the created device.
 		{
-			const auto& rt = device->GetAdapterInfo().RayTracing;
+			const auto& adapter = device->GetAdapterInfo();
+			const auto& rt = adapter.RayTracing;
+			rtFeatureEnabled = (adapter.Features.RayTracing == D::DEVICE_FEATURE_STATE_ENABLED);
 			rtCaps = static_cast<RayTracingCaps>(static_cast<UInt8>(rt.CapFlags));
 			rtMaxRecursionDepth = rt.MaxRecursionDepth;
 			rtMaxInstancesPerTLAS = rt.MaxInstancesPerTLAS;
@@ -1021,9 +1024,10 @@ struct RenderSubsystem::RenderBackend {
 		auto a = meshes.allocate(); auto* dd = meshes.getUnchecked(a.index);
 		dd->vc = (UInt32)d.vertices.size(); dd->ic = (UInt32)d.indices.size(); dd->sub = d.subMeshes;
 		dd->cpuVertices = d.vertices; dd->cpuIndices = d.indices;
-		// BIND_RAY_TRACING allows the buffers to be read during BLAS build operations.
-		{ D::BufferDesc bd; bd.Name = "VB"; bd.Size = d.vertices.size() * sizeof(Vertex); bd.BindFlags = D::BIND_VERTEX_BUFFER | D::BIND_RAY_TRACING; bd.Usage = D::USAGE_IMMUTABLE; D::BufferData bdata; bdata.pData = d.vertices.data(); bdata.DataSize = bd.Size; D::RefCntAutoPtr<D::IBuffer> b; device->CreateBuffer(bd, &bdata, &b); if (!b) return RenderError::BufferCreationFailed; dd->vb = std::move(b); }
-		{ D::BufferDesc bd; bd.Name = "IB"; bd.Size = d.indices.size() * sizeof(UInt32); bd.BindFlags = D::BIND_INDEX_BUFFER | D::BIND_RAY_TRACING; bd.Usage = D::USAGE_IMMUTABLE; D::BufferData bdata; bdata.pData = d.indices.data(); bdata.DataSize = bd.Size; D::RefCntAutoPtr<D::IBuffer> b; device->CreateBuffer(bd, &bdata, &b); if (!b) return RenderError::BufferCreationFailed; dd->ib = std::move(b); }
+		// BIND_RAY_TRACING allows the buffers to be read during BLAS build operations,
+		// but is only valid when the ray tracing device feature is enabled.
+		{ D::BufferDesc bd; bd.Name = "VB"; bd.Size = d.vertices.size() * sizeof(Vertex); bd.BindFlags = D::BIND_VERTEX_BUFFER; if (rtFeatureEnabled) bd.BindFlags |= D::BIND_RAY_TRACING; bd.Usage = D::USAGE_IMMUTABLE; D::BufferData bdata; bdata.pData = d.vertices.data(); bdata.DataSize = bd.Size; D::RefCntAutoPtr<D::IBuffer> b; device->CreateBuffer(bd, &bdata, &b); if (!b) return RenderError::BufferCreationFailed; dd->vb = std::move(b); }
+		{ D::BufferDesc bd; bd.Name = "IB"; bd.Size = d.indices.size() * sizeof(UInt32); bd.BindFlags = D::BIND_INDEX_BUFFER; if (rtFeatureEnabled) bd.BindFlags |= D::BIND_RAY_TRACING; bd.Usage = D::USAGE_IMMUTABLE; D::BufferData bdata; bdata.pData = d.indices.data(); bdata.DataSize = bd.Size; D::RefCntAutoPtr<D::IBuffer> b; device->CreateBuffer(bd, &bdata, &b); if (!b) return RenderError::BufferCreationFailed; dd->ib = std::move(b); }
 		return MeshHandle{ a.index, a.generation };
 	}
 
@@ -1542,7 +1546,7 @@ Result<MaterialHandle, RenderError> RenderSubsystem::createMaterial(const Materi
 Result<BLASHandle, RenderError> RenderSubsystem::createBLAS(MeshHandle mesh) {
 	auto& b = *m_backend;
 	if (!b.ok) return RenderError::NotInitialized;
-	if (b.rtCaps == RayTracingCaps::None) { EError("createBLAS: ray tracing is not available on this device."); return RenderError::OperationFailed; }
+	if (!b.rtFeatureEnabled || b.rtCaps == RayTracingCaps::None) { EError("createBLAS: ray tracing is not available on this device."); return RenderError::OperationFailed; }
 	auto* md = b.meshes.get(mesh.index, mesh.generation);
 	if (!md || !md->vb || !md->ib || md->ic == 0) return RenderError::InvalidHandle;
 
@@ -1607,7 +1611,7 @@ Result<BLASHandle, RenderError> RenderSubsystem::createBLAS(MeshHandle mesh) {
 Result<TLASHandle, RenderError> RenderSubsystem::createTLAS(UInt32 maxInstances, bool allowUpdate) {
 	auto& b = *m_backend;
 	if (!b.ok) return RenderError::NotInitialized;
-	if (b.rtCaps == RayTracingCaps::None) { EError("createTLAS: ray tracing is not available on this device."); return RenderError::OperationFailed; }
+	if (!b.rtFeatureEnabled || b.rtCaps == RayTracingCaps::None) { EError("createTLAS: ray tracing is not available on this device."); return RenderError::OperationFailed; }
 	if (maxInstances == 0) return RenderError::InvalidArgument;
 
 	D::TopLevelASDesc td;
