@@ -341,6 +341,57 @@ float4 main(PSIn i) : SV_TARGET
 }
 )";
 
+// G-buffer pixel shader: writes albedo (SV_Target0) and world normal (SV_Target1).
+// g_ShadowMap is declared (but unused) so the resource layout matches the PBR PSOs.
+static const char* g_PS_GBuffer = R"(
+Texture2D    t_BC         : register(t0);
+SamplerState t_BC_sampler : register(s0);
+Texture2DArray g_ShadowMap        : register(t4);
+SamplerComparisonState g_ShadowMap_sampler : register(s4);
+
+cbuffer Frame : register(b0)
+{
+    float4x4 g_ViewProj;
+    float4   g_CameraPos;
+    float4   g_Ambient;
+    uint     g_LightCount;
+    float    _p0;
+    float    _p1;
+    float    _p2;
+    float4x4 g_ShadowMapUVDepth[4]; float4 g_CascadeSplits;
+};
+
+cbuffer Object : register(b2)
+{
+    float4x4 g_World;
+    float4x4 g_Normal;
+    float4   g_BaseColor;
+    float4   g_MetallicRough;
+};
+
+struct PSIn
+{
+    float4 Pos : SV_POSITION;
+    float3 WP  : TEXCOORD0;
+    float3 N   : TEXCOORD1;
+    float2 UV  : TEXCOORD2;
+};
+
+struct PSOut
+{
+    float4 Color : SV_Target0; ///< Albedo (RGBA8_SRGB).
+    float4 Norm  : SV_Target1; ///< World normal in [-1,1] (RGBA16_FLOAT).
+};
+
+PSOut main(PSIn i)
+{
+    PSOut o;
+    o.Color = t_BC.Sample(t_BC_sampler, i.UV) * g_BaseColor;
+    o.Norm  = float4(normalize(i.N), 0.0);
+    return o;
+}
+)";
+
 // ===================================================================
 // Conversion helpers
 // ===================================================================
@@ -355,6 +406,7 @@ static D::TEXTURE_FORMAT toDFmt(TextureFormat f) {
 	case TextureFormat::RG8_UNorm: return D::TEX_FORMAT_RG8_UNORM;
 	case TextureFormat::R32_Float: return D::TEX_FORMAT_R32_FLOAT;
 	case TextureFormat::RG32_Float: return D::TEX_FORMAT_RG32_FLOAT;
+	case TextureFormat::RGBA16_Float: return D::TEX_FORMAT_RGBA16_FLOAT;
 	case TextureFormat::RGBA32_Float: return D::TEX_FORMAT_RGBA32_FLOAT;
 	case TextureFormat::D32_Float: return D::TEX_FORMAT_D32_FLOAT;
 	case TextureFormat::D24_UNorm_S8_UInt: return D::TEX_FORMAT_D24_UNORM_S8_UINT;
@@ -392,15 +444,6 @@ static D::TEXTURE_ADDRESS_MODE toDAddr(AddressMode m) {
 	switch (m) { case AddressMode::Wrap: return D::TEXTURE_ADDRESS_WRAP; case AddressMode::Mirror: return D::TEXTURE_ADDRESS_MIRROR; case AddressMode::Clamp: return D::TEXTURE_ADDRESS_CLAMP; case AddressMode::Border: return D::TEXTURE_ADDRESS_BORDER; } return D::TEXTURE_ADDRESS_WRAP;
 }
 
-// Convert a glm (column-major) Mat4 to a Diligent row-major float4x4.
-static D::float4x4 toDiligentMatrix(const Mat4& m) {
-	D::float4x4 r;
-	for (int row = 0; row < 4; ++row)
-		for (int col = 0; col < 4; ++col)
-			r[row][col] = m[col][row];
-	return r;
-}
-
 // ===================================================================
 // Diligent Engine Callbacks
 // ===================================================================
@@ -431,14 +474,12 @@ static void DILIGENT_CALL_TYPE DiligentDebugMsgCallback(enum D::DEBUG_MESSAGE_SE
 struct ShaderData { D::RefCntAutoPtr<D::IShader> shader; ShaderStage stage = ShaderStage::Vertex; };
 struct PSOData { D::RefCntAutoPtr<D::IPipelineState> pso; D::RefCntAutoPtr<D::IShaderResourceBinding> srb; PipelineStateDesc desc; };
 struct MeshData { D::RefCntAutoPtr<D::IBuffer> vb; D::RefCntAutoPtr<D::IBuffer> ib; UInt32 vc = 0; UInt32 ic = 0; Vector<SubMesh> sub; Vector<Vertex> cpuVertices; Vector<UInt32> cpuIndices; };
-struct TexData { D::RefCntAutoPtr<D::ITexture> tex; D::RefCntAutoPtr<D::ITextureView> srv; TextureDesc desc; };
+struct TexData { D::RefCntAutoPtr<D::ITexture> tex; D::RefCntAutoPtr<D::ITextureView> srv; D::RefCntAutoPtr<D::ITextureView> rtv; D::RefCntAutoPtr<D::ITextureView> uav; D::RefCntAutoPtr<D::ITextureView> dsv; TextureDesc desc; };
 struct SamplerData { D::RefCntAutoPtr<D::ISampler> sampler; SamplerDesc desc; };
-struct MatData { MaterialDesc desc; PSOHandle pso; D::RefCntAutoPtr<D::IShaderResourceBinding> srb; D::RefCntAutoPtr<D::IBuffer> objCB; };
+struct MatData { MaterialDesc desc; PSOHandle pso; D::RefCntAutoPtr<D::IShaderResourceBinding> srb; D::RefCntAutoPtr<D::IShaderResourceBinding> gbufSRB; D::RefCntAutoPtr<D::IBuffer> objCB; };
 struct CamData { CameraDesc desc; Mat4 view; Mat4 proj; F32 aspect = 16.0f / 9.0f; };
 struct RenderLightData { LightDesc desc; };
 struct ModelData { ModelLoadResult result; };
-struct BLASData { D::RefCntAutoPtr<D::IBottomLevelAS> blas; MeshHandle sourceMesh; };
-struct TLASData { D::RefCntAutoPtr<D::ITopLevelAS> tlas; D::RefCntAutoPtr<D::IBuffer> scratch; D::RefCntAutoPtr<D::IBuffer> instanceBuf; UInt32 maxInstances = 0; bool allowUpdate = true; bool built = false; };
 
 // ===================================================================
 // RenderBackend
@@ -463,13 +504,10 @@ struct RenderSubsystem::RenderBackend {
 	Detail::ResourcePool<CamData>          cameras{ 16 };
 	Detail::ResourcePool<RenderLightData>  lights{ 16 };
 	Detail::ResourcePool<ModelData>        models{ 128 };
-	Detail::ResourcePool<BLASData>         blases{ 4096 };
-	Detail::ResourcePool<TLASData>         tlases{ 8 };
-	D::RefCntAutoPtr<D::IBuffer> blasScratch; ///< Reusable scratch buffer for BLAS builds.
 	Mutex m_loadMutex; ///< Serializes async model loading (pool + GPU resource creation)
 
-	ShaderHandle  defVS, defPS, defVS_Inst, defVS_Indirect, defVS_ShadowIndirect, bboardVS, bboardPS, skyVS, skyPS, skyCubePS;
-	PSOHandle     defPSO, defPSO_wire, defPSO_Inst, defPSO_Inst_wire, defPSO_Indirect, defPSO_ShadowIndirect, bboardPSO, skyPSO, skyCubePSO, shadowPSO;
+	ShaderHandle  defVS, defPS, defVS_Inst, defVS_Indirect, defVS_ShadowIndirect, bboardVS, bboardPS, skyVS, skyPS, skyCubePS, gbufPS;
+	PSOHandle     defPSO, defPSO_wire, defPSO_Inst, defPSO_Inst_wire, defPSO_Indirect, defPSO_ShadowIndirect, bboardPSO, skyPSO, skyCubePSO, shadowPSO, gbufPSO, gbufPSO_Inst;
 	SamplerHandle defSamp, bboardSamp;
 	TextureHandle defTex, fogTex;
 	MeshHandle    bboardMesh;
@@ -487,6 +525,7 @@ struct RenderSubsystem::RenderBackend {
 
 	D::RefCntAutoPtr<D::IBuffer> frameCB, lightCB, instanceCB, bboardVB, bboardIB;
 	UInt64 fn = 0; UInt32 dc = 0; bool ok = false; bool wireframe = false;
+	bool gBufferActive = false; ///< When true, draw()/drawInstanced() write the G-buffer instead of shaded color.
 	UInt8 msaaSamples = 1;
 	// Ray tracing device feature request + reported capabilities.
 	bool requestRayTracing = true;
@@ -620,6 +659,19 @@ struct RenderSubsystem::RenderBackend {
 		{ PipelineStateDesc pd; pd.name = "WirePSO"; pd.vs = defVS; pd.ps = defPS; pd.rasterizer.fillMode = FillMode::Wireframe; auto r = mkPSO(pd); if (r.isErr()) return r.error(); defPSO_wire = r.value(); }
 		{ PipelineStateDesc pd; pd.name = "InstPSO"; pd.vs = defVS_Inst; pd.ps = defPS; auto r = mkPSO(pd, true); if (r.isErr()) return r.error(); defPSO_Inst = r.value(); }
 		{ PipelineStateDesc pd; pd.name = "InstWirePSO"; pd.vs = defVS_Inst; pd.ps = defPS; pd.rasterizer.fillMode = FillMode::Wireframe; auto r = mkPSO(pd, true); if (r.isErr()) return r.error(); defPSO_Inst_wire = r.value(); }
+		// G-buffer shaders + PSOs (hybrid ray tracing): MRT albedo + world normal, non-MSAA.
+		{
+			ShaderDesc sd; sd.stage = ShaderStage::Pixel; sd.source = g_PS_GBuffer;
+			auto r = mkShader(sd); if (r.isErr()) return r.error(); gbufPS = r.value();
+		}
+		{
+			PipelineStateDesc pd; pd.name = "GBufPSO"; pd.vs = defVS; pd.ps = gbufPS;
+			auto r = mkPSO(pd, false, true); if (r.isErr()) return r.error(); gbufPSO = r.value();
+		}
+		{
+			PipelineStateDesc pd; pd.name = "GBufInstPSO"; pd.vs = defVS_Inst; pd.ps = gbufPS;
+			auto r = mkPSO(pd, true, true); if (r.isErr()) return r.error(); gbufPSO_Inst = r.value();
+		}
 		// Indirect instanced PSO (world matrices from StructuredBuffer t5, indices from t6)
 		{
 			auto* vs = shaders.get(defVS_Indirect.index, defVS_Indirect.generation);
@@ -952,14 +1004,17 @@ struct RenderSubsystem::RenderBackend {
 		return ShaderHandle{ a.index, a.generation };
 	}
 
-	Result<PSOHandle, RenderError> mkPSO(const PipelineStateDesc& d, bool instanced = false) {
+	Result<PSOHandle, RenderError> mkPSO(const PipelineStateDesc& d, bool instanced = false, bool gbuffer = false) {
 		auto* vs = shaders.get(d.vs.index, d.vs.generation); auto* ps = shaders.get(d.ps.index, d.ps.generation);
 		if (!vs || !ps) return RenderError::InvalidHandle;
 		D::GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = d.name.c_str(); ci.PSODesc.PipelineType = D::PIPELINE_TYPE_GRAPHICS;
-			ci.pVS = vs->shader; ci.pPS = ps->shader; ci.GraphicsPipeline.NumRenderTargets = 1;
-			ci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA8_UNORM_SRGB; ci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
-			ci.GraphicsPipeline.SmplDesc.Count = msaaSamples;
-		ci.GraphicsPipeline.SmplDesc.Count = msaaSamples;
+			ci.pVS = vs->shader; ci.pPS = ps->shader;
+			ci.GraphicsPipeline.NumRenderTargets = gbuffer ? 2 : 1;
+			ci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA8_UNORM_SRGB;
+			if (gbuffer) ci.GraphicsPipeline.RTVFormats[1] = D::TEX_FORMAT_RGBA16_FLOAT;
+			ci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
+			// G-buffer pass uses non-MSAA targets (read back by the ray tracing compute shader).
+			ci.GraphicsPipeline.SmplDesc.Count = gbuffer ? 1 : msaaSamples;
 		ci.GraphicsPipeline.PrimitiveTopology = toDTopo(d.topology);
 		ci.GraphicsPipeline.RasterizerDesc.FillMode = toDFill(d.rasterizer.fillMode);
 		ci.GraphicsPipeline.RasterizerDesc.CullMode = toDCull(d.rasterizer.cullMode);
@@ -1032,10 +1087,20 @@ struct RenderSubsystem::RenderBackend {
 	}
 
 	Result<TextureHandle, RenderError> mkTex(const TextureDesc& d) {
-		D::TextureDesc td; td.Name = "Tex"; td.Type = D::RESOURCE_DIM_TEX_2D; td.Width = d.w; td.Height = d.h; td.Format = toDFmt(d.fmt); td.MipLevels = d.mipLevels; td.BindFlags = D::BIND_SHADER_RESOURCE; td.Usage = D::USAGE_IMMUTABLE;
+		const bool renderTargetLike = d.asRenderTarget || d.asUAV || d.asDepthStencil;
+		D::TextureDesc td; td.Name = "Tex"; td.Type = D::RESOURCE_DIM_TEX_2D; td.Width = d.w; td.Height = d.h; td.Format = toDFmt(d.fmt); td.MipLevels = d.mipLevels;
+		td.BindFlags = D::BIND_SHADER_RESOURCE;
+		if (d.asRenderTarget) td.BindFlags |= D::BIND_RENDER_TARGET;
+		if (d.asUAV) td.BindFlags |= D::BIND_UNORDERED_ACCESS;
+		if (d.asDepthStencil) td.BindFlags |= D::BIND_DEPTH_STENCIL;
+		td.Usage = renderTargetLike ? D::USAGE_DEFAULT : D::USAGE_IMMUTABLE;
 		D::TextureSubResData srd; srd.pData = d.data; srd.Stride = d.w * 4; D::TextureData tdata; tdata.pSubResources = d.data ? &srd : nullptr; tdata.NumSubresources = d.data ? 1 : 0;
 		D::RefCntAutoPtr<D::ITexture> t; device->CreateTexture(td, d.data ? &tdata : nullptr, &t); if (!t) return RenderError::TextureCreationFailed;
-		auto a = textures.allocate(); auto* dd = textures.getUnchecked(a.index); dd->tex = std::move(t); dd->srv = dd->tex->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE); dd->desc = d;
+		auto a = textures.allocate(); auto* dd = textures.getUnchecked(a.index); dd->tex = std::move(t); dd->desc = d;
+		dd->srv = dd->tex->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
+		if (d.asRenderTarget) dd->rtv = dd->tex->GetDefaultView(D::TEXTURE_VIEW_RENDER_TARGET);
+		if (d.asUAV) dd->uav = dd->tex->GetDefaultView(D::TEXTURE_VIEW_UNORDERED_ACCESS);
+		if (d.asDepthStencil) dd->dsv = dd->tex->GetDefaultView(D::TEXTURE_VIEW_DEPTH_STENCIL);
 		return TextureHandle{ a.index, a.generation };
 	}
 
@@ -1050,23 +1115,33 @@ struct RenderSubsystem::RenderBackend {
 		auto* p = psos.get(po.index, po.generation); if (!p) return RenderError::InvalidHandle;
 		auto a = materials.allocate(); auto* dd = materials.getUnchecked(a.index); dd->desc = d; dd->pso = po;
 		{ D::BufferDesc bd; bd.Name = "ObjCB"; bd.Size = sizeof(ObjectConstants); bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DYNAMIC; bd.CPUAccessFlags = D::CPU_ACCESS_WRITE; device->CreateBuffer(bd, nullptr, &dd->objCB); }
-		p->pso->CreateShaderResourceBinding(&dd->srb, true);
-		if (dd->srb && dd->objCB) {
-			auto* pv = dd->srb->GetVariableByName(D::SHADER_TYPE_VERTEX, "Object"); if (pv) pv->Set(dd->objCB.RawPtr());
-			auto* pv2 = dd->srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "Object"); if (pv2) pv2->Set(dd->objCB.RawPtr());
-		}
-		if (dd->srb) {
-			auto* pv = dd->srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "t_BC");
-			if (pv) {
-				if (d.baseColorTexture.isValid()) {
-					auto* td = textures.get(d.baseColorTexture.index, d.baseColorTexture.generation);
-					if (td) pv->Set(td->srv.RawPtr(), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
-					else pv->Set(whiteSRV, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
-				}
-				else {
-					pv->Set(whiteSRV, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
-				}
+		auto bindSRB = [&](D::RefCntAutoPtr<D::IShaderResourceBinding>& srb, D::IPipelineState* pso, bool bindShadowDummy) {
+			pso->CreateShaderResourceBinding(&srb, true);
+			if (!srb) return;
+			if (dd->objCB) {
+				if (auto* pv = srb->GetVariableByName(D::SHADER_TYPE_VERTEX, "Object")) pv->Set(dd->objCB.RawPtr());
+				if (auto* pv = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "Object")) pv->Set(dd->objCB.RawPtr());
 			}
+			if (auto* pv = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "t_BC")) {
+				D::ITextureView* srv = whiteSRV.RawPtr();
+				if (d.baseColorTexture.isValid()) {
+					if (auto* td = textures.get(d.baseColorTexture.index, d.baseColorTexture.generation)) srv = td->srv.RawPtr();
+				}
+				pv->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+			}
+			// The G-buffer shader declares (but does not use) g_ShadowMap; bind a dummy so
+			// the mutable variable is never left unbound when committing the G-buffer SRB.
+			// The regular PBR SRB leaves it unbound here - draw() binds the real shadow map
+			// (with ALLOW_OVERWRITE) right before the draw call.
+			if (bindShadowDummy) {
+				if (auto* sv = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap"))
+					sv->Set(shadowDummy, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+			}
+		};
+		bindSRB(dd->srb, p->pso, false);
+		// G-buffer SRB (only meaningful when the G-buffer PSOs exist, i.e. always after createDefaults).
+		if (gbufPSO.isValid()) {
+			if (auto* gp = psos.get(gbufPSO.index, gbufPSO.generation)) bindSRB(dd->gbufSRB, gp->pso, true);
 		}
 		return MaterialHandle{ a.index, a.generation };
 	}
@@ -1089,6 +1164,7 @@ struct RenderSubsystem::RenderBackend {
 	void draw(MeshHandle mh, const Transform& tr) {
 		auto* md = meshes.get(mh.index, mh.generation); if (!md || md->sub.empty()) return;
 		PSOHandle activePSO = wireframe ? defPSO_wire : defPSO;
+		if (gBufferActive) activePSO = gbufPSO;
 		auto* pd = psos.get(activePSO.index, activePSO.generation);
 		static int wfLog = 0;
 		if (!pd && wireframe && wfLog++ < 5) { EInfo("WirePSO lookup failed: idx={} gen={}", defPSO_wire.index, defPSO_wire.generation); }
@@ -1107,11 +1183,14 @@ struct RenderSubsystem::RenderBackend {
 			auto& s = md->sub[si];
 			auto* mt = materials.get(s.material.index, s.material.generation);
 			if (mt && mt->objCB) { ObjectConstants oc; oc.world = wm; oc.normalMat = nm; oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
-			if (mt && mt->srb && shadowSRV) { auto* v = mt->srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap"); if (v) v->Set(shadowSRV); }
-			if (mt && mt->srb) {
-				auto* sv = mt->srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap");
-				if (sv) sv->Set(shadowSRV ? shadowSRV : shadowDummy);
-				ctx->CommitShaderResources(mt->srb, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
+			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
+			if (mt && srb) {
+				if (!gBufferActive) {
+					auto* sv = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap");
+					if (sv) sv->Set(shadowSRV ? shadowSRV : shadowDummy, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+				}
+				ctx->CommitShaderResources(srb, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 			}
 			D::DrawIndexedAttribs da; da.IndexType = D::VT_UINT32; da.NumIndices = s.indexCount; da.FirstIndexLocation = s.indexOffset; da.BaseVertex = (D::Uint32)s.vertexOffset; da.Flags = D::DRAW_FLAG_VERIFY_ALL;
 			ctx->DrawIndexed(da); dc++;
@@ -1169,6 +1248,7 @@ struct RenderSubsystem::RenderBackend {
 		if (worldMatrices.empty()) return;
 		auto* md = meshes.get(mh.index, mh.generation); if (!md || md->sub.empty()) return;
 		PSOHandle activePSO = wireframe ? defPSO_Inst_wire : defPSO_Inst;
+		if (gBufferActive) activePSO = gbufPSO_Inst;
 		auto* pd = psos.get(activePSO.index, activePSO.generation); if (!pd) return;
 		UInt32 count = (UInt32)Min(worldMatrices.size(), (Size)MaxInstances);
 
@@ -1186,11 +1266,14 @@ struct RenderSubsystem::RenderBackend {
 		for (auto& s : md->sub) {
 			auto* mt = materials.get(s.material.index, s.material.generation);
 			if (mt && mt->objCB) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
-			if (mt && mt->srb && shadowSRV) { auto* v = mt->srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap"); if (v) v->Set(shadowSRV); }
-			if (mt && mt->srb) {
-				auto* sv = mt->srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap");
-				if (sv) sv->Set(shadowSRV ? shadowSRV : shadowDummy);
-				ctx->CommitShaderResources(mt->srb, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
+			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
+			if (mt && srb) {
+				if (!gBufferActive) {
+					auto* sv = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap");
+					if (sv) sv->Set(shadowSRV ? shadowSRV : shadowDummy, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+				}
+				ctx->CommitShaderResources(srb, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 			}
 			D::DrawIndexedAttribs da; da.IndexType = D::VT_UINT32; da.NumIndices = s.indexCount; da.FirstIndexLocation = s.indexOffset; da.BaseVertex = (D::Uint32)s.vertexOffset; da.NumInstances = count; da.Flags = D::DRAW_FLAG_VERIFY_ALL;
 			ctx->DrawIndexed(da); dc++;
@@ -1539,155 +1622,6 @@ Result<TextureHandle, RenderError> RenderSubsystem::createTexture(const TextureD
 Result<SamplerHandle, RenderError> RenderSubsystem::createSampler(const SamplerDesc& d) { if (!m_backend->ok) return RenderError::NotInitialized; return m_backend->mkSampler(d); }
 Result<MaterialHandle, RenderError> RenderSubsystem::createMaterial(const MaterialDesc& d, PSOHandle p) { if (!m_backend->ok) return RenderError::NotInitialized; return m_backend->mkMat(d, p); }
 
-// -------------------------------------------------------------------
-// Acceleration structures (ray tracing)
-// -------------------------------------------------------------------
-
-Result<BLASHandle, RenderError> RenderSubsystem::createBLAS(MeshHandle mesh) {
-	auto& b = *m_backend;
-	if (!b.ok) return RenderError::NotInitialized;
-	if (!b.rtFeatureEnabled || b.rtCaps == RayTracingCaps::None) { EError("createBLAS: ray tracing is not available on this device."); return RenderError::OperationFailed; }
-	auto* md = b.meshes.get(mesh.index, mesh.generation);
-	if (!md || !md->vb || !md->ib || md->ic == 0) return RenderError::InvalidHandle;
-
-	D::BLASTriangleDesc tri;
-	tri.GeometryName         = "Mesh";
-	tri.MaxVertexCount       = md->vc;
-	tri.VertexValueType      = D::VT_FLOAT32;
-	tri.VertexComponentCount = 3;
-	tri.MaxPrimitiveCount    = md->ic / 3;
-	tri.IndexType            = D::VT_UINT32;
-
-	D::BottomLevelASDesc ad;
-	ad.Name          = "EE_Mesh_BLAS";
-	ad.Flags         = D::RAYTRACING_BUILD_AS_PREFER_FAST_TRACE;
-	ad.pTriangles    = &tri;
-	ad.TriangleCount = 1;
-	D::RefCntAutoPtr<D::IBottomLevelAS> blas;
-	b.device->CreateBLAS(ad, &blas);
-	if (!blas) { EError("createBLAS: BLAS creation failed for mesh {}", mesh.index); return RenderError::AccelerationStructureCreationFailed; }
-
-	// Reusable scratch buffer; recreate only when the required size grows.
-	{
-		const auto sz = blas->GetScratchBufferSizes().Build;
-		if (!b.blasScratch || b.blasScratch->GetDesc().Size < sz) {
-			D::BufferDesc sd; sd.Name = "BLAS Scratch"; sd.Usage = D::USAGE_DEFAULT; sd.BindFlags = D::BIND_RAY_TRACING; sd.Size = sz;
-			b.blasScratch.Release();
-			b.device->CreateBuffer(sd, nullptr, &b.blasScratch);
-			if (!b.blasScratch) return RenderError::BufferCreationFailed;
-		}
-	}
-
-	D::BLASBuildTriangleData td;
-	td.GeometryName         = tri.GeometryName;
-	td.pVertexBuffer        = md->vb;
-	td.VertexStride         = sizeof(Vertex);
-	td.VertexCount          = md->vc;
-	td.VertexValueType      = tri.VertexValueType;
-	td.VertexComponentCount = tri.VertexComponentCount;
-	td.pIndexBuffer         = md->ib;
-	td.PrimitiveCount       = tri.MaxPrimitiveCount;
-	td.IndexType            = tri.IndexType;
-	td.Flags                = D::RAYTRACING_GEOMETRY_FLAG_OPAQUE;
-
-	D::BuildBLASAttribs ba;
-	ba.pBLAS             = blas;
-	ba.pTriangleData     = &td;
-	ba.TriangleDataCount = 1;
-	ba.pScratchBuffer    = b.blasScratch;
-	ba.BLASTransitionMode          = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
-	ba.GeometryTransitionMode      = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
-	ba.ScratchBufferTransitionMode = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
-	b.ctx->BuildBLAS(ba);
-
-	auto a = b.blases.allocate();
-	auto* dd = b.blases.getUnchecked(a.index);
-	dd->blas = std::move(blas);
-	dd->sourceMesh = mesh;
-	EInfo("BLAS created for mesh {} ({} verts, {} primitives)", mesh.index, md->vc, md->ic / 3);
-	return BLASHandle{ a.index, a.generation };
-}
-
-Result<TLASHandle, RenderError> RenderSubsystem::createTLAS(UInt32 maxInstances, bool allowUpdate) {
-	auto& b = *m_backend;
-	if (!b.ok) return RenderError::NotInitialized;
-	if (!b.rtFeatureEnabled || b.rtCaps == RayTracingCaps::None) { EError("createTLAS: ray tracing is not available on this device."); return RenderError::OperationFailed; }
-	if (maxInstances == 0) return RenderError::InvalidArgument;
-
-	D::TopLevelASDesc td;
-	td.Name             = "EE_TLAS";
-	td.MaxInstanceCount = maxInstances;
-	td.Flags            = D::RAYTRACING_BUILD_AS_PREFER_FAST_TRACE;
-	if (allowUpdate) td.Flags |= D::RAYTRACING_BUILD_AS_ALLOW_UPDATE;
-	D::RefCntAutoPtr<D::ITopLevelAS> tlas;
-	b.device->CreateTLAS(td, &tlas);
-	if (!tlas) { EError("createTLAS: TLAS creation failed"); return RenderError::AccelerationStructureCreationFailed; }
-
-	auto a = b.tlases.allocate();
-	auto* dd = b.tlases.getUnchecked(a.index);
-	dd->tlas = std::move(tlas);
-	dd->maxInstances = maxInstances;
-	dd->allowUpdate = allowUpdate;
-	EInfo("TLAS created (maxInstances={}, allowUpdate={})", maxInstances, allowUpdate);
-	return TLASHandle{ a.index, a.generation };
-}
-
-Result<void, RenderError> RenderSubsystem::buildTLAS(TLASHandle h, const Vector<TLASInstance>& instances) {
-	auto& b = *m_backend;
-	if (!b.ok) return RenderError::NotInitialized;
-	auto* dd = b.tlases.get(h.index, h.generation);
-	if (!dd || !dd->tlas) return RenderError::InvalidHandle;
-	if (instances.empty()) return RenderError::InvalidArgument;
-	if (instances.size() > dd->maxInstances) { EError("buildTLAS: {} instances exceed TLAS capacity {}", instances.size(), dd->maxInstances); return RenderError::InvalidArgument; }
-
-	// Lazily create scratch + instance buffers.
-	if (!dd->scratch) {
-		D::BufferDesc sd; sd.Name = "TLAS Scratch"; sd.Usage = D::USAGE_DEFAULT; sd.BindFlags = D::BIND_RAY_TRACING;
-		sd.Size = std::max(dd->tlas->GetScratchBufferSizes().Build, dd->tlas->GetScratchBufferSizes().Update);
-		b.device->CreateBuffer(sd, nullptr, &dd->scratch);
-		if (!dd->scratch) return RenderError::BufferCreationFailed;
-	}
-	if (!dd->instanceBuf) {
-		D::BufferDesc id; id.Name = "TLAS Instances"; id.Usage = D::USAGE_DEFAULT; id.BindFlags = D::BIND_RAY_TRACING;
-		id.Size = static_cast<D::Uint64>(D::TLAS_INSTANCE_DATA_SIZE) * dd->maxInstances;
-		b.device->CreateBuffer(id, nullptr, &dd->instanceBuf);
-		if (!dd->instanceBuf) return RenderError::BufferCreationFailed;
-	}
-
-	// Prepare instance data.
-	Vector<D::TLASBuildInstanceData> insts;
-	insts.reserve(instances.size());
-	for (const auto& in : instances) {
-		auto* bd = b.blases.get(in.blas.index, in.blas.generation);
-		if (!bd || !bd->blas) { EError("buildTLAS: invalid BLAS handle {}:{}", in.blas.index, in.blas.generation); return RenderError::InvalidHandle; }
-		D::TLASBuildInstanceData di;
-		di.InstanceName = in.name.empty() ? nullptr : in.name.c_str();
-		di.CustomId     = in.customId;
-		di.Mask         = in.mask;
-		di.pBLAS        = bd->blas;
-		// glm is column-major, Diligent instance transform is row-major.
-		D::float4x4 dm = toDiligentMatrix(in.transform);
-		di.Transform.SetRotation(dm.Data(), 4);
-		di.Transform.SetTranslation(dm[3][0], dm[3][1], dm[3][2]);
-		insts.push_back(di);
-	}
-
-	D::BuildTLASAttribs ba;
-	ba.pTLAS            = dd->tlas;
-	ba.Update           = dd->built && dd->allowUpdate;
-	ba.pInstances       = insts.data();
-	ba.InstanceCount    = static_cast<D::Uint32>(insts.size());
-	ba.pInstanceBuffer  = dd->instanceBuf;
-	ba.pScratchBuffer   = dd->scratch;
-	ba.TLASTransitionMode          = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
-	ba.BLASTransitionMode          = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
-	ba.InstanceBufferTransitionMode = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
-	ba.ScratchBufferTransitionMode  = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
-	b.ctx->BuildTLAS(ba);
-	dd->built = true;
-	return {};
-}
-
 Result<CameraHandle, RenderError> RenderSubsystem::createCamera(const CameraDesc& d) {
 	if (!m_backend->ok) return RenderError::NotInitialized;
 	CamData cd; cd.desc = d; cd.aspect = d.w / d.h; cd.proj = glm::perspective(glm::radians(d.fov), cd.aspect, d.nearP, d.farP); cd.view = glm::lookAt(d.pos, d.target, d.up);
@@ -1956,6 +1890,70 @@ const Vector<UInt32>* RenderSubsystem::getMeshIndices(MeshHandle m) const {
 	auto* md = m_backend->meshes.get(m.index, m.generation);
 	return md ? &md->cpuIndices : nullptr;
 }
+
+void RenderSubsystem::getMeshGeometry(MeshHandle mesh, void*& vertexBuffer, void*& indexBuffer, UInt32& vertexCount, UInt32& indexCount) const {
+	vertexBuffer = nullptr; indexBuffer = nullptr; vertexCount = 0; indexCount = 0;
+	auto* md = m_backend->meshes.get(mesh.index, mesh.generation);
+	if (!md) return;
+	vertexBuffer = md->vb.RawPtr();
+	indexBuffer  = md->ib.RawPtr();
+	vertexCount  = md->vc;
+	indexCount   = md->ic;
+}
+
+Optional<MaterialDesc> RenderSubsystem::getMaterial(MaterialHandle material) const {
+	auto* md = m_backend->materials.get(material.index, material.generation);
+	if (!md) return NullOpt;
+	return md->desc;
+}
+
+TextureSRV RenderSubsystem::getTextureSRV(TextureHandle texture) const {
+	auto* td = m_backend->textures.get(texture.index, texture.generation);
+	return td ? td->srv.RawPtr() : nullptr;
+}
+
+void RenderSubsystem::destroyTexture(TextureHandle texture) {
+	m_backend->textures.release(texture.index);
+}
+
+TextureRTV RenderSubsystem::getTextureRTV(TextureHandle texture) const {
+	auto* td = m_backend->textures.get(texture.index, texture.generation);
+	return td ? td->rtv.RawPtr() : nullptr;
+}
+
+TextureUAV RenderSubsystem::getTextureUAV(TextureHandle texture) const {
+	auto* td = m_backend->textures.get(texture.index, texture.generation);
+	return td ? td->uav.RawPtr() : nullptr;
+}
+
+TextureDSV RenderSubsystem::getTextureDSV(TextureHandle texture) const {
+	auto* td = m_backend->textures.get(texture.index, texture.generation);
+	return td ? td->dsv.RawPtr() : nullptr;
+}
+
+TextureDSV RenderSubsystem::getDepthStencil() const { return m_backend->dsv.RawPtr(); }
+
+void RenderSubsystem::beginGBuffer(TextureRTV colorRT, TextureRTV normalRT, TextureDSV depthDSV) {
+	if (!m_backend->ok || !colorRT || !normalRT || !depthDSV) return;
+	auto& b = *m_backend;
+	b.gBufferActive = true;
+	auto* cRTV = static_cast<D::ITextureView*>(colorRT);
+	auto* nRTV = static_cast<D::ITextureView*>(normalRT);
+	auto* dDSV = static_cast<D::ITextureView*>(depthDSV);
+	D::ITextureView* rtvs[2] = { cRTV, nRTV };
+	b.ctx->SetRenderTargets(2, rtvs, dDSV, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	const float cc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	b.ctx->ClearRenderTarget(cRTV, cc, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	b.ctx->ClearRenderTarget(nRTV, cc, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	b.ctx->ClearDepthStencil(dDSV, D::CLEAR_DEPTH_FLAG, 1.0f, 0, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	b.dc = 0;
+}
+
+void RenderSubsystem::endGBuffer() {
+	if (m_backend->ok) m_backend->gBufferActive = false;
+}
+
+bool RenderSubsystem::isGBufferActive() const { return m_backend->gBufferActive; }
 
 void RenderSubsystem::endFrame() { if (m_backend->ok) m_backend->end(); }
 

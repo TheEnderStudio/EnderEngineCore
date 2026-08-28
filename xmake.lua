@@ -1,4 +1,4 @@
-﻿set_project("EnderEngine")
+set_project("EnderEngine")
 set_xmakever("2.8.0")
 add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate")
@@ -259,6 +259,30 @@ target("Demo")
 
 	-- Windows system libs needed for GLFW and window creation
 	add_syslinks("gdi32", "user32", "shell32", "d3d12", "dxgi", "d3dcompiler")
+
+	-- Copy the DirectX Shader Compiler (dxcompiler.dll + dxil.dll) next to the
+	-- executable so that Diligent can compile Shader Model 6.0+ (ray tracing).
+	-- Required for the RayTracingSubsystem's inline ray tracing (SM 6.5).
+	after_build(function(target)
+		if is_plat("windows") then
+			local kits = "C:/Program Files (x86)/Windows Kits/10/bin"
+			local best = nil
+			for _, dir in ipairs(os.dirs(kits .. "/*")) do
+				if os.isfile(dir .. "/x64/dxcompiler.dll") then
+					if best == nil or dir > best then
+						best = dir
+					end
+				end
+			end
+			if best then
+				local x64 = best .. "/x64"
+				os.cp(x64 .. "/dxcompiler.dll", path.join(target:targetdir(), "dxcompiler.dll"))
+				if os.isfile(x64 .. "/dxil.dll") then
+					os.cp(x64 .. "/dxil.dll", path.join(target:targetdir(), "dxil.dll"))
+				end
+			end
+		end
+	end)
 
 target_end()
 

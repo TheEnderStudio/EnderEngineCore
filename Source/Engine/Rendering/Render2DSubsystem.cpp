@@ -1,4 +1,4 @@
-﻿#include <Rendering/Render2DSubsystem.hpp>
+#include <Rendering/Render2DSubsystem.hpp>
 #include <Core/Log.hpp>
 
 #include <DiligentCore/Graphics/GraphicsEngine/interface/RenderDevice.h>
@@ -87,6 +87,9 @@ struct Render2DSubsystem::Impl {
 		{ D::BufferDesc bd; bd.Name="R2DCB"; bd.Size=sizeof(Mat4); bd.BindFlags=D::BIND_UNIFORM_BUFFER; bd.Usage=D::USAGE_DYNAMIC; bd.CPUAccessFlags=D::CPU_ACCESS_WRITE; device->CreateBuffer(bd,nullptr,&cb); }
 		{ D::BufferDesc bd; bd.Name="R2DVB"; bd.Size=sizeof(Vertex2D)*MaxVertices; bd.BindFlags=D::BIND_VERTEX_BUFFER; bd.Usage=D::USAGE_DYNAMIC; bd.CPUAccessFlags=D::CPU_ACCESS_WRITE; device->CreateBuffer(bd,nullptr,&vb); }
 		{ D::BufferDesc bd; bd.Name="R2DIB"; bd.Size=sizeof(UInt32)*MaxIndices; bd.BindFlags=D::BIND_INDEX_BUFFER; bd.Usage=D::USAGE_DYNAMIC; bd.CPUAccessFlags=D::CPU_ACCESS_WRITE; device->CreateBuffer(bd,nullptr,&ib); }
+		// afterPost=false 2D is drawn together with the scene, so the PSO declares
+		// the scene depth format (D32) - the DSV is set by the renderer before UI.
+		// The afterPost=true variants declare UNKNOWN (post-process leaves no DSV).
 		{ D::RefCntAutoPtr<D::IShaderResourceBinding> tmp; createPSO(psoTexNoDS,tmp,g_PS2DTex,true,D::TEX_FORMAT_UNKNOWN); }
 		{ D::RefCntAutoPtr<D::IShaderResourceBinding> tmp; createPSO(psoTexDS,tmp,g_PS2DTex,true,D::TEX_FORMAT_D32_FLOAT); }
 	createPSO(psoSolidNoDS,srbSolidNoDS,g_PS2DSolid,false,D::TEX_FORMAT_UNKNOWN);

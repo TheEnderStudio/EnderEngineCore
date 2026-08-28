@@ -11,6 +11,7 @@ EE_NAMESPACE_RENDERING_BEGIN
 using TextureSRV = void*;       ///< Opaque texture shader resource view
 using TextureDSV = void*;       ///< Opaque depth-stencil view
 using TextureRTV = void*;       ///< Opaque render target view
+using TextureUAV = void*;       ///< Opaque texture unordered access view
 using ComputeBuf = void*;       ///< Opaque GPU buffer (structured, constant, indirect args, staging)
 using ComputeSRV = void*;       ///< Opaque buffer shader resource view
 using DevicePtr = void*;        ///< Opaque render device pointer
@@ -44,7 +45,7 @@ enum class LightType : UInt8 { Directional, Point, Spot };
 /// @brief Texture pixel format.
 enum class TextureFormat : UInt32 {
 	Unknown = 0, RGBA8_UNorm, RGBA8_UNorm_SRGB, BGRA8_UNorm, BGRA8_UNorm_SRGB,
-	R8_UNorm, RG8_UNorm, R32_Float, RG32_Float, RGBA32_Float, D32_Float, D24_UNorm_S8_UInt
+	R8_UNorm, RG8_UNorm, R32_Float, RG32_Float, RGBA16_Float, RGBA32_Float, D32_Float, D24_UNorm_S8_UInt
 };
 
 /**
@@ -155,6 +156,9 @@ struct ShaderDesc {
 struct TextureDesc {
 	UInt32 w = 0; UInt32 h = 0; TextureFormat fmt = TextureFormat::RGBA8_UNorm;
 	UInt32 mipLevels = 1; const void* data = nullptr; UInt32 dataSize = 0;
+	bool asRenderTarget = false; ///< Also bind as a render target (BIND_RENDER_TARGET, usage DEFAULT).
+	bool asUAV = false;          ///< Also bind as an unordered access view (BIND_UNORDERED_ACCESS).
+	bool asDepthStencil = false; ///< Also bind as a depth-stencil target (BIND_DEPTH_STENCIL).
 };
 
 /// @brief Descriptor for creating a sampler.

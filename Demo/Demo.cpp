@@ -19,6 +19,7 @@
 #include <Engine/Resource/ResourcesManager.hpp>
 #include <Engine/Rendering/ShadowSubsystem.hpp>
 #include <Engine/Rendering/ComputeSubsystem.hpp>
+#include <Engine/Rendering/RayTracingSubsystem.hpp>
 
 #include <HelloWorld/HelloWorldExt.hpp>
 #include <EngineExt/AdaptiveMusic.hpp>
@@ -330,6 +331,39 @@ float4 main(PSIn i) : SV_TARGET {
 	compute.attachToRenderer(&renderer);
 	compute.initialize();
 
+	// --- Ray tracing (hybrid, M3) ---
+	RayTracingSubsystem rayTracing;
+	rayTracing.attachToRenderer(&renderer);
+	bool hybridRT = false; // F9 toggles between rasterization and hybrid ray tracing
+	TextureHandle gbufColor, gbufNormal, gbufDepth, rtTex;
+	// (Re)create the window-sized G-buffer + ray traced output textures.
+	auto createGBufferTextures = [&](UInt32 w, UInt32 h) {
+		renderer.destroyTexture(gbufColor);
+		renderer.destroyTexture(gbufNormal);
+		renderer.destroyTexture(gbufDepth);
+		renderer.destroyTexture(rtTex);
+		gbufColor = gbufNormal = gbufDepth = rtTex = TextureHandle{};
+		TextureDesc td;
+		td.w = w; td.h = h; td.fmt = TextureFormat::RGBA8_UNorm_SRGB; td.asRenderTarget = true;
+		if (auto r = renderer.createTexture(td); r.isOk()) gbufColor = r.value();
+		td.fmt = TextureFormat::RGBA16_Float;
+		if (auto r = renderer.createTexture(td); r.isOk()) gbufNormal = r.value();
+		td.fmt = TextureFormat::D32_Float; td.asRenderTarget = false; td.asDepthStencil = true;
+		if (auto r = renderer.createTexture(td); r.isOk()) gbufDepth = r.value();
+		td.fmt = TextureFormat::RGBA16_Float; td.asDepthStencil = false; td.asUAV = true;
+		if (auto r = renderer.createTexture(td); r.isOk()) rtTex = r.value();
+	};
+	{
+		if (renderer.supportsInlineRayTracing()) {
+			auto r = rayTracing.initialize();
+			if (r.isErr()) { EError("RayTracing init failed: {}", ToString(r.error())); }
+		}
+		else {
+			EInfo("Hybrid ray tracing disabled: device does not support inline ray tracing.");
+		}
+		createGBufferTextures(fw, fh);
+	}
+
 	// GPU culling buffers
 	ComputeBuf cullInstBuf = compute.createStructuredBuffer(1000, sizeof(CullingInstance), true);
 	ComputeBuf cullVisBuf = compute.createStructuredBuffer(1000, sizeof(UInt32), true);
@@ -367,12 +401,6 @@ float4 main(PSIn i) : SV_TARGET {
 
 	PSOHandle pso;
 	{ PipelineStateDesc pd; pd.name = "DemoPSO"; auto r = renderer.createPipelineState(pd); if (r.isOk()) pso = r.value(); }
-
-	// Ray tracing acceleration structures (M2 validation)
-	std::atomic<bool> rtASBuilt{ false };
-	TLASHandle rtTLAS;
-	Vector<BLASHandle> rtBLAS;
-	Vector<TLASInstance> rtInstances;
 
 	std::atomic<bool> modelLoadCompleted{ false };
 	Object modelObj;
@@ -686,7 +714,8 @@ HALT
 		debugUI.text("Camera Y: {}", fly.pos.y);
 		debugUI.text("Camera Z: {}", fly.pos.z);
 		debugUI.text("RayTracing: inline={} standalone={}", renderer.supportsInlineRayTracing(), renderer.supportsStandaloneRayTracing());
-		debugUI.text("RT AS: {} BLAS, TLAS={}", rtBLAS.size(), rtASBuilt.load(std::memory_order_acquire) ? "built" : "pending");
+		debugUI.text("RT Subsystem: {}", rayTracing.isReady() ? "ready" : "disabled");
+		debugUI.text("Mode: {} (F9)", hybridRT ? "Hybrid RT" : "Raster");
 		{
 			static size_t visibleCount = 0;
 			// Use the GPU-computed count from args buffer readback (logged above)
@@ -780,53 +809,6 @@ HALT
 			}
 		}
 
-		// Build ray tracing acceleration structures once all static models are loaded (M2).
-		if (!rtASBuilt.load(std::memory_order_acquire) &&
-			renderer.supportsInlineRayTracing() &&
-			modelLoadCompleted.load(std::memory_order_acquire) &&
-			terrianLoadCompleted.load(std::memory_order_acquire) &&
-			wallLoadCompleted.load(std::memory_order_acquire))
-		{
-			Vector<MeshHandle> staticMeshes;
-			Vector<Transform>  staticTransforms;
-			for (auto& m : model)   { staticMeshes.push_back(m); staticTransforms.push_back(Transform{}); }
-			for (auto& m : terrian) { staticMeshes.push_back(m); staticTransforms.push_back(Transform{}); }
-			for (auto& m : wall)    { staticMeshes.push_back(m); staticTransforms.push_back(Transform{ .position = Vec3(20, -19, 20) }); }
-
-			for (size_t i = 0; i < staticMeshes.size(); ++i) {
-				auto br = renderer.createBLAS(staticMeshes[i]);
-				if (br.isOk()) {
-					TLASInstance inst;
-					inst.blas      = br.value();
-					inst.transform = staticTransforms[i].computeWorldMatrix();
-					inst.customId  = (UInt32)i;
-					inst.name      = "StaticInst" + std::to_string(i);
-					rtBLAS.push_back(br.value());
-					rtInstances.push_back(inst);
-				}
-				else {
-					EError("createBLAS failed for static mesh {}: {}", i, ToString(br.error()));
-				}
-			}
-			auto tr = renderer.createTLAS((UInt32)rtInstances.size(), true);
-			if (tr.isOk()) {
-				rtTLAS = tr.value();
-				rtASBuilt.store(true, std::memory_order_release);
-				EInfo("RT AS ready: {} BLAS, TLAS ({} instances)", rtBLAS.size(), rtInstances.size());
-			}
-			else {
-				EError("createTLAS failed: {}", ToString(tr.error()));
-			}
-		}
-		// Keep the TLAS updated every frame (build on first call, update afterwards).
-		if (rtASBuilt.load(std::memory_order_acquire)) {
-			auto br = renderer.buildTLAS(rtTLAS, rtInstances);
-			if (br.isErr()) {
-				static bool warned = false;
-				if (!warned) { EError("buildTLAS failed: {}", ToString(br.error())); warned = true; }
-			}
-		}
-
 		UInt32 fbW, fbH;
 		window.getFramebufferSize(fbW, fbH);
 		if (fbW != ww || fbH != wh) {
@@ -836,6 +818,7 @@ HALT
 			debugUI.resize(ww, wh);
 			render2d.setScreenSize(ww, wh);
 			ui.setScreenSize(ww, wh);
+			createGBufferTextures(ww, wh);
 		}
 
 		input.update(dt);
@@ -878,6 +861,15 @@ HALT
 		if (st.wasKeyPressedThisFrame(KeyCode::F8)) {
 			musicCtl.stop();
 			EInfo("Stopped script, tracks keep playing");
+		}
+		if (st.wasKeyPressedThisFrame(KeyCode::F9)) {
+			if (!rayTracing.isReady()) {
+				EInfo("Hybrid ray tracing unavailable on this device - stay in rasterization mode.");
+			}
+			else {
+				hybridRT = !hybridRT;
+				EInfo("Hybrid ray tracing: {}", hybridRT ? "ON" : "OFF");
+			}
 		}
 		if (st.wasKeyPressedThisFrame(KeyCode::Num2)) {
 			static bool pushed = true;
@@ -1006,6 +998,8 @@ HALT
 		}
 
 		debugUI.beginFrame(ww, wh);
+
+		if (!hybridRT) {
 		renderer.setRenderTarget(postProcess.getHDRRTV());
 		renderer.beginFrame();
 
@@ -1102,6 +1096,92 @@ HALT
 
 		renderer.endFrame();
 		renderer.setRenderTarget(nullptr);
+		}
+		else {
+			// ---- Hybrid ray tracing path (M3) ----
+			// G-buffer pass (albedo + world normal + depth). Note: the Furina model
+			// consists of 5 separate meshes, so every mesh must be drawn.
+			renderer.beginGBuffer(renderer.getTextureRTV(gbufColor), renderer.getTextureRTV(gbufNormal), renderer.getTextureDSV(gbufDepth));
+			for (auto& terrMesh : terrian) renderer.drawMesh(terrMesh, Transform{});
+			for (auto& wallMesh : wall) renderer.drawMesh(wallMesh, Transform{ .position = Vec3(20, -19, 20) });
+			if (!model.empty() && modelLoadCompleted.load(std::memory_order_acquire)) {
+				Vector<Mat4> wmats(1000);
+				for (size_t i = 0; i < 1000; ++i) wmats[i] = transv[i].computeWorldMatrix();
+				for (size_t mi = 0; mi < model.size(); ++mi)
+					renderer.drawMeshInstanced(model[mi], wmats);
+			}
+			renderer.endGBuffer();
+
+			// RT scene objects: static terrain/wall + physics bodies (all model meshes).
+			Vector<RayTracedObject> rtObjs;
+			{
+				for (auto& terrMesh : terrian) {
+					RayTracedObject o; o.mesh = terrMesh;
+					auto sub = renderer.getSubMesh(terrMesh, 0); o.material = sub.material;
+					rtObjs.push_back(o);
+				}
+				for (auto& wallMesh : wall) {
+					RayTracedObject o; o.mesh = wallMesh;
+					auto sub = renderer.getSubMesh(wallMesh, 0); o.material = sub.material;
+					o.transform.position = Vec3(20, -19, 20);
+					rtObjs.push_back(o);
+				}
+				if (!model.empty() && modelLoadCompleted.load(std::memory_order_acquire)) {
+					for (size_t mi = 0; mi < model.size(); ++mi) {
+						auto sub = renderer.getSubMesh(model[mi], 0);
+						for (size_t i = 0; i < physHandles.size(); ++i) {
+							RayTracedObject o; o.mesh = model[mi]; o.material = sub.material;
+							o.transform = physicsBodies.getWorldTransform(physHandles[i]);
+							rtObjs.push_back(o);
+						}
+					}
+				}
+			}
+			if (!rtObjs.empty()) {
+				auto sr = rayTracing.updateScene(rtObjs);
+				if (sr.isErr()) {
+					static bool rtSceneWarned = false;
+					if (!rtSceneWarned) { EError("RT updateScene failed: {}", ToString(sr.error())); rtSceneWarned = true; }
+				}
+			}
+
+			Mat4 view, proj; renderer.getCameraMatrices(view, proj);
+			Mat4 vpInv = glm::inverse(proj * view);
+			Vec3 sunDir = glm::normalize(Vec3(cos(glm::radians(sunYaw)) * cos(glm::radians(sunPitch)),
+				-sin(glm::radians(sunPitch)), sin(glm::radians(sunYaw)) * cos(glm::radians(sunPitch))));
+			RayTraceConstants rc;
+			rc.viewProjInv = vpInv;
+			// The raster PBR shader uses Ldir = -light.dir (toward the light), so the
+			// ray tracer must receive the same "toward the light" direction.
+			rc.lightDir = Vec4(glm::normalize(-sunDir), 0.0f);
+			rc.cameraPos = Vec4(fly.pos, 1.0f);
+			rc.maxRayLength = 100.0f;
+			rc.ambientLight = 0.1f;
+			{
+				auto tr = rayTracing.trace(rc, renderer.getTextureSRV(gbufNormal), renderer.getTextureSRV(gbufDepth),
+					renderer.getTextureUAV(rtTex), ww, wh);
+				if (tr.isErr()) {
+					static bool traceWarned = false;
+					if (!traceWarned) { EError("RT trace failed: {}", ToString(tr.error())); traceWarned = true; }
+				}
+			}
+
+			// HDR pass: skybox + compose.
+			renderer.setRenderTarget(postProcess.getHDRRTV());
+			renderer.beginFrame();
+			{
+				auto cr = rayTracing.compose(renderer.getTextureSRV(gbufColor), renderer.getTextureSRV(gbufNormal),
+					renderer.getTextureSRV(gbufDepth), renderer.getTextureSRV(rtTex),
+					postProcess.getHDRRTV(), renderer.getDepthStencil(),
+					vpInv, fly.pos, ww, wh);
+				if (cr.isErr()) {
+					static bool composeWarned = false;
+					if (!composeWarned) { EError("RT compose failed: {}", ToString(cr.error())); composeWarned = true; }
+				}
+			}
+			renderer.endFrame();
+			renderer.setRenderTarget(nullptr);
+		}
 
 		// Render UI layers that receive post-processing (before execute)
 		ui.beginFrame(false);
@@ -1128,6 +1208,7 @@ HALT
 	}
 
 	audio.shutdown();
+	rayTracing.shutdown();
 	renderer.shutdown();
 	postProcess.shutdown();
 	debugUI.shutdown();

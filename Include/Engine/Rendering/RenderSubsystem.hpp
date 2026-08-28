@@ -106,39 +106,69 @@ public:
 	void clearShadowCascades(class ShadowSubsystem& shadow);
 
 	// -------------------------------------------------------------------
-	// Acceleration structures (ray tracing)
+	// Accessors for ray tracing integration
 	// -------------------------------------------------------------------
 
 	/**
-	 * @brief Create a bottom-level acceleration structure (BLAS) from an existing mesh.
-	 *
-	 * The mesh must have been created through createMesh()/loadModel() so its GPU
-	 * vertex/index buffers are available (they are flagged with BIND_RAY_TRACING).
-	 * Requires ray tracing support on the device.
-	 * @param mesh Source mesh handle.
-	 * @return BLAS handle, or an error (e.g. OperationFailed if ray tracing is unavailable).
+	 * @brief Get the GPU geometry buffers of a mesh (for acceleration structure building).
+	 * @param mesh Mesh handle.
+	 * @param vertexBuffer Out: Diligent IBuffer* as void* (nullptr if the mesh is invalid).
+	 * @param indexBuffer  Out: Diligent IBuffer* as void*.
+	 * @param vertexCount  Out: number of vertices.
+	 * @param indexCount   Out: number of indices.
 	 */
-	Result<BLASHandle, RenderError> createBLAS(MeshHandle mesh);
+	void getMeshGeometry(MeshHandle mesh, void*& vertexBuffer, void*& indexBuffer, UInt32& vertexCount, UInt32& indexCount) const;
 
 	/**
-	 * @brief Create a top-level acceleration structure (TLAS).
-	 * @param maxInstances Maximum number of instances the TLAS can hold.
-	 * @param allowUpdate Allow per-frame updates via buildTLAS() (adds RAYTRACING_BUILD_AS_ALLOW_UPDATE).
-	 * @return TLAS handle, or an error.
+	 * @brief Get the material descriptor (for bindless ray tracing data).
+	 * @param material Material handle.
+	 * @return The material descriptor, or NullOpt if the handle is invalid.
 	 */
-	Result<TLASHandle, RenderError> createTLAS(UInt32 maxInstances, bool allowUpdate = true);
+	EE_NODISCARD Optional<MaterialDesc> getMaterial(MaterialHandle material) const;
 
 	/**
-	 * @brief Build (first call) or update (subsequent calls) the TLAS from the given instances.
-	 *
-	 * Instance transforms are copied into a GPU instance buffer every call; the first
-	 * call builds the TLAS, later calls update it in place (requires allowUpdate = true
-	 * at createTLAS()). All referenced BLASes must be valid.
-	 * @param tlas TLAS handle from createTLAS().
-	 * @param instances Instance list (size must not exceed maxInstances).
-	 * @return Result indicating success or failure.
+	 * @brief Get the shader resource view of a texture (Diligent ITextureView* as void*).
+	 * @param texture Texture handle.
+	 * @return The texture SRV, or nullptr if the handle is invalid.
 	 */
-	Result<void, RenderError> buildTLAS(TLASHandle tlas, const Vector<TLASInstance>& instances);
+	TextureSRV getTextureSRV(TextureHandle texture) const;
+
+	/// @brief Destroy a texture created with createTexture() (its handle becomes invalid).
+	void destroyTexture(TextureHandle texture);
+
+	/// @brief Get the render target view of a texture (nullptr if not created as a render target).
+	TextureRTV getTextureRTV(TextureHandle texture) const;
+
+	/// @brief Get the unordered access view of a texture (nullptr if not created as a UAV).
+	TextureUAV getTextureUAV(TextureHandle texture) const;
+
+	/// @brief Get the depth-stencil view of a texture (nullptr if not created as a depth target).
+	TextureDSV getTextureDSV(TextureHandle texture) const;
+
+	/// @brief Get the renderer's internal (MSAA) depth-stencil view.
+	TextureDSV getDepthStencil() const;
+
+	// -------------------------------------------------------------------
+	// G-buffer pass (for hybrid ray tracing)
+	// -------------------------------------------------------------------
+
+	/**
+	 * @brief Begin a G-buffer pass.
+	 *
+	 * Subsequent drawMesh()/drawMeshInstanced() calls write albedo (color) and world
+	 * normal into the given render targets instead of the final shaded color, and the
+	 * depth is written to depthDSV. Call endGBuffer() to restore normal shading.
+	 * @param colorRT  Render target view for albedo (RGBA8_UNORM/SRGB).
+	 * @param normalRT Render target view for world normal (RGBA16_FLOAT).
+	 * @param depthDSV Depth-stencil view (D32_FLOAT, non-MSAA recommended).
+	 */
+	void beginGBuffer(TextureRTV colorRT, TextureRTV normalRT, TextureDSV depthDSV);
+
+	/// @brief End the G-buffer pass and restore the default shading mode.
+	void endGBuffer();
+
+	/// @brief Whether a G-buffer pass is currently active.
+	EE_NODISCARD bool isGBufferActive() const;
 
 	// -------------------------------------------------------------------
 	// Shader management
