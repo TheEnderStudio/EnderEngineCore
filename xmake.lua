@@ -93,7 +93,7 @@ if is_mode("debug") then
 	add_linkdirs("Backends/SteamAudio/lib/windows-x64")
 	add_linkdirs("ThirdParty/libspng/lib/Debug")
 	add_linkdirs("ThirdParty/FreeType/lib")
-	add_linkdirs("ThirdParty/EnderVFiles/lib")
+	add_linkdirs("ThirdParty/EnderVFiles/bin")
 else
 	add_linkdirs("ThirdParty/spdlog/lib")
 	add_linkdirs("ThirdParty/glfw/lib-vc2022")
@@ -107,7 +107,7 @@ else
 	add_linkdirs("Backends/SteamAudio/lib/windows-x64")
 	add_linkdirs("ThirdParty/libspng/lib/Release")
 	add_linkdirs("ThirdParty/FreeType/lib")
-	add_linkdirs("ThirdParty/EnderVFiles/lib")
+	add_linkdirs("ThirdParty/EnderVFiles/bin")
 end
 
 -- ---------------------------------------------------------------------------

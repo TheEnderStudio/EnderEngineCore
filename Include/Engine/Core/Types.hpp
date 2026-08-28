@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "Macros.h"
 
@@ -69,7 +69,7 @@ struct ResPath {
 	explicit ResPath(const String& p) : path(p) {}
 	explicit ResPath(const char* p) : path(p) {}
 	ResPath& operator=(const String& p) { path = p; return *this; }
-	const auto& string() const { return path.string(); }
+	String string() const { return path.string(); }
 	operator const Path&() const { return path; }
 };
 
@@ -206,7 +206,7 @@ struct EE_API Transform {
     /// @brief Get the forward direction vector in world space
     EE_NODISCARD Vec3 forward() const { return rotation * Vec3(0, 0, -1); }
     /// @brief Get the up direction vector in world space
-    EE_NODISCARD Vec3 up()      const { return rotation * Vec3(1, 0, 0); }
+    EE_NODISCARD Vec3 up()      const { return rotation * Vec3(0, 1, 0); }
     /// @brief Get the right direction vector in world space
     EE_NODISCARD Vec3 right()   const { return rotation * Vec3(1, 0, 0); }
 
@@ -271,17 +271,6 @@ struct EE_API Transform {
         Mat4 S = glm::scale(Mat4(1.0f), scale);
         return glm::transpose(glm::inverse(T * R * S));
     }
-
-    /**
-     * @brief Compute the 4x4 transformation matrix from this transform.
-     * @param cm Return maxtrix will be column-major if this parameter is true
-     * @return Matrix combining TRS (Translation * Rotation * Scale).
-     * @deprecated Use computeWorldMatrix() or computeNormalMatrix() for clarity.
-     */
-	EE_NODISCARD Mat4 computeMatrix(bool cm = true) const {
-        if (cm) return computeNormalMatrix();
-        else    return computeWorldMatrix();
-	}
 
     // ================================================================
     // Static helpers

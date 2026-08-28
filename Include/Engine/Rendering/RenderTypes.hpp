@@ -57,6 +57,24 @@ enum class RenderBackendType : UInt8 {
 	Vulkan,  ///< Vulkan
 };
 
+/**
+ * @brief Ray tracing capability flags (bitmask).
+ *
+ * Mirrors the Diligent RAY_TRACING_CAP_FLAGS values so the raw flags can be
+ * compared 1:1 with the backend report.
+ */
+enum class RayTracingCaps : UInt8 {
+	None               = 0x00,
+	StandaloneShaders  = 0x01, ///< Full ray tracing pipeline (raygen / closest hit / miss / intersection shaders).
+	InlineRayTracing   = 0x02, ///< Inline ray tracing via RayQuery in compute shaders (DXR 1.1).
+	IndirectRayTracing = 0x04, ///< Indirect ray tracing (TraceRaysIndirect).
+};
+
+/// @brief Check whether a ray tracing capability flag is set.
+EE_NODISCARD inline bool hasRayTracingCap(RayTracingCaps flags, RayTracingCaps cap) {
+	return (static_cast<UInt8>(flags) & static_cast<UInt8>(cap)) != 0;
+}
+
 // ---------------------------------------------------------------------------
 // Handle types
 // ---------------------------------------------------------------------------
@@ -92,10 +110,23 @@ using CameraHandle   = RenderHandle<struct CameraTag>;
 using LightHandle    = RenderHandle<struct LightTag>;
 /// @brief Handle for a model resource.
 using ModelHandle    = RenderHandle<struct ModelTag>;
+/// @brief Handle for a bottom-level acceleration structure (BLAS) resource.
+using BLASHandle     = RenderHandle<struct BLASHandleTag>;
+/// @brief Handle for a top-level acceleration structure (TLAS) resource.
+using TLASHandle     = RenderHandle<struct TLASHandleTag>;
 
 // ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
+
+/// @brief A single instance in a top-level acceleration structure (TLAS).
+struct TLASInstance {
+	BLASHandle blas;                     ///< BLAS to reference (must be valid).
+	Mat4 transform = Mat4(1.0f);         ///< World transform (column-major glm::mat4).
+	UInt32 mask = 0xFF;                  ///< Instance inclusion mask used during ray traversal.
+	UInt32 customId = 0;                 ///< User-defined ID, exposed as InstanceID() in hit/query shaders.
+	String name;                         ///< Optional instance name (used for SBT binding / debugging).
+};
 
 /// @brief Vertex data with position, normal, texcoord and tangent.
 struct Vertex {

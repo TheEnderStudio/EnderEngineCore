@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "Macros.h"
 #include "Types.hpp"
@@ -50,10 +50,13 @@ public:
 	static void unregisterSubsystem(Subsystem* subsystem);
 
 	/**
-	 * @brief Get all registered subsystems.
-	 * @return Const reference to the list of registered subsystems.
+	 * @brief Get a snapshot of all registered subsystems.
+	 *
+	 * Returns a copy of the subsystem list so callers can iterate safely
+	 * without holding the engine's internal registry lock.
+	 * @return Copy of the list of registered subsystems.
 	 */
-	static const Vector<Subsystem*>& subsystems();
+	static Vector<Subsystem*> subsystems();
 
 	/**
 	 * @brief Update all FixedMainThread subsystems with variable timestep.

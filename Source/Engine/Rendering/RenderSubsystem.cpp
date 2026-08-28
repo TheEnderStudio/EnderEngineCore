@@ -1,4 +1,4 @@
-﻿#include <Rendering/RenderSubsystem.hpp>
+#include <Rendering/RenderSubsystem.hpp>
 #include <Core/Log.hpp>
 #include <Core/Crash.h>
 #include <Rendering/Errors.hpp>
@@ -27,6 +27,7 @@
 #include <DiligentCore/Graphics/GraphicsEngineD3D12/interface/EngineFactoryD3D12.h>
 #include <DiligentCore/Graphics/GraphicsEngineVulkan/interface/EngineFactoryVk.h>
 #include <DiligentCore/Common/interface/RefCntAutoPtr.hpp>
+#include <DiligentCore/Common/interface/AdvancedMath.hpp>
 #include <DiligentTools/TextureLoader/interface/TextureUtilities.h>
 #include <imgui.h>
 
@@ -353,6 +354,7 @@ static D::TEXTURE_FORMAT toDFmt(TextureFormat f) {
 	case TextureFormat::R8_UNorm: return D::TEX_FORMAT_R8_UNORM;
 	case TextureFormat::RG8_UNorm: return D::TEX_FORMAT_RG8_UNORM;
 	case TextureFormat::R32_Float: return D::TEX_FORMAT_R32_FLOAT;
+	case TextureFormat::RG32_Float: return D::TEX_FORMAT_RG32_FLOAT;
 	case TextureFormat::RGBA32_Float: return D::TEX_FORMAT_RGBA32_FLOAT;
 	case TextureFormat::D32_Float: return D::TEX_FORMAT_D32_FLOAT;
 	case TextureFormat::D24_UNorm_S8_UInt: return D::TEX_FORMAT_D24_UNORM_S8_UINT;
@@ -388,6 +390,15 @@ static D::COMPARISON_FUNCTION toDCmp(CompareFunc f) {
 static D::FILTER_TYPE toDFilt(FilterMode m) { return m == FilterMode::Point ? D::FILTER_TYPE_POINT : m == FilterMode::Anisotropic ? D::FILTER_TYPE_ANISOTROPIC : D::FILTER_TYPE_LINEAR; }
 static D::TEXTURE_ADDRESS_MODE toDAddr(AddressMode m) {
 	switch (m) { case AddressMode::Wrap: return D::TEXTURE_ADDRESS_WRAP; case AddressMode::Mirror: return D::TEXTURE_ADDRESS_MIRROR; case AddressMode::Clamp: return D::TEXTURE_ADDRESS_CLAMP; case AddressMode::Border: return D::TEXTURE_ADDRESS_BORDER; } return D::TEXTURE_ADDRESS_WRAP;
+}
+
+// Convert a glm (column-major) Mat4 to a Diligent row-major float4x4.
+static D::float4x4 toDiligentMatrix(const Mat4& m) {
+	D::float4x4 r;
+	for (int row = 0; row < 4; ++row)
+		for (int col = 0; col < 4; ++col)
+			r[row][col] = m[col][row];
+	return r;
 }
 
 // ===================================================================
@@ -426,6 +437,8 @@ struct MatData { MaterialDesc desc; PSOHandle pso; D::RefCntAutoPtr<D::IShaderRe
 struct CamData { CameraDesc desc; Mat4 view; Mat4 proj; F32 aspect = 16.0f / 9.0f; };
 struct RenderLightData { LightDesc desc; };
 struct ModelData { ModelLoadResult result; };
+struct BLASData { D::RefCntAutoPtr<D::IBottomLevelAS> blas; MeshHandle sourceMesh; };
+struct TLASData { D::RefCntAutoPtr<D::ITopLevelAS> tlas; D::RefCntAutoPtr<D::IBuffer> scratch; D::RefCntAutoPtr<D::IBuffer> instanceBuf; UInt32 maxInstances = 0; bool allowUpdate = true; bool built = false; };
 
 // ===================================================================
 // RenderBackend
@@ -450,6 +463,9 @@ struct RenderSubsystem::RenderBackend {
 	Detail::ResourcePool<CamData>          cameras{ 16 };
 	Detail::ResourcePool<RenderLightData>  lights{ 16 };
 	Detail::ResourcePool<ModelData>        models{ 128 };
+	Detail::ResourcePool<BLASData>         blases{ 4096 };
+	Detail::ResourcePool<TLASData>         tlases{ 8 };
+	D::RefCntAutoPtr<D::IBuffer> blasScratch; ///< Reusable scratch buffer for BLAS builds.
 	Mutex m_loadMutex; ///< Serializes async model loading (pool + GPU resource creation)
 
 	ShaderHandle  defVS, defPS, defVS_Inst, defVS_Indirect, defVS_ShadowIndirect, bboardVS, bboardPS, skyVS, skyPS, skyCubePS;
@@ -472,6 +488,11 @@ struct RenderSubsystem::RenderBackend {
 	D::RefCntAutoPtr<D::IBuffer> frameCB, lightCB, instanceCB, bboardVB, bboardIB;
 	UInt64 fn = 0; UInt32 dc = 0; bool ok = false; bool wireframe = false;
 	UInt8 msaaSamples = 1;
+	// Ray tracing device feature request + reported capabilities.
+	bool requestRayTracing = true;
+	RayTracingCaps rtCaps = RayTracingCaps::None;
+	UInt32 rtMaxRecursionDepth = 0;
+	UInt32 rtMaxInstancesPerTLAS = 0;
 	D::ITextureView* shadowDummy = nullptr;
 	D::ITextureView* shadowSRV = nullptr;
 	Mat4 shadowMapUVDepth[4]; Vec4 cascadeSplits = Vec4(0);
@@ -501,7 +522,23 @@ struct RenderSubsystem::RenderBackend {
 		HWND hwnd = glfwGetWin32Window((GLFWwindow*)wnd);
 		if (tryD3D12) {
 			auto* f = D::GetEngineFactoryD3D12();
-			if (f) { D::EngineD3D12CreateInfo ci; ci.SetValidationLevel(D::VALIDATION_LEVEL_DISABLED); f->CreateDeviceAndContextsD3D12(ci, &device, &ctx); if (device) { f->CreateSwapChainD3D12(device, ctx, scd, D::FullScreenModeDesc{}, D::NativeWindow{ hwnd }, &sc); factory = f; backendType = RenderBackendType::D3D12; } }
+			if (f) {
+				// First attempt requests the ray tracing feature (if enabled).
+				{
+					D::EngineD3D12CreateInfo ci; ci.SetValidationLevel(D::VALIDATION_LEVEL_DISABLED);
+					if (requestRayTracing) ci.Features.RayTracing = D::DEVICE_FEATURE_STATE_ENABLED;
+					f->CreateDeviceAndContextsD3D12(ci, &device, &ctx);
+				}
+				// If the GPU/driver does not support ray tracing, retry without it so that
+				// rasterization keeps working on non-RT hardware.
+				if (!device && requestRayTracing) {
+					EWarn("D3D12 device creation with ray tracing failed; retrying without ray tracing.");
+					device.Release(); ctx.Release();
+					D::EngineD3D12CreateInfo ci; ci.SetValidationLevel(D::VALIDATION_LEVEL_DISABLED);
+					f->CreateDeviceAndContextsD3D12(ci, &device, &ctx);
+				}
+				if (device) { f->CreateSwapChainD3D12(device, ctx, scd, D::FullScreenModeDesc{}, D::NativeWindow{ hwnd }, &sc); factory = f; backendType = RenderBackendType::D3D12; }
+			}
 		}
 		if (!device && tryD3D11) {
 			auto* f = D::GetEngineFactoryD3D11();
@@ -509,17 +546,52 @@ struct RenderSubsystem::RenderBackend {
 		}
 		if (!device && tryVk) {
 			auto* f = D::GetEngineFactoryVk();
-			if (f) { D::EngineVkCreateInfo ci; f->CreateDeviceAndContextsVk(ci, &device, &ctx); if (device) { f->CreateSwapChainVk(device, ctx, scd, D::NativeWindow{ hwnd }, &sc); factory = f; backendType = RenderBackendType::Vulkan; } }
+			if (f) {
+				{
+					D::EngineVkCreateInfo ci;
+					if (requestRayTracing) ci.Features.RayTracing = D::DEVICE_FEATURE_STATE_ENABLED;
+					f->CreateDeviceAndContextsVk(ci, &device, &ctx);
+				}
+				if (!device && requestRayTracing) {
+					EWarn("Vulkan device creation with ray tracing failed; retrying without ray tracing.");
+					device.Release(); ctx.Release();
+					D::EngineVkCreateInfo ci;
+					f->CreateDeviceAndContextsVk(ci, &device, &ctx);
+				}
+				if (device) { f->CreateSwapChainVk(device, ctx, scd, D::NativeWindow{ hwnd }, &sc); factory = f; backendType = RenderBackendType::Vulkan; }
+			}
 		}
 #else
 		if (tryVk) {
 			auto* f = D::GetEngineFactoryVk();
-			if (f) { D::EngineVkCreateInfo ci; f->CreateDeviceAndContextsVk(ci, &device, &ctx); if (device) { f->CreateSwapChainVk(device, ctx, scd, D::NativeWindow{}, &sc); factory = f; backendType = RenderBackendType::Vulkan; } }
+			if (f) {
+				{
+					D::EngineVkCreateInfo ci;
+					if (requestRayTracing) ci.Features.RayTracing = D::DEVICE_FEATURE_STATE_ENABLED;
+					f->CreateDeviceAndContextsVk(ci, &device, &ctx);
+				}
+				if (!device && requestRayTracing) {
+					EWarn("Vulkan device creation with ray tracing failed; retrying without ray tracing.");
+					device.Release(); ctx.Release();
+					D::EngineVkCreateInfo ci;
+					f->CreateDeviceAndContextsVk(ci, &device, &ctx);
+				}
+				if (device) { f->CreateSwapChainVk(device, ctx, scd, D::NativeWindow{}, &sc); factory = f; backendType = RenderBackendType::Vulkan; }
+			}
 		}
 #endif
 
 		if (!device) return RenderError::DeviceCreationFailed;
 		if (!sc) return RenderError::SwapChainCreationFailed;
+
+		// Read ray tracing capabilities reported by the created device.
+		{
+			const auto& rt = device->GetAdapterInfo().RayTracing;
+			rtCaps = static_cast<RayTracingCaps>(static_cast<UInt8>(rt.CapFlags));
+			rtMaxRecursionDepth = rt.MaxRecursionDepth;
+			rtMaxInstancesPerTLAS = rt.MaxInstancesPerTLAS;
+		}
+
 		D::TextureDesc td; td.Name = "Depth"; td.Type = D::RESOURCE_DIM_TEX_2D; td.Width = scd.Width; td.Height = scd.Height; td.Format = scd.DepthBufferFormat; td.BindFlags = D::BIND_DEPTH_STENCIL; td.Usage = D::USAGE_DEFAULT; td.SampleCount = msaaSamples;
 		D::RefCntAutoPtr<D::ITexture> dt; device->CreateTexture(td, nullptr, &dt); if (dt) dsv = dt->GetDefaultView(D::TEXTURE_VIEW_DEPTH_STENCIL);
 		return {};
@@ -949,8 +1021,9 @@ struct RenderSubsystem::RenderBackend {
 		auto a = meshes.allocate(); auto* dd = meshes.getUnchecked(a.index);
 		dd->vc = (UInt32)d.vertices.size(); dd->ic = (UInt32)d.indices.size(); dd->sub = d.subMeshes;
 		dd->cpuVertices = d.vertices; dd->cpuIndices = d.indices;
-		{ D::BufferDesc bd; bd.Name = "VB"; bd.Size = d.vertices.size() * sizeof(Vertex); bd.BindFlags = D::BIND_VERTEX_BUFFER; bd.Usage = D::USAGE_IMMUTABLE; D::BufferData bdata; bdata.pData = d.vertices.data(); bdata.DataSize = bd.Size; D::RefCntAutoPtr<D::IBuffer> b; device->CreateBuffer(bd, &bdata, &b); if (!b) return RenderError::BufferCreationFailed; dd->vb = std::move(b); }
-		{ D::BufferDesc bd; bd.Name = "IB"; bd.Size = d.indices.size() * sizeof(UInt32); bd.BindFlags = D::BIND_INDEX_BUFFER; bd.Usage = D::USAGE_IMMUTABLE; D::BufferData bdata; bdata.pData = d.indices.data(); bdata.DataSize = bd.Size; D::RefCntAutoPtr<D::IBuffer> b; device->CreateBuffer(bd, &bdata, &b); if (!b) return RenderError::BufferCreationFailed; dd->ib = std::move(b); }
+		// BIND_RAY_TRACING allows the buffers to be read during BLAS build operations.
+		{ D::BufferDesc bd; bd.Name = "VB"; bd.Size = d.vertices.size() * sizeof(Vertex); bd.BindFlags = D::BIND_VERTEX_BUFFER | D::BIND_RAY_TRACING; bd.Usage = D::USAGE_IMMUTABLE; D::BufferData bdata; bdata.pData = d.vertices.data(); bdata.DataSize = bd.Size; D::RefCntAutoPtr<D::IBuffer> b; device->CreateBuffer(bd, &bdata, &b); if (!b) return RenderError::BufferCreationFailed; dd->vb = std::move(b); }
+		{ D::BufferDesc bd; bd.Name = "IB"; bd.Size = d.indices.size() * sizeof(UInt32); bd.BindFlags = D::BIND_INDEX_BUFFER | D::BIND_RAY_TRACING; bd.Usage = D::USAGE_IMMUTABLE; D::BufferData bdata; bdata.pData = d.indices.data(); bdata.DataSize = bd.Size; D::RefCntAutoPtr<D::IBuffer> b; device->CreateBuffer(bd, &bdata, &b); if (!b) return RenderError::BufferCreationFailed; dd->ib = std::move(b); }
 		return MeshHandle{ a.index, a.generation };
 	}
 
@@ -1023,9 +1096,9 @@ struct RenderSubsystem::RenderBackend {
 		D::Uint64 vo = 0; D::IBuffer* vbs[] = { md->vb.RawPtr() };
 		ctx->SetVertexBuffers(0, 1, vbs, &vo, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION, D::SET_VERTEX_BUFFERS_FLAG_RESET);
 		ctx->SetIndexBuffer(md->ib, 0, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-		Mat4 wm = tr.computeMatrix(false);
+		Mat4 wm = tr.computeWorldMatrix();
 		// g_Normal = transpose(inverse(world)) in column-major (for mul(g_Normal, normal) convention)
-		Mat4 nm = tr.computeMatrix(true);
+		Mat4 nm = tr.computeNormalMatrix();
 		for (UInt32 si = 0; si < (UInt32)md->sub.size(); si++) {
 			auto& s = md->sub[si];
 			auto* mt = materials.get(s.material.index, s.material.generation);
@@ -1439,6 +1512,15 @@ void RenderSubsystem::setWindow(void* w) { m_backend->wnd = w; }
 bool RenderSubsystem::isReady() const { return m_backend->ok; }
 void RenderSubsystem::setBackend(RenderBackendType t) { m_backend->backendType = t; }
 RenderBackendType RenderSubsystem::backend() const { return m_backend->backendType; }
+
+void RenderSubsystem::setRayTracingEnabled(bool enable) { m_backend->requestRayTracing = enable; }
+bool RenderSubsystem::isRayTracingEnabled() const { return m_backend->requestRayTracing; }
+RayTracingCaps RenderSubsystem::rayTracingCaps() const { return m_backend->rtCaps; }
+bool RenderSubsystem::supportsInlineRayTracing() const { return hasRayTracingCap(m_backend->rtCaps, RayTracingCaps::InlineRayTracing); }
+bool RenderSubsystem::supportsStandaloneRayTracing() const { return hasRayTracingCap(m_backend->rtCaps, RayTracingCaps::StandaloneShaders); }
+UInt32 RenderSubsystem::maxRayRecursionDepth() const { return m_backend->rtMaxRecursionDepth; }
+UInt32 RenderSubsystem::maxInstancesPerTLAS() const { return m_backend->rtMaxInstancesPerTLAS; }
+
 void RenderSubsystem::setMSAASampleCount(UInt8 c) { m_backend->msaaSamples = c; }
 UInt8 RenderSubsystem::msaaSamples() const { return m_backend->msaaSamples; }
 
@@ -1452,6 +1534,155 @@ Result<MeshHandle, RenderError> RenderSubsystem::createMesh(const MeshDesc& d) {
 Result<TextureHandle, RenderError> RenderSubsystem::createTexture(const TextureDesc& d) { if (!m_backend->ok) return RenderError::NotInitialized; return m_backend->mkTex(d); }
 Result<SamplerHandle, RenderError> RenderSubsystem::createSampler(const SamplerDesc& d) { if (!m_backend->ok) return RenderError::NotInitialized; return m_backend->mkSampler(d); }
 Result<MaterialHandle, RenderError> RenderSubsystem::createMaterial(const MaterialDesc& d, PSOHandle p) { if (!m_backend->ok) return RenderError::NotInitialized; return m_backend->mkMat(d, p); }
+
+// -------------------------------------------------------------------
+// Acceleration structures (ray tracing)
+// -------------------------------------------------------------------
+
+Result<BLASHandle, RenderError> RenderSubsystem::createBLAS(MeshHandle mesh) {
+	auto& b = *m_backend;
+	if (!b.ok) return RenderError::NotInitialized;
+	if (b.rtCaps == RayTracingCaps::None) { EError("createBLAS: ray tracing is not available on this device."); return RenderError::OperationFailed; }
+	auto* md = b.meshes.get(mesh.index, mesh.generation);
+	if (!md || !md->vb || !md->ib || md->ic == 0) return RenderError::InvalidHandle;
+
+	D::BLASTriangleDesc tri;
+	tri.GeometryName         = "Mesh";
+	tri.MaxVertexCount       = md->vc;
+	tri.VertexValueType      = D::VT_FLOAT32;
+	tri.VertexComponentCount = 3;
+	tri.MaxPrimitiveCount    = md->ic / 3;
+	tri.IndexType            = D::VT_UINT32;
+
+	D::BottomLevelASDesc ad;
+	ad.Name          = "EE_Mesh_BLAS";
+	ad.Flags         = D::RAYTRACING_BUILD_AS_PREFER_FAST_TRACE;
+	ad.pTriangles    = &tri;
+	ad.TriangleCount = 1;
+	D::RefCntAutoPtr<D::IBottomLevelAS> blas;
+	b.device->CreateBLAS(ad, &blas);
+	if (!blas) { EError("createBLAS: BLAS creation failed for mesh {}", mesh.index); return RenderError::AccelerationStructureCreationFailed; }
+
+	// Reusable scratch buffer; recreate only when the required size grows.
+	{
+		const auto sz = blas->GetScratchBufferSizes().Build;
+		if (!b.blasScratch || b.blasScratch->GetDesc().Size < sz) {
+			D::BufferDesc sd; sd.Name = "BLAS Scratch"; sd.Usage = D::USAGE_DEFAULT; sd.BindFlags = D::BIND_RAY_TRACING; sd.Size = sz;
+			b.blasScratch.Release();
+			b.device->CreateBuffer(sd, nullptr, &b.blasScratch);
+			if (!b.blasScratch) return RenderError::BufferCreationFailed;
+		}
+	}
+
+	D::BLASBuildTriangleData td;
+	td.GeometryName         = tri.GeometryName;
+	td.pVertexBuffer        = md->vb;
+	td.VertexStride         = sizeof(Vertex);
+	td.VertexCount          = md->vc;
+	td.VertexValueType      = tri.VertexValueType;
+	td.VertexComponentCount = tri.VertexComponentCount;
+	td.pIndexBuffer         = md->ib;
+	td.PrimitiveCount       = tri.MaxPrimitiveCount;
+	td.IndexType            = tri.IndexType;
+	td.Flags                = D::RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+
+	D::BuildBLASAttribs ba;
+	ba.pBLAS             = blas;
+	ba.pTriangleData     = &td;
+	ba.TriangleDataCount = 1;
+	ba.pScratchBuffer    = b.blasScratch;
+	ba.BLASTransitionMode          = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+	ba.GeometryTransitionMode      = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+	ba.ScratchBufferTransitionMode = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+	b.ctx->BuildBLAS(ba);
+
+	auto a = b.blases.allocate();
+	auto* dd = b.blases.getUnchecked(a.index);
+	dd->blas = std::move(blas);
+	dd->sourceMesh = mesh;
+	EInfo("BLAS created for mesh {} ({} verts, {} primitives)", mesh.index, md->vc, md->ic / 3);
+	return BLASHandle{ a.index, a.generation };
+}
+
+Result<TLASHandle, RenderError> RenderSubsystem::createTLAS(UInt32 maxInstances, bool allowUpdate) {
+	auto& b = *m_backend;
+	if (!b.ok) return RenderError::NotInitialized;
+	if (b.rtCaps == RayTracingCaps::None) { EError("createTLAS: ray tracing is not available on this device."); return RenderError::OperationFailed; }
+	if (maxInstances == 0) return RenderError::InvalidArgument;
+
+	D::TopLevelASDesc td;
+	td.Name             = "EE_TLAS";
+	td.MaxInstanceCount = maxInstances;
+	td.Flags            = D::RAYTRACING_BUILD_AS_PREFER_FAST_TRACE;
+	if (allowUpdate) td.Flags |= D::RAYTRACING_BUILD_AS_ALLOW_UPDATE;
+	D::RefCntAutoPtr<D::ITopLevelAS> tlas;
+	b.device->CreateTLAS(td, &tlas);
+	if (!tlas) { EError("createTLAS: TLAS creation failed"); return RenderError::AccelerationStructureCreationFailed; }
+
+	auto a = b.tlases.allocate();
+	auto* dd = b.tlases.getUnchecked(a.index);
+	dd->tlas = std::move(tlas);
+	dd->maxInstances = maxInstances;
+	dd->allowUpdate = allowUpdate;
+	EInfo("TLAS created (maxInstances={}, allowUpdate={})", maxInstances, allowUpdate);
+	return TLASHandle{ a.index, a.generation };
+}
+
+Result<void, RenderError> RenderSubsystem::buildTLAS(TLASHandle h, const Vector<TLASInstance>& instances) {
+	auto& b = *m_backend;
+	if (!b.ok) return RenderError::NotInitialized;
+	auto* dd = b.tlases.get(h.index, h.generation);
+	if (!dd || !dd->tlas) return RenderError::InvalidHandle;
+	if (instances.empty()) return RenderError::InvalidArgument;
+	if (instances.size() > dd->maxInstances) { EError("buildTLAS: {} instances exceed TLAS capacity {}", instances.size(), dd->maxInstances); return RenderError::InvalidArgument; }
+
+	// Lazily create scratch + instance buffers.
+	if (!dd->scratch) {
+		D::BufferDesc sd; sd.Name = "TLAS Scratch"; sd.Usage = D::USAGE_DEFAULT; sd.BindFlags = D::BIND_RAY_TRACING;
+		sd.Size = std::max(dd->tlas->GetScratchBufferSizes().Build, dd->tlas->GetScratchBufferSizes().Update);
+		b.device->CreateBuffer(sd, nullptr, &dd->scratch);
+		if (!dd->scratch) return RenderError::BufferCreationFailed;
+	}
+	if (!dd->instanceBuf) {
+		D::BufferDesc id; id.Name = "TLAS Instances"; id.Usage = D::USAGE_DEFAULT; id.BindFlags = D::BIND_RAY_TRACING;
+		id.Size = static_cast<D::Uint64>(D::TLAS_INSTANCE_DATA_SIZE) * dd->maxInstances;
+		b.device->CreateBuffer(id, nullptr, &dd->instanceBuf);
+		if (!dd->instanceBuf) return RenderError::BufferCreationFailed;
+	}
+
+	// Prepare instance data.
+	Vector<D::TLASBuildInstanceData> insts;
+	insts.reserve(instances.size());
+	for (const auto& in : instances) {
+		auto* bd = b.blases.get(in.blas.index, in.blas.generation);
+		if (!bd || !bd->blas) { EError("buildTLAS: invalid BLAS handle {}:{}", in.blas.index, in.blas.generation); return RenderError::InvalidHandle; }
+		D::TLASBuildInstanceData di;
+		di.InstanceName = in.name.empty() ? nullptr : in.name.c_str();
+		di.CustomId     = in.customId;
+		di.Mask         = in.mask;
+		di.pBLAS        = bd->blas;
+		// glm is column-major, Diligent instance transform is row-major.
+		D::float4x4 dm = toDiligentMatrix(in.transform);
+		di.Transform.SetRotation(dm.Data(), 4);
+		di.Transform.SetTranslation(dm[3][0], dm[3][1], dm[3][2]);
+		insts.push_back(di);
+	}
+
+	D::BuildTLASAttribs ba;
+	ba.pTLAS            = dd->tlas;
+	ba.Update           = dd->built && dd->allowUpdate;
+	ba.pInstances       = insts.data();
+	ba.InstanceCount    = static_cast<D::Uint32>(insts.size());
+	ba.pInstanceBuffer  = dd->instanceBuf;
+	ba.pScratchBuffer   = dd->scratch;
+	ba.TLASTransitionMode          = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+	ba.BLASTransitionMode          = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+	ba.InstanceBufferTransitionMode = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+	ba.ScratchBufferTransitionMode  = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+	b.ctx->BuildTLAS(ba);
+	dd->built = true;
+	return {};
+}
 
 Result<CameraHandle, RenderError> RenderSubsystem::createCamera(const CameraDesc& d) {
 	if (!m_backend->ok) return RenderError::NotInitialized;
@@ -1634,7 +1865,6 @@ void RenderSubsystem::beginFrame() { if (m_backend->ok) m_backend->begin(); }
 
 void RenderSubsystem::drawMesh(MeshHandle m, const Transform& t) { if (m_backend->ok) m_backend->draw(m, t); }
 
-void RenderSubsystem::drawSubMesh(MeshHandle, UInt32, const Transform&) {}
 void RenderSubsystem::drawMeshInstanced(MeshHandle m, const Vector<Mat4>& wm) { if (m_backend->ok) m_backend->drawInstanced(m, wm); }
 void RenderSubsystem::drawMeshInstancedIndirect(MeshHandle m, ComputeSRV ws, ComputeSRV is, ComputeBuf ir, UInt32 off) { if (m_backend->ok) m_backend->drawInstancedIndirect(m, ws, is, ir, off); }
 SubMesh RenderSubsystem::getSubMesh(MeshHandle mh, UInt32 subIdx) const {
@@ -1766,8 +1996,20 @@ Result<void, CoreError> RenderSubsystem::onInitialize() {
 	auto dr = m_backend->createDefaults(); if (dr.isErr()) { EError("Render defaults: {}", ToString(dr.error())); return CoreError::OperationFailed; }
 	m_backend->ok = true;
 	const char* bn = "?"; switch (m_backend->backendType) { case RenderBackendType::D3D12: bn = "D3D12"; break; case RenderBackendType::D3D11: bn = "D3D11"; break; case RenderBackendType::Vulkan: bn = "Vulkan"; break; default: bn = "Auto"; break; }
-																						 EInfo("Rendering ready ({}x{}, {})", m_backend->w, m_backend->h, bn);
-																						 return {};
+	EInfo("Rendering ready ({}x{}, {})", m_backend->w, m_backend->h, bn);
+	if (m_backend->rtCaps != RayTracingCaps::None) {
+		EInfo("Ray tracing available on {}: inline={} standalone={} maxRecursion={} maxInstancesPerTLAS={}",
+			bn,
+			hasRayTracingCap(m_backend->rtCaps, RayTracingCaps::InlineRayTracing),
+			hasRayTracingCap(m_backend->rtCaps, RayTracingCaps::StandaloneShaders),
+			m_backend->rtMaxRecursionDepth,
+			m_backend->rtMaxInstancesPerTLAS);
+	}
+	else {
+		EInfo("Ray tracing is NOT available on this device/driver{}; rasterization only.",
+			m_backend->requestRayTracing ? " (feature was requested)" : " (feature was disabled by application)");
+	}
+	return {};
 }
 void RenderSubsystem::onShutdown() { m_backend->ok = false; m_backend->device.Release(); m_backend->ctx.Release(); m_backend->sc.Release(); m_backend->factory.Release(); EInfo("Rendering shut down"); }
 

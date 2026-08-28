@@ -28,6 +28,7 @@ enum class RenderError {
 	ResourceNotFound,
 	InvalidHandle,
 	PoolExhausted,
+	AccelerationStructureCreationFailed,
 	OperationFailed,
 	BackendError,
 };
@@ -59,6 +60,7 @@ inline const char* ToString(RenderError error) {
 	case RenderError::ResourceNotFound: return "ResourceNotFound";
 	case RenderError::InvalidHandle: return "InvalidHandle";
 	case RenderError::PoolExhausted: return "PoolExhausted";
+	case RenderError::AccelerationStructureCreationFailed: return "AccelerationStructureCreationFailed";
 	case RenderError::OperationFailed: return "OperationFailed";
 	case RenderError::BackendError: return "BackendError";
 	}

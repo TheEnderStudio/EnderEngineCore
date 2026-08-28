@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <Engine/Core/Subsystem.hpp>
 #include <Engine/Jobs/JobTypes.hpp>
@@ -44,6 +44,39 @@ public:
 	 */
 	RenderBackendType backend() const;
 
+	/**
+	 * @brief Enable or disable the ray tracing device feature.
+	 *
+	 * When enabled (default), D3D12 and Vulkan device creation requests the
+	 * ray tracing feature. On GPUs/drivers without ray tracing support the
+	 * device creation may fail and the engine falls back to the next backend
+	 * (e.g. D3D11) as usual. Must be called before initialize().
+	 * @param enable true to request ray tracing.
+	 */
+	void setRayTracingEnabled(bool enable);
+
+	/// @brief Whether the ray tracing device feature was requested (not whether it is available).
+	EE_NODISCARD bool isRayTracingEnabled() const;
+
+	/**
+	 * @brief Get the raw ray tracing capability flags reported by the device.
+	 *
+	 * Valid after initialize(). Zero means ray tracing is not available.
+	 */
+	EE_NODISCARD RayTracingCaps rayTracingCaps() const;
+
+	/// @brief Whether the device supports inline ray tracing (RayQuery in compute shaders, DXR 1.1).
+	EE_NODISCARD bool supportsInlineRayTracing() const;
+
+	/// @brief Whether the device supports the full ray tracing pipeline (raygen / closest hit / miss shaders).
+	EE_NODISCARD bool supportsStandaloneRayTracing() const;
+
+	/// @brief Maximum supported ray recursion depth (0 if ray tracing is unavailable).
+	EE_NODISCARD UInt32 maxRayRecursionDepth() const;
+
+	/// @brief Maximum number of instances in a top-level acceleration structure (0 if ray tracing is unavailable).
+	EE_NODISCARD UInt32 maxInstancesPerTLAS() const;
+
 	/// @brief Set MSAA sample count (1=off, 2/4/8). Applied to all PSOs at creation.
 	void setMSAASampleCount(UInt8 count);
 	UInt8 msaaSamples() const;
@@ -71,6 +104,41 @@ public:
 	/// @brief Render shadow pass with GPU-culled instances via indirect draw.
 	void renderShadowPassIndirect(class ShadowSubsystem& shadow, MeshHandle mesh, ComputeSRV worldMatSRV, ComputeSRV indicesSRV, ComputeBuf argsBuf, UInt32 argsByteOffset);
 	void clearShadowCascades(class ShadowSubsystem& shadow);
+
+	// -------------------------------------------------------------------
+	// Acceleration structures (ray tracing)
+	// -------------------------------------------------------------------
+
+	/**
+	 * @brief Create a bottom-level acceleration structure (BLAS) from an existing mesh.
+	 *
+	 * The mesh must have been created through createMesh()/loadModel() so its GPU
+	 * vertex/index buffers are available (they are flagged with BIND_RAY_TRACING).
+	 * Requires ray tracing support on the device.
+	 * @param mesh Source mesh handle.
+	 * @return BLAS handle, or an error (e.g. OperationFailed if ray tracing is unavailable).
+	 */
+	Result<BLASHandle, RenderError> createBLAS(MeshHandle mesh);
+
+	/**
+	 * @brief Create a top-level acceleration structure (TLAS).
+	 * @param maxInstances Maximum number of instances the TLAS can hold.
+	 * @param allowUpdate Allow per-frame updates via buildTLAS() (adds RAYTRACING_BUILD_AS_ALLOW_UPDATE).
+	 * @return TLAS handle, or an error.
+	 */
+	Result<TLASHandle, RenderError> createTLAS(UInt32 maxInstances, bool allowUpdate = true);
+
+	/**
+	 * @brief Build (first call) or update (subsequent calls) the TLAS from the given instances.
+	 *
+	 * Instance transforms are copied into a GPU instance buffer every call; the first
+	 * call builds the TLAS, later calls update it in place (requires allowUpdate = true
+	 * at createTLAS()). All referenced BLASes must be valid.
+	 * @param tlas TLAS handle from createTLAS().
+	 * @param instances Instance list (size must not exceed maxInstances).
+	 * @return Result indicating success or failure.
+	 */
+	Result<void, RenderError> buildTLAS(TLASHandle tlas, const Vector<TLASInstance>& instances);
 
 	// -------------------------------------------------------------------
 	// Shader management
@@ -193,8 +261,6 @@ public:
 	void beginFrame();
 	/// @brief Draw a mesh at the given transform.
 	void drawMesh(MeshHandle mesh, const Transform& transform);
-	/// @brief Draw a submesh at the given transform.
-	void drawSubMesh(MeshHandle mesh, UInt32 subMeshIndex, const Transform& transform);
 
 	/**
 	 * @brief Draw a mesh with instanced rendering (one draw call for all instances).

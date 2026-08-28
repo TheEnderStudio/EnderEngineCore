@@ -1,4 +1,4 @@
-﻿#include <Engine/Core/Core.hpp>
+#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -194,7 +194,30 @@ int WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int)
 	renderer.setWindow(window.glfwWindow());
 	renderer.setBackend(RenderBackendType::D3D12);
 	renderer.setMSAASampleCount(4);
-	renderer.initialize();
+	{
+		auto rerr = renderer.initialize();
+		if (rerr.isErr()) {
+			EError("Renderer initialization failed: {} - aborting.", ToString(rerr.error()));
+			input.shutdown();
+			jobs.shutdown();
+			window.close();
+			Engine::shutdown();
+			return 1;
+		}
+	}
+
+	// --- Ray tracing capability report ---
+	{
+		const auto rtCaps = renderer.rayTracingCaps();
+		if (rtCaps != RayTracingCaps::None) {
+			EInfo("Ray tracing supported: inline={} standalone={} | maxRecursion={} maxInstancesPerTLAS={}",
+				renderer.supportsInlineRayTracing(), renderer.supportsStandaloneRayTracing(),
+				renderer.maxRayRecursionDepth(), renderer.maxInstancesPerTLAS());
+		}
+		else {
+			EInfo("Ray tracing NOT supported on this GPU/driver - running rasterization only.");
+		}
+	}
 
 	// --- Debug UI ---
 	DebugUISubsystem debugUI;
@@ -344,6 +367,12 @@ float4 main(PSIn i) : SV_TARGET {
 
 	PSOHandle pso;
 	{ PipelineStateDesc pd; pd.name = "DemoPSO"; auto r = renderer.createPipelineState(pd); if (r.isOk()) pso = r.value(); }
+
+	// Ray tracing acceleration structures (M2 validation)
+	std::atomic<bool> rtASBuilt{ false };
+	TLASHandle rtTLAS;
+	Vector<BLASHandle> rtBLAS;
+	Vector<TLASInstance> rtInstances;
 
 	std::atomic<bool> modelLoadCompleted{ false };
 	Object modelObj;
@@ -656,6 +685,8 @@ HALT
 		debugUI.text("Camera X: {}", fly.pos.x);
 		debugUI.text("Camera Y: {}", fly.pos.y);
 		debugUI.text("Camera Z: {}", fly.pos.z);
+		debugUI.text("RayTracing: inline={} standalone={}", renderer.supportsInlineRayTracing(), renderer.supportsStandaloneRayTracing());
+		debugUI.text("RT AS: {} BLAS, TLAS={}", rtBLAS.size(), rtASBuilt.load(std::memory_order_acquire) ? "built" : "pending");
 		{
 			static size_t visibleCount = 0;
 			// Use the GPU-computed count from args buffer readback (logged above)
@@ -746,6 +777,53 @@ HALT
 			if (r.isOk()) {
 				physicsBodies.createStaticMeshFromCooked(r->data(), r->size(), Vec3(20.0f, -19.0f, 20.0f), Quat(1, 0, 0, 0));
 				EInfo("Loaded cooked wall mesh ({} bytes)", r->size());
+			}
+		}
+
+		// Build ray tracing acceleration structures once all static models are loaded (M2).
+		if (!rtASBuilt.load(std::memory_order_acquire) &&
+			renderer.supportsInlineRayTracing() &&
+			modelLoadCompleted.load(std::memory_order_acquire) &&
+			terrianLoadCompleted.load(std::memory_order_acquire) &&
+			wallLoadCompleted.load(std::memory_order_acquire))
+		{
+			Vector<MeshHandle> staticMeshes;
+			Vector<Transform>  staticTransforms;
+			for (auto& m : model)   { staticMeshes.push_back(m); staticTransforms.push_back(Transform{}); }
+			for (auto& m : terrian) { staticMeshes.push_back(m); staticTransforms.push_back(Transform{}); }
+			for (auto& m : wall)    { staticMeshes.push_back(m); staticTransforms.push_back(Transform{ .position = Vec3(20, -19, 20) }); }
+
+			for (size_t i = 0; i < staticMeshes.size(); ++i) {
+				auto br = renderer.createBLAS(staticMeshes[i]);
+				if (br.isOk()) {
+					TLASInstance inst;
+					inst.blas      = br.value();
+					inst.transform = staticTransforms[i].computeWorldMatrix();
+					inst.customId  = (UInt32)i;
+					inst.name      = "StaticInst" + std::to_string(i);
+					rtBLAS.push_back(br.value());
+					rtInstances.push_back(inst);
+				}
+				else {
+					EError("createBLAS failed for static mesh {}: {}", i, ToString(br.error()));
+				}
+			}
+			auto tr = renderer.createTLAS((UInt32)rtInstances.size(), true);
+			if (tr.isOk()) {
+				rtTLAS = tr.value();
+				rtASBuilt.store(true, std::memory_order_release);
+				EInfo("RT AS ready: {} BLAS, TLAS ({} instances)", rtBLAS.size(), rtInstances.size());
+			}
+			else {
+				EError("createTLAS failed: {}", ToString(tr.error()));
+			}
+		}
+		// Keep the TLAS updated every frame (build on first call, update afterwards).
+		if (rtASBuilt.load(std::memory_order_acquire)) {
+			auto br = renderer.buildTLAS(rtTLAS, rtInstances);
+			if (br.isErr()) {
+				static bool warned = false;
+				if (!warned) { EError("buildTLAS failed: {}", ToString(br.error())); warned = true; }
 			}
 		}
 

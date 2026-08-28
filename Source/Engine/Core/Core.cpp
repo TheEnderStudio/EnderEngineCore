@@ -1,4 +1,4 @@
-﻿#include <Core/Core.hpp>
+#include <Core/Core.hpp>
 #include <Core/Log.hpp>
 #include <Core/Crash.h>
 #include <Core/Subsystem.hpp>
@@ -110,7 +110,7 @@ void Engine::unregisterSubsystem(Subsystem* subsystem) {
 	EInfo("Subsystem '{}' unregistered.", subsystem->name());
 }
 
-const Vector<Subsystem*>& Engine::subsystems() {
+Vector<Subsystem*> Engine::subsystems() {
 	std::lock_guard<Mutex> lock(g_subsystemMutex);
 	return g_subsystems;
 }
@@ -120,11 +120,22 @@ void Engine::update(F64 deltaTime) {
 		return;
 	}
 
-	std::lock_guard<Mutex> lock(g_subsystemMutex);
-	for (Subsystem* subsystem : g_subsystems) {
-		if (subsystem && subsystem->updateMode() == SubsystemUpdateMode::FixedMainThread) {
-			subsystem->update(deltaTime);
+	// Snapshot the affected subsystems under the lock, then invoke their
+	// update callbacks outside of it so that subsystems may safely register
+	// or unregister other subsystems (and Engine::registerSubsystem/unregisterSubsystem
+	// may be called) without deadlocking on the non-reentrant registry mutex.
+	Vector<Subsystem*> snapshot;
+	{
+		std::lock_guard<Mutex> lock(g_subsystemMutex);
+		snapshot.reserve(g_subsystems.size());
+		for (Subsystem* subsystem : g_subsystems) {
+			if (subsystem && subsystem->updateMode() == SubsystemUpdateMode::FixedMainThread) {
+				snapshot.push_back(subsystem);
+			}
 		}
+	}
+	for (Subsystem* subsystem : snapshot) {
+		subsystem->update(deltaTime);
 	}
 }
 
@@ -133,11 +144,18 @@ void Engine::fixedUpdate(F64 fixedDeltaTime) {
 		return;
 	}
 
-	std::lock_guard<Mutex> lock(g_subsystemMutex);
-	for (Subsystem* subsystem : g_subsystems) {
-		if (subsystem && subsystem->updateMode() == SubsystemUpdateMode::FixedMainThread) {
-			subsystem->fixedUpdate(fixedDeltaTime);
+	Vector<Subsystem*> snapshot;
+	{
+		std::lock_guard<Mutex> lock(g_subsystemMutex);
+		snapshot.reserve(g_subsystems.size());
+		for (Subsystem* subsystem : g_subsystems) {
+			if (subsystem && subsystem->updateMode() == SubsystemUpdateMode::FixedMainThread) {
+				snapshot.push_back(subsystem);
+			}
 		}
+	}
+	for (Subsystem* subsystem : snapshot) {
+		subsystem->fixedUpdate(fixedDeltaTime);
 	}
 }
 
