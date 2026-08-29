@@ -1,4 +1,4 @@
-#include <Engine/Core/Core.hpp>
+﻿#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -336,6 +336,11 @@ float4 main(PSIn i) : SV_TARGET {
 	rayTracing.attachToRenderer(&renderer);
 	bool hybridRT = false; // F9 toggles between rasterization and hybrid ray tracing
 	UInt32 rtDrawMode = 0; // compose debug mode (0=shaded ... 5=Fresnel)
+	UInt32 rtShadowPCF = 4; // PCF shadow samples (1..16)
+	F32 rtAoRadius = 1.5f;   // AO ray length
+	UInt32 rtAoSamples = 4;  // AO rays per pixel (0 = off)
+	F32 rtLightSize = 0.05f; // PCSS light size (0 = fixed-cone PCF)
+	F32 rtReflectionBlur = 0.7f; // roughness-driven reflection attenuation
 	bool rtHalfRes = true; // half-resolution ray tracing (faster; may flicker on far small objects)
 	TextureHandle gbufColor, gbufNormal, gbufDepth, rtTex;
 	// (Re)create the window-sized G-buffer + ray traced output textures.
@@ -385,6 +390,14 @@ float4 main(PSIn i) : SV_TARGET {
 
 	// Skybox with cubemap from 6 face images
 	TextureHandle skyCubeTexHandle;
+	// Skybox state shared between the renderer and the ray tracer (reflections).
+	static int s_skyMode = 0;
+	static Vec4 s_skyCorners[8] = {
+		Vec4(0.3f, 0.5f, 0.9f, 1), Vec4(0.4f, 0.55f, 0.95f, 1),
+		Vec4(0.4f, 0.55f, 0.95f, 1), Vec4(0.3f, 0.5f, 0.9f, 1),
+		Vec4(0.5f, 0.55f, 0.6f, 1), Vec4(0.5f, 0.55f, 0.6f, 1),
+		Vec4(0.5f, 0.55f, 0.6f, 1), Vec4(0.5f, 0.55f, 0.6f, 1),
+	};
 	{
 		RenderSubsystem::CubemapFace skyFaces[6] = {
 			{loadImage(ERes("skybox/right.png")), false, true},
@@ -721,14 +734,29 @@ HALT
 		debugUI.text("RT Subsystem: {}", rayTracing.isReady() ? "ready" : "disabled");
 		debugUI.text("Mode: {} (F9)", hybridRT ? "Hybrid RT" : "Raster");
 		if (hybridRT) {
-			static const char* rtModeNames[] = { "Shaded", "GBufferColor", "GBufferNormal", "Diffuse", "Reflections", "Fresnel" };
+			static const char* rtModeNames[] = { "Shaded", "GBufferColor", "GBufferNormal", "Diffuse", "Reflections", "Fresnel", "RTAlpha" };
 			if (debugUI.button(fmt::format("RT View: {}", rtModeNames[rtDrawMode]).c_str())) {
-				rtDrawMode = (rtDrawMode + 1) % 6;
+				rtDrawMode = (rtDrawMode + 1) % 7;
 			}
 			if (debugUI.button(fmt::format("RT Res: {}", rtHalfRes ? "Half" : "Full").c_str())) {
 				rtHalfRes = !rtHalfRes;
 				createGBufferTextures(ww, wh); // recreate the RT texture at the new resolution
 			}
+			{
+				float pcfF = (float)rtShadowPCF;
+				if (debugUI.sliderFloat("Shadow PCF", &pcfF, 1.0f, 16.0f)) {
+					rtShadowPCF = (UInt32)(pcfF + 0.5f);
+				}
+			}
+			if (debugUI.sliderFloat("Light Size (PCSS)", &rtLightSize, 0.0f, 0.3f)) {}
+			if (debugUI.sliderFloat("AO Radius", &rtAoRadius, 0.0f, 5.0f)) {}
+			{
+				float aoF = (float)rtAoSamples;
+				if (debugUI.sliderFloat("AO Samples", &aoF, 0.0f, 8.0f)) {
+					rtAoSamples = (UInt32)(aoF + 0.5f);
+				}
+			}
+			if (debugUI.sliderFloat("Refl Blur", &rtReflectionBlur, 0.0f, 1.0f)) {}
 		}
 		{
 			static size_t visibleCount = 0;
@@ -738,29 +766,31 @@ HALT
 		debugUI.endWindow();
 
 		debugUI.beginWindow("Skybox");
-		static int skyMode = 0;
 		static const char* skyNames[] = { "Day", "Sunset", "Night", "Texture" };
 		int totalModes = skyCubeTexHandle.isValid() ? 4 : 3;
-		if (debugUI.button(fmt::format("Sky: {}", skyNames[skyMode]).c_str())) {
-			skyMode = (skyMode + 1) % totalModes;
+		if (debugUI.button(fmt::format("Sky: {}", skyNames[s_skyMode]).c_str())) {
+			s_skyMode = (s_skyMode + 1) % totalModes;
 			RenderSubsystem::SkyboxDesc sd;
-			if (skyMode == 3) {
+			if (s_skyMode == 3) {
 				sd.skyCubeTex = skyCubeTexHandle;
 			}
-			else if (skyMode == 0) {
+			else if (s_skyMode == 0) {
 				// Day: blue top, gray horizon
-				for (int i = 0; i < 4; i++) sd.corners[i] = Vec4(0.3f + (i & 1) * 0.1f, 0.5f + (i & 2) * 0.05f, 0.9f + ((i >> 1) & 1) * 0.05f, 1);
-				for (int i = 4; i < 8; i++) sd.corners[i] = Vec4(0.5f, 0.55f, 0.6f, 1);
+				for (int i = 0; i < 4; i++) s_skyCorners[i] = Vec4(0.3f + (i & 1) * 0.1f, 0.5f + (i & 2) * 0.05f, 0.9f + ((i >> 1) & 1) * 0.05f, 1);
+				for (int i = 4; i < 8; i++) s_skyCorners[i] = Vec4(0.5f, 0.55f, 0.6f, 1);
+				memcpy(sd.corners, s_skyCorners, sizeof(s_skyCorners));
 			}
-			else if (skyMode == 1) {
+			else if (s_skyMode == 1) {
 				// Sunset: orange top, dark purple horizon
-				for (int i = 0; i < 4; i++) sd.corners[i] = Vec4(0.9f, 0.4f + ((i & 2) >> 1) * 0.15f, 0.15f + ((i >> 1) & 1) * 0.1f, 1);
-				for (int i = 4; i < 8; i++) sd.corners[i] = Vec4(0.3f, 0.15f, 0.25f, 1);
+				for (int i = 0; i < 4; i++) s_skyCorners[i] = Vec4(0.9f, 0.4f + ((i & 2) >> 1) * 0.15f, 0.15f + ((i >> 1) & 1) * 0.1f, 1);
+				for (int i = 4; i < 8; i++) s_skyCorners[i] = Vec4(0.3f, 0.15f, 0.25f, 1);
+				memcpy(sd.corners, s_skyCorners, sizeof(s_skyCorners));
 			}
 			else {
 				// Night: dark blue top, black bottom
-				for (int i = 0; i < 4; i++) sd.corners[i] = Vec4(0.05f, 0.05f, 0.2f + (i & 1) * 0.05f, 1);
-				for (int i = 4; i < 8; i++) sd.corners[i] = Vec4(0.02f, 0.02f, 0.05f, 1);
+				for (int i = 0; i < 4; i++) s_skyCorners[i] = Vec4(0.05f, 0.05f, 0.2f + (i & 1) * 0.05f, 1);
+				for (int i = 4; i < 8; i++) s_skyCorners[i] = Vec4(0.02f, 0.02f, 0.05f, 1);
+				memcpy(sd.corners, s_skyCorners, sizeof(s_skyCorners));
 			}
 			renderer.setSkybox(sd);
 		}
@@ -1174,6 +1204,7 @@ HALT
 			Mat4 vpInv = glm::inverse(proj * view);
 			Vec3 sunDir = glm::normalize(Vec3(cos(glm::radians(sunYaw)) * cos(glm::radians(sunPitch)),
 				-sin(glm::radians(sunPitch)), sin(glm::radians(sunYaw)) * cos(glm::radians(sunPitch))));
+			rayTracing.setSkybox(s_skyMode == 3, skyCubeTexHandle, s_skyCorners);
 			RayTraceConstants rc;
 			rc.viewProjInv = vpInv;
 			// The raster PBR shader uses Ldir = -light.dir (toward the light), so the
@@ -1182,6 +1213,30 @@ HALT
 			rc.cameraPos = Vec4(fly.pos, 1.0f);
 			rc.maxRayLength = 100.0f;
 			rc.ambientLight = 0.1f;
+			rc.shadowPCF = rtShadowPCF;
+			rc.aoRadius = rtAoRadius;
+			rc.aoSamples = rtAoSamples;
+			rc.lightSize = rtLightSize;
+			rc.reflectionBlur = rtReflectionBlur;
+			// Packed disc samples for soft shadows (16 points, xy/zw pairs).
+			// The first sample is the center (no perturbation) so PCF=1 behaves
+			// like a plain single shadow ray.
+			{
+				static Vec4 s_disc[8];
+				static bool s_discInit = false;
+				if (!s_discInit) {
+					memset(s_disc, 0, sizeof(s_disc));
+					for (int i = 1; i < 16; ++i) {
+						float r = std::sqrt((i + 0.5f) / 16.0f) * 0.8f;
+						float a = i * 2.399963f;
+						Vec2 p(cosf(a) * r, sinf(a) * r);
+						s_disc[i / 2][(i % 2) * 2] = p.x;
+						s_disc[i / 2][(i % 2) * 2 + 1] = p.y;
+					}
+					s_discInit = true;
+				}
+				memcpy(rc.discPoints, s_disc, sizeof(s_disc));
+			}
 			{
 				UInt32 rtw = rtHalfRes ? ww / 2 : ww;
 				UInt32 rth = rtHalfRes ? wh / 2 : wh;

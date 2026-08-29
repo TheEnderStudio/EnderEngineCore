@@ -380,14 +380,14 @@ struct PSIn
 struct PSOut
 {
     float4 Color : SV_Target0; ///< Albedo (RGBA8_SRGB).
-    float4 Norm  : SV_Target1; ///< World normal in [-1,1] (RGBA16_FLOAT).
+    float4 Norm  : SV_Target1; ///< World normal in rgb, roughness in alpha (RGBA16_FLOAT).
 };
 
 PSOut main(PSIn i)
 {
     PSOut o;
     o.Color = t_BC.Sample(t_BC_sampler, i.UV) * g_BaseColor;
-    o.Norm  = float4(normalize(i.N), 0.0);
+    o.Norm  = float4(normalize(i.N), g_MetallicRough.y);
     return o;
 }
 )";

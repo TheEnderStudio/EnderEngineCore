@@ -11,12 +11,20 @@ class RenderSubsystem;
 /// @brief Per-frame constants for the inline ray tracing compute shader.
 struct alignas(16) RayTraceConstants {
 	Mat4 viewProjInv;     ///< Inverse view-projection (column-major glm::mat4).
-	Vec4 lightDir;        ///< World-space light direction (xyz, w unused).
+	Vec4 lightDir;        ///< World-space light direction (toward the light, w unused).
 	Vec4 cameraPos;       ///< World-space camera position.
 	F32  maxRayLength = 100.0f;
 	F32  ambientLight = 0.1f;
+	UInt32 shadowPCF = 4; ///< PCF shadow samples per shadow ray (1..16).
 	F32  _pad0 = 0.0f;
-	F32  _pad1 = 0.0f;
+	Vec4 discPoints[8];   ///< 16 packed float2 disc samples (soft shadow cone, xy/zw pairs).
+	Vec4 skyCorners[8];   ///< Skybox corner colors (bit0=x+, bit1=y+, bit2=z+), matches SkyboxDesc::corners.
+	UInt32 skyMode = 0;   ///< 0 = corner gradient, 1 = cubemap texture.
+	UInt32 _padSky[3] = { 0, 0, 0 };
+	F32  aoRadius = 1.5f;      ///< AO ray length (world units).
+	UInt32 aoSamples = 4;      ///< AO rays per pixel (0 disables AO).
+	F32  lightSize = 0.05f;    ///< PCSS light angular size (0 = fixed-cone PCF).
+	F32  reflectionBlur = 0.7f; ///< Reflection attenuation by roughness (0..1).
 };
 
 /// @brief A ray-traced scene object (mesh + material + world transform).
@@ -84,6 +92,20 @@ public:
 	// -------------------------------------------------------------------
 	// Bindless scene
 	// -------------------------------------------------------------------
+
+	/**
+	 * @brief Set the skybox used by the reflection miss shader.
+	 *
+	 * Must match the skybox rendered by RenderSubsystem so that reflections
+	 * show the same background. Call whenever the skybox changes (and at least
+	 * once before trace()).
+	 * @param useCubemap true to sample the cubemap texture, false to use the
+	 *                   corner gradient (trilinear interpolation).
+	 * @param cubemap   Cubemap texture handle (valid only when useCubemap).
+	 * @param corners   8 corner colors (bit0=x+, bit1=y+, bit2=z+), same layout
+	 *                  as RenderSubsystem::SkyboxDesc::corners.
+	 */
+	void setSkybox(bool useCubemap, TextureHandle cubemap, const Vec4 corners[8]);
 
 	/**
 	 * @brief Rebuild bindless scene data from the given object groups.

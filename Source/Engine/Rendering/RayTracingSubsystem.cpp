@@ -43,8 +43,8 @@ struct alignas(16) RTMaterialAttribs {
 	Vec4 baseColorMask;       ///< Base color tint.
 	UInt32 sampInd;           ///< Index into the sampler array (always 0 for now).
 	UInt32 baseColorTexInd;   ///< Index into the texture array.
-	UInt32 padding0;
-	UInt32 padding1;
+	F32 roughness;            ///< Material roughness (drives reflection attenuation).
+	F32 metallic;             ///< Material metallic factor.
 };
 static_assert(sizeof(RTMaterialAttribs) % 16 == 0, "RTMaterialAttribs must be 16-byte aligned");
 
@@ -73,8 +73,8 @@ struct MaterialAttribs {
     float4 BaseColorMask;
     uint   SampInd;
     uint   BaseColorTexInd;
-    uint   padding0;
-    uint   padding1;
+    float  Roughness;
+    float  Metallic;
 };
 struct RTConstants {
     float4x4 ViewProjInv;
@@ -82,8 +82,18 @@ struct RTConstants {
     float4   CameraPos;
     float    MaxRayLength;
     float    AmbientLight;
+    uint     ShadowPCF;
     float    _pad0;
-    float    _pad1;
+    float4   DiscPoints[8];
+    float4   SkyCorners[8];
+    uint     SkyMode;
+    uint     _padSky0;
+    uint     _padSky1;
+    uint     _padSky2;
+    float    AoRadius;
+    uint     AoSamples;
+    float    LightSize;
+    float    ReflectionBlur;
 };
 
 RaytracingAccelerationStructure g_TLAS            : register(t0);
@@ -94,6 +104,7 @@ StructuredBuffer<uint>            g_IndexBuffer   : register(t4);
 Texture2D<float4>                 g_GBufferNormal : register(t5);
 Texture2D<float>                  g_GBufferDepth  : register(t6);
 Texture2D<float4>                 g_Textures[16]  : register(t7);
+TextureCube<float4>               g_SkyCube       : register(t23);
 RWTexture2D<float4>               g_OutRT         : register(u0);
 SamplerState                      g_Sampler       : register(s0);
 ConstantBuffer<RTConstants>       g_RTConstants   : register(b0);
@@ -115,20 +126,111 @@ float CastShadow(float3 Origin, float3 RayDir, float MaxRayLength)
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
 }
 
-float4 GetSkyColor(float3 Dir, float3 LightDir)
+// Percentage-closer soft shadows with optional PCSS (penumbra scales with the
+// blocker distance). Samples are taken from the packed DiscPoints array.
+float CastShadowPCF(float3 Origin, float3 LightDir, float MaxRayLength, float3 Norm, float DistToCam)
 {
-    Dir.y += 0.075;
-    Dir = normalize(Dir);
-    float CosTheta = dot(Dir, LightDir);
-    float Scatter  = pow(saturate(0.5 * (1.0 - CosTheta)), 0.2);
-    float3 Sky     = pow(saturate(CosTheta - 0.02), 50.0) * saturate(LightDir.y * 5.0);
-    float3 Dome    = float3(0.07, 0.11, 0.23) * lerp(max(Scatter, 0.1), 1.0, saturate(Dir.y)) / max(Dir.y, 0.01);
-    Dome *= 13.0 / max(length(Dome), 13.0);
-    float3 Horizon = pow(Dome, float3(1.0, 1.0, 1.0) - Dome);
-    Sky += lerp(Horizon, Dome / (Dome + 0.5), saturate(Dir.y * 2.0));
-    Sky *= 1.0 + pow(1.0 - Scatter, 10.0) * 10.0;
-    Sky *= 1.0 - abs(1.0 - Dir.y) * 0.5;
-    return float4(Sky, 1.0);
+    // Depth-reconstruction error grows ~z^2 (perspective), so the origin bias
+    // must scale with distance and with the slope (grazing angle) to keep the
+    // ray start outside the surface; otherwise the start point falls inside the
+    // mesh and the ray self-hits, producing regular "triangle" dark artifacts.
+    float ndl = max(dot(LightDir, Norm), 0.1);
+    float bias = max(0.002, 0.001 * DistToCam) / ndl;
+    float3 origin = Origin + Norm * bias + LightDir * (bias * 0.5);
+
+    float3 T = normalize(cross(abs(LightDir.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0), LightDir));
+    float3 B = cross(LightDir, T);
+    int    n = clamp((int)g_RTConstants.ShadowPCF, 1, 16);
+
+    // PCSS: estimate the penumbra from the distance to the nearest blocker.
+    float radius = 0.015;
+    if (g_RTConstants.LightSize > 0.0)
+    {
+        RayDesc blockerRay;
+        blockerRay.Origin    = origin;
+        blockerRay.Direction = LightDir;
+        blockerRay.TMin      = 0.0;
+        blockerRay.TMax      = MaxRayLength;
+        RayQuery<RAY_FLAG_CULL_FRONT_FACING_TRIANGLES> bq;
+        bq.TraceRayInline(g_TLAS, RAY_FLAG_NONE, ~0u, blockerRay);
+        bq.Proceed();
+        if (bq.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+        {
+            float blockerDist = bq.CommittedRayT();
+            // penumbra ~ (blockerDist - surfaceDist) * lightSize / blockerDist
+            float penumbra = saturate((blockerDist - 0.001) * g_RTConstants.LightSize / max(blockerDist, 0.001));
+            radius = clamp(penumbra * 0.05, 0.005, 0.05);
+        }
+    }
+
+    float s = 0.0;
+    for (int j = 0; j < 16; ++j)
+    {
+        if (j >= n)
+            break;
+        float4 dp = g_RTConstants.DiscPoints[j / 2];
+        float2 d  = (j % 2 == 0) ? dp.xy : dp.zw;
+        float3 dir = normalize(LightDir + (T * d.x + B * d.y) * radius);
+        s += CastShadow(origin, dir, MaxRayLength);
+    }
+    return s / float(n);
+}
+
+// Screen-space-style ambient occlusion: short rays in a hemisphere around the
+// normal, using the fixed disc directions. Returns 1 (unoccluded) .. 0 (fully
+// occluded). AoSamples == 0 disables it.
+float ComputeAO(float3 Origin, float3 Norm, float DistToCam)
+{
+    int samples = (int)g_RTConstants.AoSamples;
+    if (samples <= 0)
+        return 1.0;
+    samples = clamp(samples, 1, 16);
+
+    float3 T = normalize(cross(abs(Norm.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0), Norm));
+    float3 B = cross(Norm, T);
+    float bias = max(0.01, SMALL_OFFSET * DistToCam);
+    float3 aoOrigin = Origin + Norm * bias;
+
+    float occluded = 0.0;
+    for (int i = 0; i < samples; ++i)
+    {
+        float4 dp = g_RTConstants.DiscPoints[i / 2];
+        float2 d  = (i % 2 == 0) ? dp.xy : dp.zw;
+        // Hemisphere direction around the normal.
+        float3 dir = normalize(Norm + (T * d.x + B * d.y) * 0.8);
+
+        RayDesc ray;
+        ray.Origin    = aoOrigin;
+        ray.Direction = dir;
+        ray.TMin      = 0.0;
+        ray.TMax      = g_RTConstants.AoRadius;
+
+        RayQuery<RAY_FLAG_CULL_FRONT_FACING_TRIANGLES | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+        q.TraceRayInline(g_TLAS, RAY_FLAG_NONE, ~0u, ray);
+        q.Proceed();
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+            occluded += 1.0;
+    }
+    return 1.0 - occluded / float(samples);
+}
+
+float4 GetSkyColor(float3 Dir)
+{
+    // Sample the actual skybox so reflections match the rendered background:
+    // either the cubemap texture (SkyMode=1) or the corner gradient (SkyMode=0,
+    // trilinear interpolation of the 8 corner colors).
+    if (g_RTConstants.SkyMode == 1)
+    {
+        return float4(g_SkyCube.SampleLevel(g_Sampler, Dir, 0).rgb, 1.0);
+    }
+    float3 w = saturate(Dir * 0.5 + 0.5);
+    float3 c0  = lerp(g_RTConstants.SkyCorners[0].rgb, g_RTConstants.SkyCorners[1].rgb, w.x);
+    float3 c1  = lerp(g_RTConstants.SkyCorners[2].rgb, g_RTConstants.SkyCorners[3].rgb, w.x);
+    float3 c2  = lerp(g_RTConstants.SkyCorners[4].rgb, g_RTConstants.SkyCorners[5].rgb, w.x);
+    float3 c3  = lerp(g_RTConstants.SkyCorners[6].rgb, g_RTConstants.SkyCorners[7].rgb, w.x);
+    float3 c01 = lerp(c0, c1, w.y);
+    float3 c23 = lerp(c2, c3, w.y);
+    return float4(lerp(c01, c23, w.z), 1.0);
 }
 
 struct ReflectionResult {
@@ -182,13 +284,15 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
         Norm = normalize(mul((float3x3)Obj.NormalMat, Norm));
 
         res.BaseColor = Mtr.BaseColorMask * g_Textures[NonUniformResourceIndex(Mtr.BaseColorTexInd)].SampleLevel(g_Sampler, UV, 0);
+        // Roughness-driven reflection attenuation: rougher surfaces reflect less.
+        res.BaseColor *= (1.0 - Mtr.Roughness * g_RTConstants.ReflectionBlur);
         res.NdotL     = max(0.0, dot(LightDir, Norm));
         res.Found     = true;
 
         if (res.NdotL > 0.0)
         {
             float3 HitPos = Origin + ReflDir * q.CommittedRayT();
-            res.NdotL *= CastShadow(HitPos + Norm * SMALL_OFFSET * length(HitPos - CameraPos), LightDir, MaxShadowLen);
+            res.NdotL *= CastShadowPCF(HitPos, LightDir, MaxShadowLen, Norm, length(HitPos - CameraPos));
         }
     }
     return res;
@@ -209,30 +313,67 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
     if (DTid.x >= Dim.x || DTid.y >= Dim.y)
         return;
 
-    // Normalized UV of the half-res pixel center; sampling the full-res G-buffer
-    // with this UV performs bilinear filtering (softens shadow/reflection edges).
-    float2 UV = (float2(DTid) + 0.5) / float2(Dim);
+    // Depth-guided sampling: pick the G-buffer texel with the nearest depth
+    // (the visible surface). At half resolution we scan the 2x2 footprint of
+    // this output pixel; at full resolution it is the 1:1 texel. This avoids
+    // blending depth/normal across geometry edges (bilinear "triangle"
+    // artifacts) while keeping surface detail (vs. always sampling one center
+    // texel, which produces blocky/banded half-res lighting).
+    uint2 FullDim;
+    g_GBufferDepth.GetDimensions(FullDim.x, FullDim.y);
+    int2  fpBest;
+    float bestD;
+    if (Dim.x >= FullDim.x) // full resolution: 1:1
+    {
+        fpBest = min(int2(DTid), int2(FullDim) - 1);
+        bestD  = g_GBufferDepth.Load(int3(fpBest, 0)).x;
+    }
+    else // half resolution: 2x2 footprint
+    {
+        int2 maxc = int2(FullDim) - 1;
+        int2 base = int2(DTid * 2);
+        int2 p00 = min(base + int2(0, 0), maxc);
+        int2 p10 = min(base + int2(1, 0), maxc);
+        int2 p01 = min(base + int2(0, 1), maxc);
+        int2 p11 = min(base + int2(1, 1), maxc);
+        float d00 = g_GBufferDepth.Load(int3(p00, 0)).x;
+        float d10 = g_GBufferDepth.Load(int3(p10, 0)).x;
+        float d01 = g_GBufferDepth.Load(int3(p01, 0)).x;
+        float d11 = g_GBufferDepth.Load(int3(p11, 0)).x;
+        fpBest = p00; bestD = d00;
+        if (d10 < bestD) { bestD = d10; fpBest = p10; }
+        if (d01 < bestD) { bestD = d01; fpBest = p01; }
+        if (d11 < bestD) { bestD = d11; fpBest = p11; }
+    }
 
-    float Depth = g_GBufferDepth.SampleLevel(g_Sampler, UV, 0).x;
+    float Depth = bestD;
     if (Depth >= 1.0)
     {
         g_OutRT[DTid] = float4(0, 0, 0, 1);
         return;
     }
 
-    float3 WPos      = ScreenPosToWorldPos(UV, Depth, g_RTConstants.ViewProjInv);
-    float3 LightDir  = g_RTConstants.LightDir.xyz;
-    float3 WNormal   = normalize(g_GBufferNormal.SampleLevel(g_Sampler, UV, 0).xyz);
-    float  DisToCam  = length(WPos - g_RTConstants.CameraPos.xyz);
-    float3 ViewDir   = (WPos - g_RTConstants.CameraPos.xyz) / max(DisToCam, 0.0001);
+    float2 BestUV  = (float2(fpBest) + 0.5) / float2(FullDim);
+    float3 WPos    = ScreenPosToWorldPos(BestUV, Depth, g_RTConstants.ViewProjInv);
+    float3 LightDir = g_RTConstants.LightDir.xyz;
+    float3 WNormal = normalize(g_GBufferNormal.Load(int3(fpBest, 0)).xyz);
+    float  DisToCam = length(WPos - g_RTConstants.CameraPos.xyz);
+    float3 ViewDir = (WPos - g_RTConstants.CameraPos.xyz) / max(DisToCam, 0.0001);
 
     float NdotL = max(0.0, dot(LightDir, WNormal));
     if (NdotL > 0.0)
-        NdotL *= CastShadow(WPos + WNormal * SMALL_OFFSET * DisToCam, LightDir, g_RTConstants.MaxRayLength);
+        NdotL *= CastShadowPCF(WPos, LightDir, g_RTConstants.MaxRayLength, WNormal, DisToCam);
+
+    // Ambient occlusion (short hemisphere rays).
+    float ao = ComputeAO(WPos, WNormal, DisToCam);
+    // Current pixel roughness (from the G-buffer normal alpha) for the sky miss.
+    float roughness = g_GBufferNormal.Load(int3(fpBest, 0)).a;
 
     float4 Color = float4(0, 0, 0, 1);
     {
-        ReflectionResult refl = Reflect(WPos + WNormal * SMALL_OFFSET * DisToCam,
+        // Reflect from a point biased above the surface to avoid self-hit.
+        float bias = max(0.002, SMALL_OFFSET * DisToCam);
+        ReflectionResult refl = Reflect(WPos + WNormal * bias,
                                         reflect(ViewDir, WNormal),
                                         g_RTConstants.MaxRayLength,
                                         g_RTConstants.MaxRayLength,
@@ -241,10 +382,12 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
         if (refl.Found)
             Color = refl.BaseColor * max(g_RTConstants.AmbientLight, refl.NdotL);
         else
-            Color = GetSkyColor(reflect(ViewDir, WNormal), LightDir);
+            Color = GetSkyColor(reflect(ViewDir, WNormal)) * (1.0 - roughness * g_RTConstants.ReflectionBlur);
     }
 
-    Color.a = max(g_RTConstants.AmbientLight, NdotL);
+    // Lighting factor: ambient (AO-shaded) + direct (shadowed). Compose uses
+    // Color * RT.a for the diffuse term.
+    Color.a = g_RTConstants.AmbientLight * ao + NdotL;
     g_OutRT[DTid] = Color;
 }
 )";
@@ -280,6 +423,7 @@ struct PSIn { float4 Pos : SV_POSITION; float2 UV : TEXCOORD0; };
 #define RENDER_MODE_DIFFUSE_LIGHTING 3
 #define RENDER_MODE_REFLECTIONS      4
 #define RENDER_MODE_FRESNEL_TERM     5
+#define RENDER_MODE_RT_ALPHA         6
 
 float3 ScreenPosToWorldPos(float2 uv, float depth, float4x4 vpInv)
 {
@@ -316,6 +460,7 @@ float4 main(PSIn i) : SV_Target
         case RENDER_MODE_DIFFUSE_LIGHTING: return float4(Color.rgb * RT.a, 1.0);
         case RENDER_MODE_REFLECTIONS:      return float4(RT.rgb, 1.0);
         case RENDER_MODE_FRESNEL_TERM:     return float4(R, R, R, 1.0);
+        case RENDER_MODE_RT_ALPHA:         return float4(RT.a, RT.a, RT.a, 1.0);
         case RENDER_MODE_SHADED:
         default:
         {
@@ -368,12 +513,18 @@ struct RayTracingSubsystem::Impl {
 	D::RefCntAutoPtr<D::IBuffer> materialAttribsBuf;
 	Vector<D::ITextureView*> sceneTextureSRVs;           ///< SRVs bound into the compute shader.
 	D::RefCntAutoPtr<D::ITextureView> whiteSRV;
+	D::RefCntAutoPtr<D::ITextureView> whiteCubeSRV;      ///< 1x1 white cubemap fallback for g_SkyCube.
 	D::RefCntAutoPtr<D::ISampler> linearSampler;
 
 	// RT compute pipeline
 	D::RefCntAutoPtr<D::IPipelineState> rtPSO;
 	D::RefCntAutoPtr<D::IShaderResourceBinding> rtSRB;
 	D::RefCntAutoPtr<D::IBuffer> constantsBuf;
+
+	// Skybox for the reflection miss shader (matches the rendered background).
+	bool skyUseCubemap = false;
+	TextureHandle skyCubemap;
+	Vec4 skyCorners[8] = { Vec4(0.3f, 0.5f, 0.9f, 1) };
 
 	// Compose pipeline
 	D::RefCntAutoPtr<D::IPipelineState> composePSO;
@@ -388,6 +539,15 @@ RayTracingSubsystem::~RayTracingSubsystem() = default;
 
 void RayTracingSubsystem::attachToRenderer(RenderSubsystem* r) { m_impl->renderer = r; }
 bool RayTracingSubsystem::isReady() const { return m_impl->ok; }
+
+void RayTracingSubsystem::setSkybox(bool useCubemap, TextureHandle cubemap, const Vec4 corners[8]) {
+	auto& p = *m_impl;
+	p.skyUseCubemap = useCubemap;
+	p.skyCubemap = cubemap;
+	if (corners) {
+		for (int i = 0; i < 8; ++i) p.skyCorners[i] = corners[i];
+	}
+}
 
 // ===================================================================
 // Acceleration structures
@@ -682,6 +842,8 @@ Result<void, RenderError> RayTracingSubsystem::updateScene(const Vector<RayTrace
 				ma.baseColorMask = desc->baseColorFactor;
 				ma.sampInd = 0;
 				ma.baseColorTexInd = 0;
+				ma.roughness = desc->roughnessFactor;
+				ma.metallic = desc->metallicFactor;
 				if (desc->baseColorTexture.isValid()) {
 					bool texFound = false;
 					for (size_t t = 0; t < texKeys.size(); ++t) {
@@ -796,16 +958,27 @@ Result<void, RenderError> RayTracingSubsystem::trace(const RayTraceConstants& c,
 	if (!p.ok || !p.rtPSO || !p.rtSRB) return RenderError::OperationFailed;
 	if (!gBufferNormal || !gBufferDepth || !outRT || width == 0 || height == 0) return RenderError::InvalidArgument;
 
-	// Upload constants.
+	// Upload constants (skybox data is merged in from the subsystem state).
 	{
+		RayTraceConstants cc = c;
+		cc.skyMode = p.skyUseCubemap ? 1 : 0;
+		memcpy(cc.skyCorners, p.skyCorners, sizeof(p.skyCorners));
 		void* m = nullptr;
 		ctx->MapBuffer(p.constantsBuf, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
-		if (m) { memcpy(m, &c, sizeof(c)); ctx->UnmapBuffer(p.constantsBuf, D::MAP_WRITE); }
+		if (m) { memcpy(m, &cc, sizeof(cc)); ctx->UnmapBuffer(p.constantsBuf, D::MAP_WRITE); }
 	}
 
 	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_GBufferNormal")) v->Set(static_cast<D::ITextureView*>(gBufferNormal), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_GBufferDepth")) v->Set(static_cast<D::ITextureView*>(gBufferDepth), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutRT")) v->Set(static_cast<D::ITextureView*>(outRT), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	// Bind the skybox cubemap (or the white CUBEMAP fallback when not in cubemap mode).
+	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_SkyCube")) {
+		D::ITextureView* srv = p.whiteCubeSRV.RawPtr();
+		if (p.skyUseCubemap && p.skyCubemap.isValid()) {
+			if (auto* s = static_cast<D::ITextureView*>(p.renderer->getTextureSRV(p.skyCubemap))) srv = s;
+		}
+		v->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	}
 
 	ctx->SetPipelineState(p.rtPSO);
 	ctx->CommitShaderResources(p.rtSRB, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
@@ -876,6 +1049,21 @@ Result<void, CoreError> RayTracingSubsystem::onInitialize() {
 		D::RefCntAutoPtr<D::ITexture> tex;
 		dev->CreateTexture(td, &tdata, &tex);
 		if (tex) p.whiteSRV = tex->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
+	}
+
+	// 1x1 white CUBEMAP (fallback for g_SkyCube so the bound dimension always
+	// matches the TextureCube the shader expects, even in corner-gradient mode).
+	{
+		D::TextureDesc td; td.Name = "RT WhiteCube"; td.Type = D::RESOURCE_DIM_TEX_CUBE; td.Width = 1; td.Height = 1;
+		td.ArraySize = 6; td.MipLevels = 1;
+		td.Format = D::TEX_FORMAT_RGBA8_UNORM; td.BindFlags = D::BIND_SHADER_RESOURCE; td.Usage = D::USAGE_IMMUTABLE;
+		UInt32 white = 0xFFFFFFFF;
+		D::TextureSubResData srd[6];
+		for (int i = 0; i < 6; ++i) { srd[i].pData = &white; srd[i].Stride = 4; }
+		D::TextureData tdata; tdata.pSubResources = srd; tdata.NumSubresources = 6;
+		D::RefCntAutoPtr<D::ITexture> tex;
+		dev->CreateTexture(td, &tdata, &tex);
+		if (tex) p.whiteCubeSRV = tex->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
 	}
 
 	// Linear sampler (immutable in the RT PSO).
@@ -1002,7 +1190,7 @@ void RayTracingSubsystem::onShutdown() {
 	p.sharedVB.Release(); p.sharedIB.Release();
 	p.sceneMeshKeys.clear(); p.sceneMeshFirstVertex.clear(); p.sceneMeshFirstIndex.clear();
 	p.sceneTextureSRVs.clear();
-	p.whiteSRV.Release(); p.linearSampler.Release();
+	p.whiteSRV.Release(); p.whiteCubeSRV.Release(); p.linearSampler.Release();
 	p.ok = false;
 	EInfo("RayTracing subsystem shut down.");
 }
