@@ -1,4 +1,4 @@
-﻿#include <Engine/Core/Core.hpp>
+#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -341,15 +341,25 @@ float4 main(PSIn i) : SV_TARGET {
 	UInt32 rtAoSamples = 4;  // AO rays per pixel (0 = off)
 	F32 rtLightSize = 0.05f; // PCSS light size (0 = fixed-cone PCF)
 	F32 rtReflectionBlur = 0.7f; // roughness-driven reflection attenuation
-	bool rtHalfRes = true; // half-resolution ray tracing (faster; may flicker on far small objects)
+	float rtResScale = 0.5f; // RT resolution scale (0.25 / 0.5 / 1.0)
+	bool rtResAuto = true;   // auto-pick the scale from the distance to the nearest object
 	TextureHandle gbufColor, gbufNormal, gbufDepth, rtTex;
-	// (Re)create the window-sized G-buffer + ray traced output textures.
+	// (Re)create the ray traced output texture at the current rtResScale.
+	auto createRTTex = [&](UInt32 w, UInt32 h) {
+		renderer.destroyTexture(rtTex);
+		rtTex = TextureHandle{};
+		TextureDesc td;
+		td.fmt = TextureFormat::RGBA16_Float; td.asDepthStencil = false; td.asUAV = true;
+		td.w = std::max<UInt32>(1, (UInt32)(w * rtResScale));
+		td.h = std::max<UInt32>(1, (UInt32)(h * rtResScale));
+		if (auto r = renderer.createTexture(td); r.isOk()) rtTex = r.value();
+	};
+	// (Re)create the window-sized G-buffer (always full resolution) + RT output.
 	auto createGBufferTextures = [&](UInt32 w, UInt32 h) {
 		renderer.destroyTexture(gbufColor);
 		renderer.destroyTexture(gbufNormal);
 		renderer.destroyTexture(gbufDepth);
-		renderer.destroyTexture(rtTex);
-		gbufColor = gbufNormal = gbufDepth = rtTex = TextureHandle{};
+		gbufColor = gbufNormal = gbufDepth = TextureHandle{};
 		TextureDesc td;
 		td.w = w; td.h = h; td.fmt = TextureFormat::RGBA8_UNorm_SRGB; td.asRenderTarget = true;
 		if (auto r = renderer.createTexture(td); r.isOk()) gbufColor = r.value();
@@ -357,10 +367,7 @@ float4 main(PSIn i) : SV_TARGET {
 		if (auto r = renderer.createTexture(td); r.isOk()) gbufNormal = r.value();
 		td.fmt = TextureFormat::D32_Float; td.asRenderTarget = false; td.asDepthStencil = true;
 		if (auto r = renderer.createTexture(td); r.isOk()) gbufDepth = r.value();
-		// Ray traced output is half resolution by default (upsampled in compose).
-		td.fmt = TextureFormat::RGBA16_Float; td.asDepthStencil = false; td.asUAV = true;
-		td.w = rtHalfRes ? w / 2 : w; td.h = rtHalfRes ? h / 2 : h;
-		if (auto r = renderer.createTexture(td); r.isOk()) rtTex = r.value();
+		createRTTex(w, h);
 	};
 	{
 		if (renderer.supportsInlineRayTracing()) {
@@ -738,9 +745,17 @@ HALT
 			if (debugUI.button(fmt::format("RT View: {}", rtModeNames[rtDrawMode]).c_str())) {
 				rtDrawMode = (rtDrawMode + 1) % 7;
 			}
-			if (debugUI.button(fmt::format("RT Res: {}", rtHalfRes ? "Half" : "Full").c_str())) {
-				rtHalfRes = !rtHalfRes;
-				createGBufferTextures(ww, wh); // recreate the RT texture at the new resolution
+			static const char* rtResNames[] = { "Auto", "Full", "Half" };
+			// Auto(0) / Full(1) / Half(2) cycle.
+			int resMode = rtResAuto ? 0 : (rtResScale > 0.9f ? 1 : 2);
+			if (debugUI.button(fmt::format("RT Res: {}", rtResNames[resMode]).c_str())) {
+				resMode = (resMode + 1) % 3;
+				if (resMode == 0) { rtResAuto = true; }
+				else {
+					rtResAuto = false;
+					rtResScale = (resMode == 1) ? 1.0f : 0.5f;
+				}
+				createRTTex(ww, wh); // recreate only the RT texture (G-buffer stays full-res)
 			}
 			{
 				float pcfF = (float)rtShadowPCF;
@@ -1237,9 +1252,25 @@ HALT
 				}
 				memcpy(rc.discPoints, s_disc, sizeof(s_disc));
 			}
+			// Auto resolution: pick the scale from the distance to the nearest object.
+			// Hysteresis band (22..28) prevents flicker when objects hover near the threshold.
+			if (rtResAuto) {
+				float minDist = 1e9f;
+				for (const auto& t : transv) {
+					float d = glm::length(t.position - fly.pos);
+					if (d < minDist) minDist = d;
+				}
+				float targetScale = rtResScale;
+				if (rtResScale >= 1.0f && minDist > 28.0f) targetScale = 0.5f;  // move away -> half
+				else if (rtResScale <= 0.5f && minDist < 22.0f) targetScale = 1.0f; // approach -> full
+				if (targetScale != rtResScale) {
+					rtResScale = targetScale;
+					createRTTex(ww, wh); // recreate only the RT texture - no blank frame
+				}
+			}
 			{
-				UInt32 rtw = rtHalfRes ? ww / 2 : ww;
-				UInt32 rth = rtHalfRes ? wh / 2 : wh;
+				UInt32 rtw = std::max<UInt32>(1, (UInt32)(ww * rtResScale));
+				UInt32 rth = std::max<UInt32>(1, (UInt32)(wh * rtResScale));
 				auto tr = rayTracing.trace(rc, renderer.getTextureSRV(gbufNormal), renderer.getTextureSRV(gbufDepth),
 					renderer.getTextureUAV(rtTex), rtw, rth);
 				if (tr.isErr()) {
