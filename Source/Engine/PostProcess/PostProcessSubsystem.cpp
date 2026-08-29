@@ -151,10 +151,10 @@ struct PostProcessSubsystem::Impl {
 		}
 	}
 
-	void makeTex(D::RefCntAutoPtr<D::ITexture>& t, D::RefCntAutoPtr<D::ITextureView>& r, D::RefCntAutoPtr<D::ITextureView>& s, UInt8 sampleCount = 1) {
+	void makeTex(D::RefCntAutoPtr<D::ITexture>& t, D::RefCntAutoPtr<D::ITextureView>& r, D::RefCntAutoPtr<D::ITextureView>& s, UInt8 sampleCount, D::TEXTURE_FORMAT fmt) {
 		if(w==0||h==0) return;
 		D::TextureDesc td; td.Type=D::RESOURCE_DIM_TEX_2D; td.Width=w; td.Height=h;
-		td.Format=D::TEX_FORMAT_RGBA8_UNORM_SRGB; td.BindFlags=D::BIND_SHADER_RESOURCE|D::BIND_RENDER_TARGET;
+		td.Format=fmt; td.BindFlags=D::BIND_SHADER_RESOURCE|D::BIND_RENDER_TARGET;
 		td.SampleCount = sampleCount;
 		r.Release(); s.Release(); t.Release(); dev->CreateTexture(td,nullptr,&t);
 		r=t->GetDefaultView(D::TEXTURE_VIEW_RENDER_TARGET); s=t->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
@@ -163,10 +163,13 @@ struct PostProcessSubsystem::Impl {
 	void createTextures() {
 		UInt8 msaaSamples = cfg.sampleCount;
 		if (msaaSamples < 1) msaaSamples = 1;
-		makeTex(hdrTex,hdrRTV,hdrSRV, msaaSamples);
-		// Resolved (single-sample) copy of HDR for bloom/tone map input
-		makeTex(resTex,resRTV,resSRV, 1);
-		makeTex(bloomTex,bloomRTV,bloomSRV); makeTex(blurTex,blurRTV,blurSRV);
+		// HDR target and its single-sample resolve use RGBA16_FLOAT so that
+		// bright reflections/highlights are not clamped to 8-bit before tone
+		// mapping. Bloom intermediates stay 8-bit.
+		makeTex(hdrTex,hdrRTV,hdrSRV, msaaSamples, D::TEX_FORMAT_RGBA16_FLOAT);
+		makeTex(resTex,resRTV,resSRV, 1, D::TEX_FORMAT_RGBA16_FLOAT);
+		makeTex(bloomTex,bloomRTV,bloomSRV, 1, D::TEX_FORMAT_RGBA8_UNORM_SRGB);
+		makeTex(blurTex,blurRTV,blurSRV, 1, D::TEX_FORMAT_RGBA8_UNORM_SRGB);
 		if(srbTM){auto*pv=srbTM->GetVariableByName(D::SHADER_TYPE_PIXEL,"g_HDR");if(pv)pv->Set(resSRV,D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);pv=srbTM->GetVariableByName(D::SHADER_TYPE_PIXEL,"g_Bloom");if(pv)pv->Set(blurSRV,D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);}
 		if(srbBright){auto*pv=srbBright->GetVariableByName(D::SHADER_TYPE_PIXEL,"g_In");if(pv)pv->Set(resSRV,D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);}
 		if(srbBlur){auto*pv=srbBlur->GetVariableByName(D::SHADER_TYPE_PIXEL,"g_In");if(pv)pv->Set(bloomSRV,D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);}

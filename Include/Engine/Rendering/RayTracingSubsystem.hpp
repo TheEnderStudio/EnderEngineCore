@@ -16,7 +16,8 @@ struct alignas(16) RayTraceConstants {
 	F32  maxRayLength = 100.0f;
 	F32  ambientLight = 0.1f;
 	UInt32 shadowPCF = 4; ///< PCF shadow samples per shadow ray (1..16).
-	F32  _pad0 = 0.0f;
+	F32  lightIntensity = 1.0f; ///< Light intensity (multiplies the direct diffuse term).
+	Vec4 lightColor = Vec4(1.0f, 1.0f, 1.0f, 0.0f); ///< Light color (rgb; w unused).
 	Vec4 discPoints[8];   ///< 16 packed float2 disc samples (soft shadow cone, xy/zw pairs).
 	Vec4 skyCorners[8];   ///< Skybox corner colors (bit0=x+, bit1=y+, bit2=z+), matches SkyboxDesc::corners.
 	UInt32 skyMode = 0;   ///< 0 = corner gradient, 1 = cubemap texture.
@@ -75,6 +76,9 @@ public:
 
 	/// @brief Whether ray tracing is available and the subsystem is ready.
 	bool isReady() const;
+
+	/// @brief GPU time of the last trace() dispatch in milliseconds (0 if not measured yet).
+	EE_NODISCARD float lastTraceMs() const;
 
 	// -------------------------------------------------------------------
 	// Acceleration structures
@@ -162,11 +166,12 @@ public:
 	 *                      2=G-buffer normal, 3=diffuse lighting, 4=reflections, 5=Fresnel.
 	 * @param viewProjInv   Inverse view-projection (column-major).
 	 * @param cameraPos     World-space camera position.
+	 * @param lightColor    Light color (applied to the diffuse term).
 	 * @param width,height  Target dimensions.
 	 */
 	Result<void, RenderError> compose(void* gBufferColor, void* gBufferNormal, void* gBufferDepth,
 		void* rtTex, void* outputRTV, void* depthDSV, UInt32 drawMode,
-		const Mat4& viewProjInv, const Vec3& cameraPos,
+		const Mat4& viewProjInv, const Vec3& cameraPos, const Vec3& lightColor,
 		UInt32 width, UInt32 height);
 
 protected:

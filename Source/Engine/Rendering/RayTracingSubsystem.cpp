@@ -83,7 +83,8 @@ struct RTConstants {
     float    MaxRayLength;
     float    AmbientLight;
     uint     ShadowPCF;
-    float    _pad0;
+    float    LightIntensity;
+    float4   LightColor;
     float4   DiscPoints[8];
     float4   SkyCorners[8];
     uint     SkyMode;
@@ -192,7 +193,7 @@ float ComputeAO(float3 Origin, float3 Norm, float DistToCam)
 
     float3 T = normalize(cross(abs(Norm.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0), Norm));
     float3 B = cross(Norm, T);
-    float bias = max(0.01, SMALL_OFFSET * DistToCam);
+    float bias = max(0.01, 0.001 * DistToCam);
     float3 aoOrigin = Origin + Norm * bias;
 
     float occluded = 0.0;
@@ -307,7 +308,7 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
         {
             float3 HitPos = Origin + ReflDir * q.CommittedRayT();
             float3 Refl2  = reflect(ReflDir, Norm);
-            float  bias2  = max(0.002, SMALL_OFFSET * length(HitPos - CameraPos));
+            float  bias2  = max(0.002, 0.001 * length(HitPos - CameraPos));
             RayDesc ray2;
             ray2.Origin    = HitPos + Norm * bias2;
             ray2.Direction = Refl2;
@@ -411,8 +412,10 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
 
     float4 Color = float4(0, 0, 0, 1);
     {
-        // Reflect from a point biased above the surface to avoid self-hit.
-        float bias = max(0.002, SMALL_OFFSET * DisToCam);
+        // Reflect from a point biased above the surface to avoid self-hit. The
+        // bias scales with distance (depth-reconstruction error grows ~z^2), the
+        // same fix that removed the shadow "triangle" artifacts.
+        float bias = max(0.002, 0.001 * DisToCam);
         ReflectionResult refl = Reflect(WPos + WNormal * bias,
                                         reflect(ViewDir, WNormal),
                                         g_RTConstants.MaxRayLength,
@@ -421,14 +424,20 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
                                         LightDir,
                                         0);
         if (refl.Found)
-            Color = refl.BaseColor * max(g_RTConstants.AmbientLight, refl.NdotL);
+        {
+            // Reflection point lighting: ambient and direct are both tinted by the
+            // light color (consistent with the compose diffuse term).
+            float3 lightColor = g_RTConstants.LightColor.rgb;
+            float3 lit = (g_RTConstants.AmbientLight + max(0.0, refl.NdotL) * g_RTConstants.LightIntensity) * lightColor;
+            Color = float4(refl.BaseColor.rgb * lit, 1.0);
+        }
         else
             Color = GetSkyColor(reflect(ViewDir, WNormal)) * (1.0 - roughness * g_RTConstants.ReflectionBlur);
     }
 
-    // Lighting factor: ambient (AO-shaded) + direct (shadowed). Compose uses
-    // Color * RT.a for the diffuse term.
-    Color.a = g_RTConstants.AmbientLight * ao + NdotL;
+    // Lighting factor: ambient (AO-shaded) + direct (shadowed, intensity-scaled).
+    // Compose uses Color * RT.a for the diffuse term.
+    Color.a = g_RTConstants.AmbientLight * ao + NdotL * g_RTConstants.LightIntensity;
     g_OutRT[DTid] = Color;
 }
 )";
@@ -455,6 +464,7 @@ cbuffer ComposeCB : register(b0) {
     float4   g_CameraPos;
     uint     g_DrawMode;
     float3   g_Pad;
+    float4   g_LightColor;
 };
 struct PSIn { float4 Pos : SV_POSITION; float2 UV : TEXCOORD0; };
 
@@ -505,7 +515,8 @@ float4 main(PSIn i) : SV_Target
         case RENDER_MODE_SHADED:
         default:
         {
-            float3 Shaded = Color.rgb * RT.a;
+            // Diffuse: albedo * lighting factor * light color.
+            float3 Shaded = Color.rgb * RT.a * g_LightColor.rgb;
             float3 Final  = lerp(Shaded, RT.rgb, R);
             return float4(Final, 1.0);
         }
@@ -561,6 +572,9 @@ struct RayTracingSubsystem::Impl {
 	D::RefCntAutoPtr<D::IPipelineState> rtPSO;
 	D::RefCntAutoPtr<D::IShaderResourceBinding> rtSRB;
 	D::RefCntAutoPtr<D::IBuffer> constantsBuf;
+	D::RefCntAutoPtr<D::IQuery> traceQuery; ///< GPU duration query for trace().
+	bool traceQueryEnded = false;          ///< Whether the query was ended at least once (GetData guard).
+	float lastTraceMs = 0.0f;
 
 	// Skybox for the reflection miss shader (matches the rendered background).
 	bool skyUseCubemap = false;
@@ -580,6 +594,7 @@ RayTracingSubsystem::~RayTracingSubsystem() = default;
 
 void RayTracingSubsystem::attachToRenderer(RenderSubsystem* r) { m_impl->renderer = r; }
 bool RayTracingSubsystem::isReady() const { return m_impl->ok; }
+float RayTracingSubsystem::lastTraceMs() const { return m_impl->lastTraceMs; }
 
 void RayTracingSubsystem::setSkybox(bool useCubemap, TextureHandle cubemap, const Vec4 corners[8]) {
 	auto& p = *m_impl;
@@ -1024,16 +1039,26 @@ Result<void, RenderError> RayTracingSubsystem::trace(const RayTraceConstants& c,
 	ctx->SetPipelineState(p.rtPSO);
 	ctx->CommitShaderResources(p.rtSRB, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
+	// Read the previous frame's duration result (if ready).
+	if (p.traceQuery && p.traceQueryEnded) {
+		D::QueryDataDuration qd;
+		if (p.traceQuery->GetData(&qd, sizeof(qd), false) && qd.Frequency != 0) {
+			p.lastTraceMs = (float)((double)qd.Duration / (double)qd.Frequency * 1000.0);
+		}
+	}
+
 	D::DispatchComputeAttribs da;
 	da.ThreadGroupCountX = (width + 7) / 8;
 	da.ThreadGroupCountY = (height + 7) / 8;
+	if (p.traceQuery) ctx->BeginQuery(p.traceQuery);
 	ctx->DispatchCompute(da);
+	if (p.traceQuery) { ctx->EndQuery(p.traceQuery); p.traceQueryEnded = true; }
 	return {};
 }
 
 Result<void, RenderError> RayTracingSubsystem::compose(void* gBufferColor, void* gBufferNormal, void* gBufferDepth,
 	void* rtTex, void* outputRTV, void* depthDSV, UInt32 drawMode,
-	const Mat4& viewProjInv, const Vec3& cameraPos,
+	const Mat4& viewProjInv, const Vec3& cameraPos, const Vec3& lightColor,
 	UInt32 width, UInt32 height) {
 	auto& p = *m_impl;
 	auto* ctx = p.ctx(); if (!ctx) return RenderError::NotInitialized;
@@ -1041,12 +1066,13 @@ Result<void, RenderError> RayTracingSubsystem::compose(void* gBufferColor, void*
 	if (!gBufferColor || !gBufferNormal || !gBufferDepth || !rtTex || !outputRTV) return RenderError::InvalidArgument;
 
 	{
-		// ComposeCB: float4x4 + float4 + uint + 3 floats padding (16-byte aligned).
-		struct { Mat4 viewProjInv; Vec4 cameraPos; UInt32 drawMode; UInt32 _pad[3]; } cb;
+		// ComposeCB: float4x4 + float4 + uint + 3 floats padding + lightColor (16-byte aligned).
+		struct { Mat4 viewProjInv; Vec4 cameraPos; UInt32 drawMode; UInt32 _pad[3]; Vec4 lightColor; } cb;
 		cb.viewProjInv = viewProjInv;
 		cb.cameraPos = Vec4(cameraPos, 1.0f);
 		cb.drawMode = drawMode;
 		cb._pad[0] = cb._pad[1] = cb._pad[2] = 0;
+		cb.lightColor = Vec4(lightColor, 0.0f);
 		void* m = nullptr;
 		ctx->MapBuffer(p.composeCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
 		if (m) { memcpy(m, &cb, sizeof(cb)); ctx->UnmapBuffer(p.composeCB, D::MAP_WRITE); }
@@ -1122,6 +1148,12 @@ Result<void, CoreError> RayTracingSubsystem::onInitialize() {
 		dev->CreateBuffer(bd, nullptr, &p.constantsBuf);
 	}
 
+	// GPU duration query for trace().
+	{
+		D::QueryDesc qd(D::QUERY_TYPE_DURATION);
+		dev->CreateQuery(qd, &p.traceQuery);
+	}
+
 	// Ray tracing compute shader (DXR 1.1 inline, SM 6.5).
 	D::RefCntAutoPtr<D::IShader> rtCS;
 	{
@@ -1190,7 +1222,9 @@ Result<void, CoreError> RayTracingSubsystem::onInitialize() {
 		gci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
 		gci.pVS = vs; gci.pPS = ps;
 		gci.GraphicsPipeline.NumRenderTargets = 1;
-		gci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA8_UNORM_SRGB;
+		// Compose outputs into the RGBA16_FLOAT HDR target (matches the renderer's
+		// scene PSOs and the PostProcess HDR texture).
+		gci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA16_FLOAT;
 		// The compose pass is bound with the renderer's MSAA depth (to keep the
 		// DSV state consistent for later 2D/UI passes), so the PSO must declare it.
 		gci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
@@ -1206,7 +1240,7 @@ Result<void, CoreError> RayTracingSubsystem::onInitialize() {
 
 	// Compose constant buffer.
 	{
-		D::BufferDesc bd; bd.Name = "RT Compose CB"; bd.Size = sizeof(Mat4) + sizeof(Vec4) + 16; // + drawMode/padding
+		D::BufferDesc bd; bd.Name = "RT Compose CB"; bd.Size = sizeof(Mat4) + sizeof(Vec4) + 16 + 16; // + drawMode/padding + lightColor
 		bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DYNAMIC; bd.CPUAccessFlags = D::CPU_ACCESS_WRITE;
 		dev->CreateBuffer(bd, nullptr, &p.composeCB);
 		if (p.composeSRB) {
@@ -1222,6 +1256,7 @@ Result<void, CoreError> RayTracingSubsystem::onInitialize() {
 void RayTracingSubsystem::onShutdown() {
 	auto& p = *m_impl;
 	p.rtPSO.Release(); p.rtSRB.Release(); p.constantsBuf.Release();
+	p.traceQuery.Release(); p.traceQueryEnded = false;
 	p.composePSO.Release(); p.composeSRB.Release(); p.composeCB.Release();
 	p.objectAttribsBuf.Release(); p.materialAttribsBuf.Release();
 	p.sceneTLAS = TLASData{};

@@ -48,13 +48,13 @@ struct Render2DSubsystem::Impl {
 	}
 
 	void createPSO(D::RefCntAutoPtr<D::IPipelineState>& pso, D::RefCntAutoPtr<D::IShaderResourceBinding>& srb,
-	               const char* psSrc, bool hasTexture, D::TEXTURE_FORMAT dsvFmt) {
+	               const char* psSrc, bool hasTexture, D::TEXTURE_FORMAT dsvFmt, D::TEXTURE_FORMAT rtvFmt) {
 		auto vs=mkShader(g_VS2D,D::SHADER_TYPE_VERTEX,"VS2D");
 		auto ps=mkShader(psSrc,D::SHADER_TYPE_PIXEL,hasTexture?"PS2DTex":"PS2DSolid");
 		D::GraphicsPipelineStateCreateInfo ci;
 		ci.PSODesc.Name=hasTexture?"R2DTex":"R2DSolid"; ci.PSODesc.PipelineType=D::PIPELINE_TYPE_GRAPHICS;
 		ci.pVS=vs; ci.pPS=ps; ci.GraphicsPipeline.NumRenderTargets=1;
-		ci.GraphicsPipeline.RTVFormats[0]=D::TEX_FORMAT_RGBA8_UNORM_SRGB;
+		ci.GraphicsPipeline.RTVFormats[0]=rtvFmt;
 		ci.GraphicsPipeline.PrimitiveTopology=D::PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 		ci.GraphicsPipeline.RasterizerDesc.CullMode=D::CULL_MODE_NONE;
 		ci.GraphicsPipeline.RasterizerDesc.ScissorEnable=true;
@@ -87,13 +87,13 @@ struct Render2DSubsystem::Impl {
 		{ D::BufferDesc bd; bd.Name="R2DCB"; bd.Size=sizeof(Mat4); bd.BindFlags=D::BIND_UNIFORM_BUFFER; bd.Usage=D::USAGE_DYNAMIC; bd.CPUAccessFlags=D::CPU_ACCESS_WRITE; device->CreateBuffer(bd,nullptr,&cb); }
 		{ D::BufferDesc bd; bd.Name="R2DVB"; bd.Size=sizeof(Vertex2D)*MaxVertices; bd.BindFlags=D::BIND_VERTEX_BUFFER; bd.Usage=D::USAGE_DYNAMIC; bd.CPUAccessFlags=D::CPU_ACCESS_WRITE; device->CreateBuffer(bd,nullptr,&vb); }
 		{ D::BufferDesc bd; bd.Name="R2DIB"; bd.Size=sizeof(UInt32)*MaxIndices; bd.BindFlags=D::BIND_INDEX_BUFFER; bd.Usage=D::USAGE_DYNAMIC; bd.CPUAccessFlags=D::CPU_ACCESS_WRITE; device->CreateBuffer(bd,nullptr,&ib); }
-		// afterPost=false 2D is drawn together with the scene, so the PSO declares
-		// the scene depth format (D32) - the DSV is set by the renderer before UI.
-		// The afterPost=true variants declare UNKNOWN (post-process leaves no DSV).
-		{ D::RefCntAutoPtr<D::IShaderResourceBinding> tmp; createPSO(psoTexNoDS,tmp,g_PS2DTex,true,D::TEX_FORMAT_UNKNOWN); }
-		{ D::RefCntAutoPtr<D::IShaderResourceBinding> tmp; createPSO(psoTexDS,tmp,g_PS2DTex,true,D::TEX_FORMAT_D32_FLOAT); }
-	createPSO(psoSolidNoDS,srbSolidNoDS,g_PS2DSolid,false,D::TEX_FORMAT_UNKNOWN);
-	createPSO(psoSolidDS,srbSolidDS,g_PS2DSolid,false,D::TEX_FORMAT_D32_FLOAT);
+		// afterPost=false 2D is drawn together with the scene (into the RGBA16_FLOAT
+		// HDR target), so those PSOs declare D32 depth + the HDR RTV format.
+		// The afterPost=true variants draw to the swap chain (RGBA8_UNORM_SRGB).
+		{ D::RefCntAutoPtr<D::IShaderResourceBinding> tmp; createPSO(psoTexNoDS,tmp,g_PS2DTex,true,D::TEX_FORMAT_UNKNOWN, D::TEX_FORMAT_RGBA8_UNORM_SRGB); }
+		{ D::RefCntAutoPtr<D::IShaderResourceBinding> tmp; createPSO(psoTexDS,tmp,g_PS2DTex,true,D::TEX_FORMAT_D32_FLOAT, D::TEX_FORMAT_RGBA16_FLOAT); }
+	createPSO(psoSolidNoDS,srbSolidNoDS,g_PS2DSolid,false,D::TEX_FORMAT_UNKNOWN, D::TEX_FORMAT_RGBA8_UNORM_SRGB);
+	createPSO(psoSolidDS,srbSolidDS,g_PS2DSolid,false,D::TEX_FORMAT_D32_FLOAT, D::TEX_FORMAT_RGBA16_FLOAT);
 	}
 
 	void flushSolid() {

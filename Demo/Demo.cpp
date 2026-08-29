@@ -705,7 +705,17 @@ HALT
 	Object debugUIObj;
 	debugUI.registerObject(debugUIObj);
 	static UInt32 gpuVisCount = 0;
+	static float sunIntensity = 1.0;
+	static float sunColorR = 1.0f;
+	static float sunColorG = 0.98f;
+	static float sunColorB = 0.9f;
 	debugUI.subscribe<DebugUIRenderEvent>(debugUIObj, [&](const DebugUIRenderEvent&) {
+		debugUI.beginWindow("Environment");
+		debugUI.sliderFloat("Sun Intensity", &sunIntensity, 0.1f, 20.0f);
+		debugUI.sliderFloat("Sun Color R", &sunColorR, 0, 1.0f);
+		debugUI.sliderFloat("Sun Color G", &sunColorG, 0, 1.0f);
+		debugUI.sliderFloat("Sun Color B", &sunColorB, 0, 1.0f);
+		debugUI.endWindow();
 		debugUI.beginWindow("Post-Process Settings");
 		bool changed = false;
 		bool customChanged = false;
@@ -714,8 +724,8 @@ HALT
 		checkIfChanged<F32>(ppCfg.toneMap.saturation, changed, [&](F32& v) { debugUI.sliderFloat("Saturation", &v, 0, 2.0f); });
 		checkIfChanged<F32>(ppCfg.toneMap.contrast, changed, [&](F32& v) { debugUI.sliderFloat("Contrast", &v, 0.5f, 2.0f); });
 		checkIfChanged<bool>(ppCfg.bloom.enabled, changed, [&](bool& v) { String str = fmt::format("Bloom: {}", v ? "ON" : "OFF"); if (debugUI.button(str.c_str())) { v = !v; } });
-		checkIfChanged<F32>(ppCfg.bloom.intensity, changed, [&](F32& v) { debugUI.sliderFloat("Bloom Intensity", &v, 0, 1.0f); });
-		checkIfChanged<F32>(ppCfg.bloom.radius, changed, [&](F32& v) { debugUI.sliderFloat("Bloom Radius", &v, 0, 1.0f); });
+		checkIfChanged<F32>(ppCfg.bloom.intensity, changed, [&](F32& v) { debugUI.sliderFloat("Bloom Intensity", &v, 0, 2.0f); });
+		checkIfChanged<F32>(ppCfg.bloom.radius, changed, [&](F32& v) { debugUI.sliderFloat("Bloom Radius", &v, 0, 8.0f); });
 		debugUI.text("MSAA: {}x", (int)ppCfg.sampleCount);
 		checkIfChanged<String>(ppCfg.customShader, customChanged, [&](String& v) { String str = fmt::format("Custom: {}", v.empty() ? "OFF" : "ON"); if (debugUI.button(str.c_str())) { v = v.empty() ? g_CustomPS : ""; } });
 		if (debugUI.button("Reset")) {
@@ -741,6 +751,9 @@ HALT
 		debugUI.text("Camera Z: {}", fly.pos.z);
 		debugUI.text("RayTracing: inline={} standalone={}", renderer.supportsInlineRayTracing(), renderer.supportsStandaloneRayTracing());
 		debugUI.text("RT Subsystem: {}", rayTracing.isReady() ? "ready" : "disabled");
+		if (hybridRT) {
+			debugUI.text("RT trace: {:.2f} ms", rayTracing.lastTraceMs());
+		}
 		debugUI.text("Mode: {} (F9)", hybridRT ? "Hybrid RT" : "Raster");
 		if (hybridRT) {
 			static const char* rtModeNames[] = { "Shaded", "GBufferColor", "GBufferNormal", "Diffuse", "Reflections", "Fresnel", "RTAlpha" };
@@ -1001,7 +1014,7 @@ HALT
 			Vec3 sunDir = Vec3(cos(glm::radians(sunYaw)) * cos(glm::radians(sunPitch)),
 				-sin(glm::radians(sunPitch)),
 				sin(glm::radians(sunYaw)) * cos(glm::radians(sunPitch)));
-			LightDesc ld; ld.dir = glm::normalize(sunDir); ld.color = Vec3(1.0f, 0.98f, 0.9f); ld.intensity = 2.0f;
+			LightDesc ld; ld.dir = glm::normalize(sunDir); ld.color = Vec3(sunColorR, sunColorG, sunColorB); ld.intensity = sunIntensity;
 			renderer.updateLight(sunHandle, ld);
 		}
 
@@ -1234,6 +1247,8 @@ HALT
 			rc.cameraPos = Vec4(fly.pos, 1.0f);
 			rc.maxRayLength = 100.0f;
 			rc.ambientLight = 0.1f;
+			rc.lightIntensity = sunIntensity;
+			rc.lightColor = Vec4(sunColorR, sunColorG, sunColorB, 0.0f); // matches the sun color in updateLight
 			rc.shadowPCF = rtShadowPCF;
 			rc.aoRadius = rtAoRadius;
 			rc.aoSamples = rtAoSamples;
@@ -1294,7 +1309,7 @@ HALT
 				auto cr = rayTracing.compose(renderer.getTextureSRV(gbufColor), renderer.getTextureSRV(gbufNormal),
 					renderer.getTextureSRV(gbufDepth), renderer.getTextureSRV(rtTex),
 					postProcess.getHDRRTV(), renderer.getDepthStencil(), rtDrawMode,
-					vpInv, fly.pos, ww, wh);
+					vpInv, fly.pos, Vec3(sunColorR, sunColorG, sunColorB), ww, wh);
 				if (cr.isErr()) {
 					static bool composeWarned = false;
 					if (!composeWarned) { EError("RT compose failed: {}", ToString(cr.error())); composeWarned = true; }

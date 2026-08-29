@@ -679,7 +679,7 @@ struct RenderSubsystem::RenderBackend {
 			if (vs && ps) {
 				D::GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "IndirectPSO"; ci.PSODesc.PipelineType = D::PIPELINE_TYPE_GRAPHICS;
 				ci.pVS = vs->shader; ci.pPS = ps->shader; ci.GraphicsPipeline.NumRenderTargets = 1;
-				ci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA8_UNORM_SRGB; ci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
+				ci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA16_FLOAT; ci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
 				ci.GraphicsPipeline.SmplDesc.Count = msaaSamples;
 				ci.GraphicsPipeline.PrimitiveTopology = D::PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 				ci.GraphicsPipeline.RasterizerDesc.CullMode = D::CULL_MODE_NONE;
@@ -848,7 +848,7 @@ struct RenderSubsystem::RenderBackend {
 			if (vs && ps && fogSRV) {
 				D::GraphicsPipelineStateCreateInfo ci; 				ci.PSODesc.Name = "BBoardPSO"; ci.PSODesc.PipelineType = D::PIPELINE_TYPE_GRAPHICS;
 				ci.pVS = vs->shader; ci.pPS = ps->shader; ci.GraphicsPipeline.NumRenderTargets = 1;
-				ci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA8_UNORM_SRGB; ci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
+				ci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA16_FLOAT; ci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
 				ci.GraphicsPipeline.SmplDesc.Count = msaaSamples;
 				ci.GraphicsPipeline.PrimitiveTopology = D::PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 				ci.GraphicsPipeline.RasterizerDesc.CullMode = D::CULL_MODE_NONE;
@@ -926,7 +926,7 @@ struct RenderSubsystem::RenderBackend {
 			if (vs && ps) {
 				D::GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "SkyPSO"; ci.PSODesc.PipelineType = D::PIPELINE_TYPE_GRAPHICS;
 				ci.pVS = vs->shader; ci.pPS = ps->shader; ci.GraphicsPipeline.NumRenderTargets = 1;
-				ci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA8_UNORM_SRGB; ci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
+				ci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA16_FLOAT; ci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
 				ci.GraphicsPipeline.PrimitiveTopology = D::PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 				ci.GraphicsPipeline.RasterizerDesc.CullMode = D::CULL_MODE_NONE;
 				ci.GraphicsPipeline.DepthStencilDesc.DepthEnable = true;
@@ -961,7 +961,7 @@ struct RenderSubsystem::RenderBackend {
 			if (vs && ps) {
 				D::GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "SkyCubePSO"; ci.PSODesc.PipelineType = D::PIPELINE_TYPE_GRAPHICS;
 				ci.pVS = vs->shader; ci.pPS = ps->shader; ci.GraphicsPipeline.NumRenderTargets = 1;
-				ci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA8_UNORM_SRGB; ci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
+				ci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA16_FLOAT; ci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
 				ci.GraphicsPipeline.PrimitiveTopology = D::PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 				ci.GraphicsPipeline.RasterizerDesc.CullMode = D::CULL_MODE_NONE;
 				ci.GraphicsPipeline.DepthStencilDesc.DepthEnable = true;
@@ -1010,7 +1010,9 @@ struct RenderSubsystem::RenderBackend {
 		D::GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = d.name.c_str(); ci.PSODesc.PipelineType = D::PIPELINE_TYPE_GRAPHICS;
 			ci.pVS = vs->shader; ci.pPS = ps->shader;
 			ci.GraphicsPipeline.NumRenderTargets = gbuffer ? 2 : 1;
-			ci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA8_UNORM_SRGB;
+			// Scene passes render into the (RGBA16_FLOAT) HDR target; the G-buffer
+			// pass keeps its 8-bit albedo target.
+			ci.GraphicsPipeline.RTVFormats[0] = gbuffer ? D::TEX_FORMAT_RGBA8_UNORM_SRGB : D::TEX_FORMAT_RGBA16_FLOAT;
 			if (gbuffer) ci.GraphicsPipeline.RTVFormats[1] = D::TEX_FORMAT_RGBA16_FLOAT;
 			ci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
 			// G-buffer pass uses non-MSAA targets (read back by the ray tracing compute shader).
