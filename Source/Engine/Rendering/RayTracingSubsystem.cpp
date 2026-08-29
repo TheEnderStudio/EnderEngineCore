@@ -94,6 +94,10 @@ struct RTConstants {
     uint     AoSamples;
     float    LightSize;
     float    ReflectionBlur;
+    uint     MaxBounces;
+    float    BounceRoughness;
+    float    _padB0;
+    float    _padB1;
 };
 
 RaytracingAccelerationStructure g_TLAS            : register(t0);
@@ -240,7 +244,9 @@ struct ReflectionResult {
 };
 
 // Trace one reflection ray and shade the hit point (material + shadow).
-ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float MaxShadowLen, float3 CameraPos, float3 LightDir)
+// When bounce < MaxBounces and the hit surface is smooth, casts a second
+// reflection ray from the hit point (two-bounce reflections).
+ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float MaxShadowLen, float3 CameraPos, float3 LightDir, uint bounce)
 {
     RayDesc ray;
     ray.Origin    = Origin;
@@ -293,6 +299,40 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
         {
             float3 HitPos = Origin + ReflDir * q.CommittedRayT();
             res.NdotL *= CastShadowPCF(HitPos, LightDir, MaxShadowLen, Norm, length(HitPos - CameraPos));
+        }
+
+        // Two-bounce: reflect again from the hit point on surfaces at or below
+        // the roughness threshold (BounceRoughness = 1.0 forces all surfaces).
+        if (res.Found && bounce < g_RTConstants.MaxBounces && Mtr.Roughness <= g_RTConstants.BounceRoughness)
+        {
+            float3 HitPos = Origin + ReflDir * q.CommittedRayT();
+            float3 Refl2  = reflect(ReflDir, Norm);
+            float  bias2  = max(0.002, SMALL_OFFSET * length(HitPos - CameraPos));
+            RayDesc ray2;
+            ray2.Origin    = HitPos + Norm * bias2;
+            ray2.Direction = Refl2;
+            ray2.TMin      = 0.0;
+            ray2.TMax      = MaxReflLen;
+
+            RayQuery<RAY_FLAG_CULL_BACK_FACING_TRIANGLES> q2;
+            q2.TraceRayInline(g_TLAS, RAY_FLAG_NONE, ~0u, ray2);
+            q2.Proceed();
+
+            float3 col2;
+            if (q2.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+            {
+                // Simplified second-bounce shading: material base color only.
+                uint          InstId2 = q2.CommittedInstanceID();
+                uint          GeoId2  = q2.CommittedGeometryIndex();
+                ObjectAttribs   Obj2   = g_ObjectAttribs[InstId2 + GeoId2];
+                MaterialAttribs Mtr2   = g_MaterialAttribs[Obj2.MaterialId];
+                col2 = Mtr2.BaseColorMask.rgb * (1.0 - Mtr2.Roughness * g_RTConstants.ReflectionBlur);
+            }
+            else
+            {
+                col2 = GetSkyColor(Refl2).rgb;
+            }
+            res.BaseColor = lerp(res.BaseColor, float4(col2, res.BaseColor.a), 0.5);
         }
     }
     return res;
@@ -378,7 +418,8 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
                                         g_RTConstants.MaxRayLength,
                                         g_RTConstants.MaxRayLength,
                                         g_RTConstants.CameraPos.xyz,
-                                        LightDir);
+                                        LightDir,
+                                        0);
         if (refl.Found)
             Color = refl.BaseColor * max(g_RTConstants.AmbientLight, refl.NdotL);
         else

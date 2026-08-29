@@ -341,7 +341,9 @@ float4 main(PSIn i) : SV_TARGET {
 	UInt32 rtAoSamples = 4;  // AO rays per pixel (0 = off)
 	F32 rtLightSize = 0.05f; // PCSS light size (0 = fixed-cone PCF)
 	F32 rtReflectionBlur = 0.7f; // roughness-driven reflection attenuation
-	float rtResScale = 0.5f; // RT resolution scale (0.25 / 0.5 / 1.0)
+	UInt32 rtMaxBounces = 1;     // max reflection bounces (0 = single, 1 = two-bounce)
+	F32 rtBounceRoughness = 1.0f; // second-bounce roughness threshold (1.0 = force all surfaces)
+	float rtResScale = 0.5f; // RT resolution scale (0.5 / 1.0)
 	bool rtResAuto = true;   // auto-pick the scale from the distance to the nearest object
 	TextureHandle gbufColor, gbufNormal, gbufDepth, rtTex;
 	// (Re)create the ray traced output texture at the current rtResScale.
@@ -772,6 +774,10 @@ HALT
 				}
 			}
 			if (debugUI.sliderFloat("Refl Blur", &rtReflectionBlur, 0.0f, 1.0f)) {}
+			if (debugUI.button(fmt::format("Refl Bounce: {}", rtMaxBounces ? "2" : "1").c_str())) {
+				rtMaxBounces = rtMaxBounces ? 0 : 1;
+			}
+			if (debugUI.sliderFloat("Bounce Rough", &rtBounceRoughness, 0.0f, 1.0f)) {}
 		}
 		{
 			static size_t visibleCount = 0;
@@ -1233,6 +1239,8 @@ HALT
 			rc.aoSamples = rtAoSamples;
 			rc.lightSize = rtLightSize;
 			rc.reflectionBlur = rtReflectionBlur;
+			rc.maxBounces = rtMaxBounces;
+			rc.bounceRoughness = rtBounceRoughness;
 			// Packed disc samples for soft shadows (16 points, xy/zw pairs).
 			// The first sample is the center (no perturbation) so PCF=1 behaves
 			// like a plain single shadow ray.

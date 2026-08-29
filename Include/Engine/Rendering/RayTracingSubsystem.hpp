@@ -25,6 +25,9 @@ struct alignas(16) RayTraceConstants {
 	UInt32 aoSamples = 4;      ///< AO rays per pixel (0 disables AO).
 	F32  lightSize = 0.05f;    ///< PCSS light angular size (0 = fixed-cone PCF).
 	F32  reflectionBlur = 0.7f; ///< Reflection attenuation by roughness (0..1).
+	UInt32 maxBounces = 1;     ///< Max reflection bounces (0 = single, 1 = two-bounce).
+	F32  bounceRoughness = 0.4f; ///< Roughness threshold for the second bounce (1.0 = all surfaces).
+	F32  _padBounce[2] = { 0, 0 };
 };
 
 /// @brief A ray-traced scene object (mesh + material + world transform).
