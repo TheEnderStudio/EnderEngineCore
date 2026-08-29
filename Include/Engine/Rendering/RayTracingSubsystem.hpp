@@ -27,6 +27,19 @@ struct RayTracedObject {
 };
 
 /**
+ * @brief A ray-traced object group.
+ *
+ * One TLAS instance that references a single BLAS built from multiple meshes
+ * (geometries), all sharing the same world transform. The order of objects
+ * must match the geometry order in the BLAS; the shader selects the geometry
+ * with CommittedGeometryIndex().
+ */
+struct RayTracedObjectGroup {
+	Vector<RayTracedObject> objects; ///< Geometries (mesh + material), BLAS geometry order.
+	Transform transform;             ///< Shared world transform for all geometries.
+};
+
+/**
  * @brief Ray tracing subsystem.
  *
  * Owns acceleration structures (BLAS/TLAS), bindless scene data
@@ -59,6 +72,9 @@ public:
 	/// @brief Create a bottom-level acceleration structure (BLAS) from an existing mesh.
 	Result<BLASHandle, RenderError> createBLAS(MeshHandle mesh);
 
+	/// @brief Create a BLAS from multiple meshes (one geometry per mesh).
+	Result<BLASHandle, RenderError> createBLAS(const Vector<MeshHandle>& meshes);
+
 	/// @brief Create a top-level acceleration structure (TLAS).
 	Result<TLASHandle, RenderError> createTLAS(UInt32 maxInstances, bool allowUpdate = true);
 
@@ -70,14 +86,16 @@ public:
 	// -------------------------------------------------------------------
 
 	/**
-	 * @brief Rebuild bindless scene data from the given render list.
+	 * @brief Rebuild bindless scene data from the given object groups.
 	 *
-	 * Builds/updates a BLAS per unique mesh, regenerates the object and
-	 * material attribute buffers and the texture registry, and rebuilds an
+	 * Builds/updates a BLAS per unique group mesh-set, regenerates the object
+	 * and material attribute buffers and the texture registry, and rebuilds an
 	 * internal TLAS (created lazily) so that trace() has a complete scene.
-	 * @param objects Scene objects (mesh + material + transform).
+	 * One TLAS instance is created per group; ObjectAttribs are expanded per
+	 * geometry and addressed in the shader as CustomId + CommittedGeometryIndex().
+	 * @param groups Scene object groups.
 	 */
-	Result<void, RenderError> updateScene(const Vector<RayTracedObject>& objects);
+	Result<void, RenderError> updateScene(const Vector<RayTracedObjectGroup>& groups);
 
 	// -------------------------------------------------------------------
 	// Ray tracing + compose
@@ -115,12 +133,14 @@ public:
 	 * @param depthDSV      Optional DSV to keep bound after composing (pass the
 	 *                      scene/G-buffer depth so subsequent 2D/UI passes that
 	 *                      expect a D32 depth stay consistent); nullptr unbinds it.
+	 * @param drawMode      Debug render mode: 0=shaded, 1=G-buffer color,
+	 *                      2=G-buffer normal, 3=diffuse lighting, 4=reflections, 5=Fresnel.
 	 * @param viewProjInv   Inverse view-projection (column-major).
 	 * @param cameraPos     World-space camera position.
 	 * @param width,height  Target dimensions.
 	 */
 	Result<void, RenderError> compose(void* gBufferColor, void* gBufferNormal, void* gBufferDepth,
-		void* rtTex, void* outputRTV, void* depthDSV,
+		void* rtTex, void* outputRTV, void* depthDSV, UInt32 drawMode,
 		const Mat4& viewProjInv, const Vec3& cameraPos,
 		UInt32 width, UInt32 height);
 

@@ -158,8 +158,11 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
 
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
     {
+        // CustomId is the ObjectAttribs start index of the instance; the
+        // geometry index selects the mesh within the instance's BLAS.
         uint          InstId = q.CommittedInstanceID();
-        ObjectAttribs Obj    = g_ObjectAttribs[InstId];
+        uint          GeoId  = q.CommittedGeometryIndex();
+        ObjectAttribs Obj    = g_ObjectAttribs[InstId + GeoId];
         MaterialAttribs Mtr  = g_MaterialAttribs[Obj.MaterialId];
 
         uint  PrimInd     = q.CommittedPrimitiveIndex();
@@ -202,21 +205,24 @@ float3 ScreenPosToWorldPos(float2 uv, float depth, float4x4 vpInv)
 void CSMain(uint2 DTid : SV_DispatchThreadID)
 {
     uint2 Dim;
-    g_OutRT.GetDimensions(Dim.x, Dim.y);
+    g_OutRT.GetDimensions(Dim.x, Dim.y); // half-resolution output
     if (DTid.x >= Dim.x || DTid.y >= Dim.y)
         return;
 
-    float Depth = g_GBufferDepth.Load(int3(DTid, 0)).x;
+    // Normalized UV of the half-res pixel center; sampling the full-res G-buffer
+    // with this UV performs bilinear filtering (softens shadow/reflection edges).
+    float2 UV = (float2(DTid) + 0.5) / float2(Dim);
+
+    float Depth = g_GBufferDepth.SampleLevel(g_Sampler, UV, 0).x;
     if (Depth >= 1.0)
     {
         g_OutRT[DTid] = float4(0, 0, 0, 1);
         return;
     }
 
-    float2 UV        = (float2(DTid) + 0.5) / float2(Dim);
     float3 WPos      = ScreenPosToWorldPos(UV, Depth, g_RTConstants.ViewProjInv);
     float3 LightDir  = g_RTConstants.LightDir.xyz;
-    float3 WNormal   = normalize(g_GBufferNormal.Load(int3(DTid, 0)).xyz);
+    float3 WNormal   = normalize(g_GBufferNormal.SampleLevel(g_Sampler, UV, 0).xyz);
     float  DisToCam  = length(WPos - g_RTConstants.CameraPos.xyz);
     float3 ViewDir   = (WPos - g_RTConstants.CameraPos.xyz) / max(DisToCam, 0.0001);
 
@@ -259,11 +265,21 @@ Texture2D<float4> g_GBufferColor  : register(t0);
 Texture2D<float4> g_GBufferNormal : register(t1);
 Texture2D<float>  g_GBufferDepth  : register(t2);
 Texture2D<float4> g_RayTracedTex  : register(t3);
+SamplerState      g_Sampler       : register(s0);
 cbuffer ComposeCB : register(b0) {
     float4x4 g_ViewProjInv;
     float4   g_CameraPos;
+    uint     g_DrawMode;
+    float3   g_Pad;
 };
 struct PSIn { float4 Pos : SV_POSITION; float2 UV : TEXCOORD0; };
+
+#define RENDER_MODE_SHADED           0
+#define RENDER_MODE_G_BUFFER_COLOR   1
+#define RENDER_MODE_G_BUFFER_NORMAL  2
+#define RENDER_MODE_DIFFUSE_LIGHTING 3
+#define RENDER_MODE_REFLECTIONS      4
+#define RENDER_MODE_FRESNEL_TERM     5
 
 float3 ScreenPosToWorldPos(float2 uv, float depth, float4x4 vpInv)
 {
@@ -285,23 +301,36 @@ float4 main(PSIn i) : SV_Target
 
     float4 Color  = g_GBufferColor.Load(tc);
     float3 Normal = normalize(g_GBufferNormal.Load(tc).xyz);
-    float4 RT     = g_RayTracedTex.Load(tc);
+    // The ray traced texture is half resolution; bilinear upsample.
+    float4 RT     = g_RayTracedTex.SampleLevel(g_Sampler, UV, 0);
 
     float3 WPos    = ScreenPosToWorldPos(UV, Depth, g_ViewProjInv);
     float3 ViewDir = normalize(g_CameraPos.xyz - WPos);
     float  NdotV   = saturate(dot(Normal, ViewDir));
     float  R       = lerp(0.04, 1.0, pow(1.0 - NdotV, 5.0));
 
-    float3 Shaded = Color.rgb * RT.a;
-    float3 Final  = lerp(Shaded, RT.rgb, R);
-    return float4(Final, 1.0);
+    switch (g_DrawMode)
+    {
+        case RENDER_MODE_G_BUFFER_COLOR:   return Color;
+        case RENDER_MODE_G_BUFFER_NORMAL:  return float4(abs(Normal), 1.0);
+        case RENDER_MODE_DIFFUSE_LIGHTING: return float4(Color.rgb * RT.a, 1.0);
+        case RENDER_MODE_REFLECTIONS:      return float4(RT.rgb, 1.0);
+        case RENDER_MODE_FRESNEL_TERM:     return float4(R, R, R, 1.0);
+        case RENDER_MODE_SHADED:
+        default:
+        {
+            float3 Shaded = Color.rgb * RT.a;
+            float3 Final  = lerp(Shaded, RT.rgb, R);
+            return float4(Final, 1.0);
+        }
+    }
 }
 )";
 
 // ===================================================================
 // Acceleration structure data (owned by this subsystem).
 // ===================================================================
-struct BLASData { D::RefCntAutoPtr<D::IBottomLevelAS> blas; MeshHandle sourceMesh; };
+struct BLASData { D::RefCntAutoPtr<D::IBottomLevelAS> blas; Vector<MeshHandle> sourceMeshes; };
 struct TLASData {
 	D::RefCntAutoPtr<D::ITopLevelAS> tlas;
 	D::RefCntAutoPtr<D::IBuffer> scratch;
@@ -309,6 +338,7 @@ struct TLASData {
 	UInt32 maxInstances = 0;
 	bool allowUpdate = true;
 	bool built = false;
+	Vector<String> names; ///< Cached instance names (Diligent requires non-null; avoids per-frame allocations).
 };
 
 struct RayTracingSubsystem::Impl {
@@ -323,8 +353,8 @@ struct RayTracingSubsystem::Impl {
 	Detail::ResourcePool<TLASData> tlases{ 8 };
 	D::RefCntAutoPtr<D::IBuffer> blasScratch;
 	TLASData sceneTLAS;                 ///< Internal TLAS managed by updateScene().
-	Vector<BLASHandle> blasCache;       ///< BLAS per unique mesh (parallel to blasCacheMesh).
-	Vector<MeshHandle> blasCacheMesh;
+	Vector<BLASHandle> blasCache;       ///< BLAS per unique group mesh-set.
+	Vector<Vector<MeshHandle>> blasCacheMeshSet; ///< The mesh-set each cached BLAS was built from.
 
 	// Shared scene geometry (all meshes merged, for the ray query shader).
 	D::RefCntAutoPtr<D::IBuffer> sharedVB;
@@ -364,30 +394,52 @@ bool RayTracingSubsystem::isReady() const { return m_impl->ok; }
 // ===================================================================
 
 Result<BLASHandle, RenderError> RayTracingSubsystem::createBLAS(MeshHandle mesh) {
+	Vector<MeshHandle> meshes{ mesh };
+	return createBLAS(meshes);
+}
+
+Result<BLASHandle, RenderError> RayTracingSubsystem::createBLAS(const Vector<MeshHandle>& meshes) {
 	auto& p = *m_impl;
 	auto* dev = p.device(); if (!dev) return RenderError::NotInitialized;
 	auto* ctx = p.ctx(); if (!ctx) return RenderError::NotInitialized;
+	if (meshes.empty()) return RenderError::InvalidArgument;
 
-	void* vb = nullptr; void* ib = nullptr; UInt32 vc = 0; UInt32 ic = 0;
-	p.renderer->getMeshGeometry(mesh, vb, ib, vc, ic);
-	if (!vb || !ib || ic == 0) return RenderError::InvalidHandle;
-
-	D::BLASTriangleDesc tri;
-	tri.GeometryName         = "Mesh";
-	tri.MaxVertexCount       = vc;
-	tri.VertexValueType      = D::VT_FLOAT32;
-	tri.VertexComponentCount = 3;
-	tri.MaxPrimitiveCount    = ic / 3;
-	tri.IndexType            = D::VT_UINT32;
+	// Geometry names must be stable for the BLAS lifetime (used by the build data).
+	Vector<String> geoNames;
+	geoNames.reserve(meshes.size());
+	Vector<D::BLASTriangleDesc> tris(meshes.size());
+	Vector<D::IBuffer*> vbs(meshes.size());
+	Vector<D::IBuffer*> ibs(meshes.size());
+	Vector<UInt32> vcs(meshes.size());
+	Vector<UInt32> ics(meshes.size());
+	UInt32 totalPrims = 0;
+	for (size_t i = 0; i < meshes.size(); ++i) {
+		void* vb = nullptr; void* ib = nullptr; UInt32 vc = 0; UInt32 ic = 0;
+		p.renderer->getMeshGeometry(meshes[i], vb, ib, vc, ic);
+		if (!vb || !ib || ic == 0) return RenderError::InvalidHandle;
+		geoNames.emplace_back("Geo" + std::to_string(i));
+		vbs[i] = static_cast<D::IBuffer*>(vb);
+		ibs[i] = static_cast<D::IBuffer*>(ib);
+		vcs[i] = vc;
+		ics[i] = ic;
+		D::BLASTriangleDesc& tri = tris[i];
+		tri.GeometryName         = geoNames.back().c_str();
+		tri.MaxVertexCount       = vc;
+		tri.VertexValueType      = D::VT_FLOAT32;
+		tri.VertexComponentCount = 3;
+		tri.MaxPrimitiveCount    = ic / 3;
+		tri.IndexType            = D::VT_UINT32;
+		totalPrims += ic / 3;
+	}
 
 	D::BottomLevelASDesc ad;
 	ad.Name          = "EE_RT_BLAS";
 	ad.Flags         = D::RAYTRACING_BUILD_AS_PREFER_FAST_TRACE;
-	ad.pTriangles    = &tri;
-	ad.TriangleCount = 1;
+	ad.pTriangles    = tris.data();
+	ad.TriangleCount = (D::Uint32)tris.size();
 	D::RefCntAutoPtr<D::IBottomLevelAS> blas;
 	dev->CreateBLAS(ad, &blas);
-	if (!blas) { EError("RayTracing: BLAS creation failed for mesh {}", mesh.index); return RenderError::AccelerationStructureCreationFailed; }
+	if (!blas) { EError("RayTracing: BLAS creation failed ({} geometries)", meshes.size()); return RenderError::AccelerationStructureCreationFailed; }
 
 	{
 		const auto sz = blas->GetScratchBufferSizes().Build;
@@ -399,22 +451,25 @@ Result<BLASHandle, RenderError> RayTracingSubsystem::createBLAS(MeshHandle mesh)
 		}
 	}
 
-	D::BLASBuildTriangleData td;
-	td.GeometryName         = tri.GeometryName;
-	td.pVertexBuffer        = static_cast<D::IBuffer*>(vb);
-	td.VertexStride         = sizeof(Vertex);
-	td.VertexCount          = vc;
-	td.VertexValueType      = tri.VertexValueType;
-	td.VertexComponentCount = tri.VertexComponentCount;
-	td.pIndexBuffer         = static_cast<D::IBuffer*>(ib);
-	td.PrimitiveCount       = tri.MaxPrimitiveCount;
-	td.IndexType            = tri.IndexType;
-	td.Flags                = D::RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+	Vector<D::BLASBuildTriangleData> tds(meshes.size());
+	for (size_t i = 0; i < meshes.size(); ++i) {
+		D::BLASBuildTriangleData& td = tds[i];
+		td.GeometryName         = geoNames[i].c_str();
+		td.pVertexBuffer        = vbs[i];
+		td.VertexStride         = sizeof(Vertex);
+		td.VertexCount          = vcs[i];
+		td.VertexValueType      = tris[i].VertexValueType;
+		td.VertexComponentCount = tris[i].VertexComponentCount;
+		td.pIndexBuffer         = ibs[i];
+		td.PrimitiveCount       = tris[i].MaxPrimitiveCount;
+		td.IndexType            = tris[i].IndexType;
+		td.Flags                = D::RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+	}
 
 	D::BuildBLASAttribs ba;
 	ba.pBLAS             = blas;
-	ba.pTriangleData     = &td;
-	ba.TriangleDataCount = 1;
+	ba.pTriangleData     = tds.data();
+	ba.TriangleDataCount = (D::Uint32)tds.size();
 	ba.pScratchBuffer    = p.blasScratch;
 	ba.BLASTransitionMode          = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
 	ba.GeometryTransitionMode      = D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
@@ -424,8 +479,8 @@ Result<BLASHandle, RenderError> RayTracingSubsystem::createBLAS(MeshHandle mesh)
 	auto a = p.blases.allocate();
 	auto* dd = p.blases.getUnchecked(a.index);
 	dd->blas = std::move(blas);
-	dd->sourceMesh = mesh;
-	EInfo("RayTracing: BLAS created for mesh {} ({} verts, {} primitives)", mesh.index, vc, ic / 3);
+	dd->sourceMeshes = meshes;
+	EInfo("RayTracing: BLAS created ({} geometries, {} primitives)", meshes.size(), totalPrims);
 	return BLASHandle{ a.index, a.generation };
 }
 
@@ -479,17 +534,22 @@ Result<void, RenderError> RayTracingSubsystem::Impl::buildTLAS(TLASData& dd, con
 		if (!dd.instanceBuf) return RenderError::BufferCreationFailed;
 	}
 
+	// Cache instance names (rebuilt only when the instance count changes).
+	if (dd.names.size() != instances.size()) {
+		dd.names.clear();
+		dd.names.reserve(instances.size()); // reserve so c_str() pointers stay valid
+		for (size_t i = 0; i < instances.size(); ++i)
+			dd.names.emplace_back(instances[i].name.empty() ? "Instance" + std::to_string(i) : instances[i].name);
+	}
+
 	Vector<D::TLASBuildInstanceData> insts;
 	insts.reserve(instances.size());
-	Vector<String> names;
-	names.reserve(instances.size()); // reserve so c_str() pointers stay valid
-	for (const auto& in : instances) {
+	for (size_t i = 0; i < instances.size(); ++i) {
+		const TLASInstance& in = instances[i];
 		auto* bd = p.blases.get(in.blas.index, in.blas.generation);
 		if (!bd || !bd->blas) { EError("RayTracing: invalid BLAS handle {}:{}", in.blas.index, in.blas.generation); return RenderError::InvalidHandle; }
 		D::TLASBuildInstanceData di;
-		// Diligent requires a non-null instance name.
-		names.push_back(in.name.empty() ? "Instance" + std::to_string(insts.size()) : in.name);
-		di.InstanceName = names.back().c_str();
+		di.InstanceName = dd.names[i].c_str();
 		di.CustomId     = in.customId;
 		di.Mask         = in.mask;
 		di.pBLAS        = bd->blas;
@@ -522,49 +582,57 @@ Result<void, RenderError> RayTracingSubsystem::Impl::buildTLAS(TLASData& dd, con
 // Bindless scene
 // ===================================================================
 
-Result<void, RenderError> RayTracingSubsystem::updateScene(const Vector<RayTracedObject>& objects) {
+Result<void, RenderError> RayTracingSubsystem::updateScene(const Vector<RayTracedObjectGroup>& groups) {
 	auto& p = *m_impl;
 	auto* dev = p.device(); if (!dev) return RenderError::NotInitialized;
 	auto* ctx = p.ctx(); if (!ctx) return RenderError::NotInitialized;
-	if (objects.empty() || !p.rtPSO) return RenderError::InvalidArgument;
+	if (groups.empty() || !p.rtPSO) return RenderError::InvalidArgument;
 
-	// 1. Ensure a BLAS exists for every unique mesh.
-	Vector<BLASHandle> objBLAS(objects.size());
-	for (size_t i = 0; i < objects.size(); ++i) {
-		const MeshHandle mh = objects[i].mesh;
+	// 1. Ensure a BLAS (one geometry per mesh) exists for every unique group mesh-set.
+	Vector<BLASHandle> groupBLAS(groups.size());
+	for (size_t g = 0; g < groups.size(); ++g) {
+		Vector<MeshHandle> meshes;
+		meshes.reserve(groups[g].objects.size());
+		for (auto& o : groups[g].objects) meshes.push_back(o.mesh);
 		BLASHandle bh;
-		bool found = false;
-		for (size_t c = 0; c < p.blasCacheMesh.size(); ++c) {
-			if (p.blasCacheMesh[c].index == mh.index && p.blasCacheMesh[c].generation == mh.generation) {
-				bh = p.blasCache[c]; found = true; break;
+		for (size_t c = 0; c < p.blasCacheMeshSet.size(); ++c) {
+			if (p.blasCacheMeshSet[c].size() != meshes.size()) continue;
+			bool same = true;
+			for (size_t i = 0; i < meshes.size(); ++i) {
+				if (p.blasCacheMeshSet[c][i].index != meshes[i].index ||
+					p.blasCacheMeshSet[c][i].generation != meshes[i].generation) { same = false; break; }
 			}
+			if (same) { bh = p.blasCache[c]; break; }
 		}
-		if (!found) {
-			auto r = createBLAS(mh);
-			if (r.isErr()) { EError("RayTracing: createBLAS failed for mesh {}: {}", mh.index, ToString(r.error())); return r.error(); }
+		if (!bh.isValid()) {
+			auto r = createBLAS(meshes);
+			if (r.isErr()) { EError("RayTracing: createBLAS failed: {}", ToString(r.error())); return r.error(); }
 			bh = r.value();
 			p.blasCache.push_back(bh);
-			p.blasCacheMesh.push_back(mh);
+			p.blasCacheMeshSet.push_back(std::move(meshes));
 		}
-		objBLAS[i] = bh;
+		groupBLAS[g] = bh;
 	}
 
 	// 1.5. Rebuild the shared vertex/index buffers when the mesh set changes.
-	// All scene meshes are merged into one vertex/index buffer pair; ObjectAttribs
-	// stores the per-mesh offset into these buffers (same approach as the reference
-	// hybrid renderer). Mesh geometry is static, so this only runs on set changes.
-	bool meshSetChanged = p.blasCacheMesh.size() != p.sceneMeshKeys.size();
+	// All unique scene meshes are merged into one vertex/index buffer pair.
+	Vector<MeshHandle> allMeshes;
+	for (auto& set : p.blasCacheMeshSet)
+		for (auto& mh : set)
+			if (std::find(allMeshes.begin(), allMeshes.end(), mh) == allMeshes.end())
+				allMeshes.push_back(mh);
+	bool meshSetChanged = allMeshes.size() != p.sceneMeshKeys.size();
 	if (!meshSetChanged) {
-		for (size_t i = 0; i < p.blasCacheMesh.size(); ++i) {
-			if (p.blasCacheMesh[i].index != p.sceneMeshKeys[i].index ||
-				p.blasCacheMesh[i].generation != p.sceneMeshKeys[i].generation) { meshSetChanged = true; break; }
+		for (size_t i = 0; i < allMeshes.size(); ++i) {
+			if (allMeshes[i].index != p.sceneMeshKeys[i].index ||
+				allMeshes[i].generation != p.sceneMeshKeys[i].generation) { meshSetChanged = true; break; }
 		}
 	}
 	if (meshSetChanged) {
 		Vector<Vertex> allVerts;
 		Vector<UInt32> allIdx;
 		Vector<UInt32> firstVertex, firstIndex;
-		for (auto& mh : p.blasCacheMesh) {
+		for (auto& mh : allMeshes) {
 			const Vector<Vertex>* verts = p.renderer->getMeshVertices(mh);
 			const Vector<UInt32>* idxs = p.renderer->getMeshIndices(mh);
 			if (!verts || !idxs) { EError("RayTracing: cannot access mesh {} geometry", mh.index); return RenderError::InvalidHandle; }
@@ -584,64 +652,78 @@ Result<void, RenderError> RayTracingSubsystem::updateScene(const Vector<RayTrace
 		};
 		if (!uploadStatic(p.sharedVB, allVerts.data(), (UInt32)allVerts.size(), (UInt32)sizeof(Vertex), "RT SharedVB")) return RenderError::BufferCreationFailed;
 		if (!uploadStatic(p.sharedIB, allIdx.data(), (UInt32)allIdx.size(), (UInt32)sizeof(UInt32), "RT SharedIB")) return RenderError::BufferCreationFailed;
-		p.sceneMeshKeys = p.blasCacheMesh;
+		p.sceneMeshKeys = allMeshes;
 		p.sceneMeshFirstVertex = std::move(firstVertex);
 		p.sceneMeshFirstIndex = std::move(firstIndex);
 		EInfo("RayTracing: shared geometry rebuilt ({} meshes, {} verts, {} indices)", p.sceneMeshKeys.size(), allVerts.size(), allIdx.size());
 	}
 
 	// 2. Rebuild material attribs (deduplicated by material handle) + texture registry.
+	// Traversal order matches the ObjectAttribs expansion in step 3.
+	UInt32 totalObjects = 0;
+	for (auto& g : groups) totalObjects += (UInt32)g.objects.size();
 	Vector<RTMaterialAttribs> newMaterials;
 	Vector<MaterialHandle> materialKeys;
-	Vector<UInt32> objMaterialId(objects.size());
+	Vector<UInt32> objMaterialId(totalObjects);
 	Vector<TextureHandle> texKeys;
 	Vector<D::ITextureView*> newSRVs;
-	for (size_t i = 0; i < objects.size(); ++i) {
-		const MaterialHandle mat = objects[i].material;
-		UInt32 mid = InvalidIndex;
-		for (size_t m = 0; m < materialKeys.size(); ++m) {
-			if (materialKeys[m].index == mat.index && materialKeys[m].generation == mat.generation) { mid = (UInt32)m; break; }
-		}
-		if (mid == InvalidIndex) {
-			auto desc = p.renderer->getMaterial(mat);
-			if (!desc.has_value()) { EError("RayTracing: invalid material handle {}:{}", mat.index, mat.generation); return RenderError::InvalidHandle; }
-			RTMaterialAttribs ma;
-			ma.baseColorMask = desc->baseColorFactor;
-			ma.sampInd = 0;
-			ma.baseColorTexInd = 0;
-			if (desc->baseColorTexture.isValid()) {
-				bool texFound = false;
-				for (size_t t = 0; t < texKeys.size(); ++t) {
-					if (texKeys[t].index == desc->baseColorTexture.index) { ma.baseColorTexInd = (UInt32)t; texFound = true; break; }
-				}
-				if (!texFound) {
-					ma.baseColorTexInd = (UInt32)texKeys.size();
-					texKeys.push_back(desc->baseColorTexture);
-					auto* srv = static_cast<D::ITextureView*>(p.renderer->getTextureSRV(desc->baseColorTexture));
-					newSRVs.push_back(srv ? srv : p.whiteSRV.RawPtr());
-				}
+	UInt32 oi = 0;
+	for (auto& g : groups) {
+		for (auto& o : g.objects) {
+			const MaterialHandle mat = o.material;
+			UInt32 mid = InvalidIndex;
+			for (size_t m = 0; m < materialKeys.size(); ++m) {
+				if (materialKeys[m].index == mat.index && materialKeys[m].generation == mat.generation) { mid = (UInt32)m; break; }
 			}
-			mid = (UInt32)materialKeys.size();
-			materialKeys.push_back(mat);
-			newMaterials.push_back(ma);
+			if (mid == InvalidIndex) {
+				auto desc = p.renderer->getMaterial(mat);
+				if (!desc.has_value()) { EError("RayTracing: invalid material handle {}:{}", mat.index, mat.generation); return RenderError::InvalidHandle; }
+				RTMaterialAttribs ma;
+				ma.baseColorMask = desc->baseColorFactor;
+				ma.sampInd = 0;
+				ma.baseColorTexInd = 0;
+				if (desc->baseColorTexture.isValid()) {
+					bool texFound = false;
+					for (size_t t = 0; t < texKeys.size(); ++t) {
+						if (texKeys[t].index == desc->baseColorTexture.index) { ma.baseColorTexInd = (UInt32)t; texFound = true; break; }
+					}
+					if (!texFound) {
+						ma.baseColorTexInd = (UInt32)texKeys.size();
+						texKeys.push_back(desc->baseColorTexture);
+						auto* srv = static_cast<D::ITextureView*>(p.renderer->getTextureSRV(desc->baseColorTexture));
+						newSRVs.push_back(srv ? srv : p.whiteSRV.RawPtr());
+					}
+				}
+				mid = (UInt32)materialKeys.size();
+				materialKeys.push_back(mat);
+				newMaterials.push_back(ma);
+			}
+			objMaterialId[oi++] = mid;
 		}
-		objMaterialId[i] = mid;
 	}
 
-	// 3. Build ObjectAttribs (FirstIndex/FirstVertex point into the shared buffers).
-	Vector<RTObjectAttribs> objAttribs(objects.size());
-	for (size_t i = 0; i < objects.size(); ++i) {
-		UInt32 mi = InvalidIndex;
-		for (size_t m = 0; m < p.sceneMeshKeys.size(); ++m) {
-			if (p.sceneMeshKeys[m].index == objects[i].mesh.index && p.sceneMeshKeys[m].generation == objects[i].mesh.generation) { mi = (UInt32)m; break; }
+	// 3. Build ObjectAttribs (expanded per geometry; FirstIndex/FirstVertex into the shared buffers).
+	Vector<RTObjectAttribs> objAttribs(totalObjects);
+	Vector<UInt32> groupStart(groups.size());
+	oi = 0;
+	for (size_t g = 0; g < groups.size(); ++g) {
+		groupStart[g] = oi;
+		const Mat4 wm = groups[g].transform.computeWorldMatrix();
+		const Mat4 nm = groups[g].transform.computeNormalMatrix();
+		for (auto& o : groups[g].objects) {
+			UInt32 mi = InvalidIndex;
+			for (size_t m = 0; m < p.sceneMeshKeys.size(); ++m) {
+				if (p.sceneMeshKeys[m].index == o.mesh.index && p.sceneMeshKeys[m].generation == o.mesh.generation) { mi = (UInt32)m; break; }
+			}
+			RTObjectAttribs& oa = objAttribs[oi];
+			oa.modelMat  = wm;
+			oa.normalMat = nm;
+			oa.materialId = objMaterialId[oi];
+			oa.firstIndex = (mi != InvalidIndex) ? p.sceneMeshFirstIndex[mi] : 0;
+			oa.firstVertex = (mi != InvalidIndex) ? p.sceneMeshFirstVertex[mi] : 0;
+			oa.meshId = mi;
+			++oi;
 		}
-		RTObjectAttribs& oa = objAttribs[i];
-		oa.modelMat  = objects[i].transform.computeWorldMatrix();
-		oa.normalMat = objects[i].transform.computeNormalMatrix();
-		oa.materialId = objMaterialId[i];
-		oa.firstIndex = (mi != InvalidIndex) ? p.sceneMeshFirstIndex[mi] : 0;
-		oa.firstVertex = (mi != InvalidIndex) ? p.sceneMeshFirstVertex[mi] : 0;
-		oa.meshId = mi;
 	}
 
 	// 4. Upload buffers (recreate when the size grows).
@@ -672,26 +754,26 @@ Result<void, RenderError> RayTracingSubsystem::updateScene(const Vector<RayTrace
 		if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_Textures")) v->SetArray(srvs.data(), 0, MaxSceneTextures, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	}
 
-	// 6. Build/update the internal TLAS.
-	Vector<TLASInstance> instances(objects.size());
-	for (size_t i = 0; i < objects.size(); ++i) {
-		TLASInstance& in = instances[i];
-		in.blas = objBLAS[i];
-		in.transform = objects[i].transform.computeWorldMatrix();
+	// 6. Build/update the internal TLAS (one instance per group).
+	Vector<TLASInstance> instances(groups.size());
+	for (size_t g = 0; g < groups.size(); ++g) {
+		TLASInstance& in = instances[g];
+		in.blas = groupBLAS[g];
+		in.transform = groups[g].transform.computeWorldMatrix();
 		in.mask = 0xFF;
-		in.customId = (UInt32)i; // CustomId == ObjectAttribs index
+		in.customId = groupStart[g]; // ObjectAttribs start index of this instance
 	}
-	if (!p.sceneTLAS.tlas || p.sceneTLAS.maxInstances < objects.size()) {
+	if (!p.sceneTLAS.tlas || p.sceneTLAS.maxInstances < groups.size()) {
 		p.sceneTLAS = TLASData{}; // Recreate with the new capacity.
 		D::TopLevelASDesc td;
 		td.Name = "EE_RT_SceneTLAS";
-		td.MaxInstanceCount = (UInt32)objects.size();
+		td.MaxInstanceCount = (UInt32)groups.size();
 		td.Flags = D::RAYTRACING_BUILD_AS_PREFER_FAST_TRACE | D::RAYTRACING_BUILD_AS_ALLOW_UPDATE;
 		dev->CreateTLAS(td, &p.sceneTLAS.tlas);
 		if (!p.sceneTLAS.tlas) return RenderError::AccelerationStructureCreationFailed;
-		p.sceneTLAS.maxInstances = (UInt32)objects.size();
+		p.sceneTLAS.maxInstances = (UInt32)groups.size();
 		p.sceneTLAS.allowUpdate = true;
-		EInfo("RayTracing: scene TLAS created ({} instances)", objects.size());
+		EInfo("RayTracing: scene TLAS created ({} instances)", groups.size());
 	}
 	auto r = p.buildTLAS(p.sceneTLAS, instances);
 	if (r.isErr()) { EError("RayTracing: scene TLAS build failed: {}", ToString(r.error())); return r.error(); }
@@ -736,7 +818,7 @@ Result<void, RenderError> RayTracingSubsystem::trace(const RayTraceConstants& c,
 }
 
 Result<void, RenderError> RayTracingSubsystem::compose(void* gBufferColor, void* gBufferNormal, void* gBufferDepth,
-	void* rtTex, void* outputRTV, void* depthDSV,
+	void* rtTex, void* outputRTV, void* depthDSV, UInt32 drawMode,
 	const Mat4& viewProjInv, const Vec3& cameraPos,
 	UInt32 width, UInt32 height) {
 	auto& p = *m_impl;
@@ -745,9 +827,12 @@ Result<void, RenderError> RayTracingSubsystem::compose(void* gBufferColor, void*
 	if (!gBufferColor || !gBufferNormal || !gBufferDepth || !rtTex || !outputRTV) return RenderError::InvalidArgument;
 
 	{
-		struct { Mat4 viewProjInv; Vec4 cameraPos; } cb;
+		// ComposeCB: float4x4 + float4 + uint + 3 floats padding (16-byte aligned).
+		struct { Mat4 viewProjInv; Vec4 cameraPos; UInt32 drawMode; UInt32 _pad[3]; } cb;
 		cb.viewProjInv = viewProjInv;
 		cb.cameraPos = Vec4(cameraPos, 1.0f);
+		cb.drawMode = drawMode;
+		cb._pad[0] = cb._pad[1] = cb._pad[2] = 0;
 		void* m = nullptr;
 		ctx->MapBuffer(p.composeCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
 		if (m) { memcpy(m, &cb, sizeof(cb)); ctx->UnmapBuffer(p.composeCB, D::MAP_WRITE); }
@@ -871,6 +956,9 @@ Result<void, CoreError> RayTracingSubsystem::onInitialize() {
 		gci.PSODesc.Name = "RT Compose PSO";
 		gci.PSODesc.PipelineType = D::PIPELINE_TYPE_GRAPHICS;
 		gci.PSODesc.ResourceLayout.DefaultVariableType = D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE;
+		D::ImmutableSamplerDesc csam[] = { { D::SHADER_TYPE_PIXEL, "g_Sampler", D::SamplerDesc{} } };
+		gci.PSODesc.ResourceLayout.ImmutableSamplers = csam;
+		gci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
 		gci.pVS = vs; gci.pPS = ps;
 		gci.GraphicsPipeline.NumRenderTargets = 1;
 		gci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA8_UNORM_SRGB;
@@ -889,7 +977,7 @@ Result<void, CoreError> RayTracingSubsystem::onInitialize() {
 
 	// Compose constant buffer.
 	{
-		D::BufferDesc bd; bd.Name = "RT Compose CB"; bd.Size = sizeof(Mat4) + sizeof(Vec4);
+		D::BufferDesc bd; bd.Name = "RT Compose CB"; bd.Size = sizeof(Mat4) + sizeof(Vec4) + 16; // + drawMode/padding
 		bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DYNAMIC; bd.CPUAccessFlags = D::CPU_ACCESS_WRITE;
 		dev->CreateBuffer(bd, nullptr, &p.composeCB);
 		if (p.composeSRB) {
@@ -910,7 +998,7 @@ void RayTracingSubsystem::onShutdown() {
 	p.sceneTLAS = TLASData{};
 	p.blases.reset(); p.tlases.reset();
 	p.blasScratch.Release();
-	p.blasCache.clear(); p.blasCacheMesh.clear();
+	p.blasCache.clear(); p.blasCacheMeshSet.clear();
 	p.sharedVB.Release(); p.sharedIB.Release();
 	p.sceneMeshKeys.clear(); p.sceneMeshFirstVertex.clear(); p.sceneMeshFirstIndex.clear();
 	p.sceneTextureSRVs.clear();

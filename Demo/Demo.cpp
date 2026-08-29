@@ -335,6 +335,8 @@ float4 main(PSIn i) : SV_TARGET {
 	RayTracingSubsystem rayTracing;
 	rayTracing.attachToRenderer(&renderer);
 	bool hybridRT = false; // F9 toggles between rasterization and hybrid ray tracing
+	UInt32 rtDrawMode = 0; // compose debug mode (0=shaded ... 5=Fresnel)
+	bool rtHalfRes = true; // half-resolution ray tracing (faster; may flicker on far small objects)
 	TextureHandle gbufColor, gbufNormal, gbufDepth, rtTex;
 	// (Re)create the window-sized G-buffer + ray traced output textures.
 	auto createGBufferTextures = [&](UInt32 w, UInt32 h) {
@@ -350,7 +352,9 @@ float4 main(PSIn i) : SV_TARGET {
 		if (auto r = renderer.createTexture(td); r.isOk()) gbufNormal = r.value();
 		td.fmt = TextureFormat::D32_Float; td.asRenderTarget = false; td.asDepthStencil = true;
 		if (auto r = renderer.createTexture(td); r.isOk()) gbufDepth = r.value();
+		// Ray traced output is half resolution by default (upsampled in compose).
 		td.fmt = TextureFormat::RGBA16_Float; td.asDepthStencil = false; td.asUAV = true;
+		td.w = rtHalfRes ? w / 2 : w; td.h = rtHalfRes ? h / 2 : h;
 		if (auto r = renderer.createTexture(td); r.isOk()) rtTex = r.value();
 	};
 	{
@@ -716,6 +720,16 @@ HALT
 		debugUI.text("RayTracing: inline={} standalone={}", renderer.supportsInlineRayTracing(), renderer.supportsStandaloneRayTracing());
 		debugUI.text("RT Subsystem: {}", rayTracing.isReady() ? "ready" : "disabled");
 		debugUI.text("Mode: {} (F9)", hybridRT ? "Hybrid RT" : "Raster");
+		if (hybridRT) {
+			static const char* rtModeNames[] = { "Shaded", "GBufferColor", "GBufferNormal", "Diffuse", "Reflections", "Fresnel" };
+			if (debugUI.button(fmt::format("RT View: {}", rtModeNames[rtDrawMode]).c_str())) {
+				rtDrawMode = (rtDrawMode + 1) % 6;
+			}
+			if (debugUI.button(fmt::format("RT Res: {}", rtHalfRes ? "Half" : "Full").c_str())) {
+				rtHalfRes = !rtHalfRes;
+				createGBufferTextures(ww, wh); // recreate the RT texture at the new resolution
+			}
+		}
 		{
 			static size_t visibleCount = 0;
 			// Use the GPU-computed count from args buffer readback (logged above)
@@ -1112,33 +1126,44 @@ HALT
 			}
 			renderer.endGBuffer();
 
-			// RT scene objects: static terrain/wall + physics bodies (all model meshes).
-			Vector<RayTracedObject> rtObjs;
+			// RT scene groups: terrain/wall (meshes merged per model) + physics
+			// bodies (all Furina meshes share one BLAS per body).
+			Vector<RayTracedObjectGroup> rtGroups;
 			{
-				for (auto& terrMesh : terrian) {
-					RayTracedObject o; o.mesh = terrMesh;
-					auto sub = renderer.getSubMesh(terrMesh, 0); o.material = sub.material;
-					rtObjs.push_back(o);
+				if (!terrian.empty()) {
+					RayTracedObjectGroup g;
+					for (auto& terrMesh : terrian) {
+						RayTracedObject o; o.mesh = terrMesh;
+						auto sub = renderer.getSubMesh(terrMesh, 0); o.material = sub.material;
+						g.objects.push_back(o);
+					}
+					rtGroups.push_back(std::move(g));
 				}
-				for (auto& wallMesh : wall) {
-					RayTracedObject o; o.mesh = wallMesh;
-					auto sub = renderer.getSubMesh(wallMesh, 0); o.material = sub.material;
-					o.transform.position = Vec3(20, -19, 20);
-					rtObjs.push_back(o);
+				if (!wall.empty()) {
+					RayTracedObjectGroup g;
+					g.transform.position = Vec3(20, -19, 20);
+					for (auto& wallMesh : wall) {
+						RayTracedObject o; o.mesh = wallMesh;
+						auto sub = renderer.getSubMesh(wallMesh, 0); o.material = sub.material;
+						g.objects.push_back(o);
+					}
+					rtGroups.push_back(std::move(g));
 				}
 				if (!model.empty() && modelLoadCompleted.load(std::memory_order_acquire)) {
-					for (size_t mi = 0; mi < model.size(); ++mi) {
-						auto sub = renderer.getSubMesh(model[mi], 0);
-						for (size_t i = 0; i < physHandles.size(); ++i) {
-							RayTracedObject o; o.mesh = model[mi]; o.material = sub.material;
-							o.transform = physicsBodies.getWorldTransform(physHandles[i]);
-							rtObjs.push_back(o);
+					for (size_t i = 0; i < physHandles.size(); ++i) {
+						RayTracedObjectGroup g;
+						g.transform = physicsBodies.getWorldTransform(physHandles[i]);
+						for (size_t mi = 0; mi < model.size(); ++mi) {
+							RayTracedObject o; o.mesh = model[mi];
+							auto sub = renderer.getSubMesh(model[mi], 0); o.material = sub.material;
+							g.objects.push_back(o);
 						}
+						rtGroups.push_back(std::move(g));
 					}
 				}
 			}
-			if (!rtObjs.empty()) {
-				auto sr = rayTracing.updateScene(rtObjs);
+			if (!rtGroups.empty()) {
+				auto sr = rayTracing.updateScene(rtGroups);
 				if (sr.isErr()) {
 					static bool rtSceneWarned = false;
 					if (!rtSceneWarned) { EError("RT updateScene failed: {}", ToString(sr.error())); rtSceneWarned = true; }
@@ -1158,8 +1183,10 @@ HALT
 			rc.maxRayLength = 100.0f;
 			rc.ambientLight = 0.1f;
 			{
+				UInt32 rtw = rtHalfRes ? ww / 2 : ww;
+				UInt32 rth = rtHalfRes ? wh / 2 : wh;
 				auto tr = rayTracing.trace(rc, renderer.getTextureSRV(gbufNormal), renderer.getTextureSRV(gbufDepth),
-					renderer.getTextureUAV(rtTex), ww, wh);
+					renderer.getTextureUAV(rtTex), rtw, rth);
 				if (tr.isErr()) {
 					static bool traceWarned = false;
 					if (!traceWarned) { EError("RT trace failed: {}", ToString(tr.error())); traceWarned = true; }
@@ -1172,7 +1199,7 @@ HALT
 			{
 				auto cr = rayTracing.compose(renderer.getTextureSRV(gbufColor), renderer.getTextureSRV(gbufNormal),
 					renderer.getTextureSRV(gbufDepth), renderer.getTextureSRV(rtTex),
-					postProcess.getHDRRTV(), renderer.getDepthStencil(),
+					postProcess.getHDRRTV(), renderer.getDepthStencil(), rtDrawMode,
 					vpInv, fly.pos, ww, wh);
 				if (cr.isErr()) {
 					static bool composeWarned = false;
