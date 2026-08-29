@@ -148,6 +148,32 @@ public:
 		UInt32 width, UInt32 height);
 
 	/**
+	 * @brief Temporal + spatial denoiser (SVGF-lite) for the ray traced output.
+	 *
+	 * Reprojects the previous denoised frame into the current frame (camera
+	 * motion only), clamps it to the current 3x3 neighborhood and blends with
+	 * an edge-preserving spatial filter of the current frame. Run once per
+	 * frame right after trace(); compose() should then read getDenoisedSRV().
+	 * The internal ping-pong textures are (re)created to match the RT
+	 * resolution, so resolution switches are handled automatically.
+	 * @param rtSRV           SRV of the raw ray traced output (from trace()).
+	 * @param gBufferNormalSRV SRV of the G-buffer world normal.
+	 * @param gBufferDepthSRV  SRV of the G-buffer depth.
+	 * @param viewProjInv     Inverse view-projection of the current frame.
+	 * @param viewProj        View-projection of the current frame (stored for the
+	 *                        next frame's reprojection).
+	 * @param width,height    RT output dimensions (dispatch size).
+	 */
+	Result<void, RenderError> denoise(void* rtSRV, void* gBufferNormalSRV, void* gBufferDepthSRV,
+		const Mat4& viewProjInv, const Mat4& viewProj, UInt32 width, UInt32 height);
+
+	/// @brief SRV of the latest denoised frame (nullptr until denoise() runs).
+	void* getDenoisedSRV() const;
+
+	/// @brief Set the temporal history weight (0 = no history, 1 = full history).
+	void setDenoiseStrength(F32 historyWeight);
+
+	/**
 	 * @brief Compose G-buffer + ray traced results over the scene.
 	 *
 	 * Draws a fullscreen triangle that blends the shaded albedo with the
@@ -157,6 +183,8 @@ public:
 	 * @param gBufferColor  SRV of the G-buffer albedo.
 	 * @param gBufferNormal SRV of the G-buffer world normal.
 	 * @param gBufferDepth  SRV of the G-buffer depth.
+	 * @param gBufferEmissive SRV of the G-buffer emissive (added untinted after
+	 *                        the Fresnel blend).
 	 * @param rtTex         SRV of the ray traced output (from trace()).
 	 * @param outputRTV     RTV to compose into (e.g. the HDR target).
 	 * @param depthDSV      Optional DSV to keep bound after composing (pass the
@@ -170,7 +198,7 @@ public:
 	 * @param width,height  Target dimensions.
 	 */
 	Result<void, RenderError> compose(void* gBufferColor, void* gBufferNormal, void* gBufferDepth,
-		void* rtTex, void* outputRTV, void* depthDSV, UInt32 drawMode,
+		void* gBufferEmissive, void* rtTex, void* outputRTV, void* depthDSV, UInt32 drawMode,
 		const Mat4& viewProjInv, const Vec3& cameraPos, const Vec3& lightColor,
 		UInt32 width, UInt32 height);
 

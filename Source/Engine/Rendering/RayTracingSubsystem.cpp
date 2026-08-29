@@ -45,6 +45,7 @@ struct alignas(16) RTMaterialAttribs {
 	UInt32 baseColorTexInd;   ///< Index into the texture array.
 	F32 roughness;            ///< Material roughness (drives reflection attenuation).
 	F32 metallic;             ///< Material metallic factor.
+	Vec4 emissive;            ///< Emissive color (rgb) + intensity (w). Added to reflections/direct shading without light tint.
 };
 static_assert(sizeof(RTMaterialAttribs) % 16 == 0, "RTMaterialAttribs must be 16-byte aligned");
 
@@ -75,6 +76,7 @@ struct MaterialAttribs {
     uint   BaseColorTexInd;
     float  Roughness;
     float  Metallic;
+    float4 Emissive;
 };
 struct RTConstants {
     float4x4 ViewProjInv;
@@ -241,6 +243,7 @@ float4 GetSkyColor(float3 Dir)
 struct ReflectionResult {
     float4 BaseColor;
     float  NdotL;
+    float3 Emissive; ///< Self-emission of the hit surface (not light-tinted).
     bool   Found;
 };
 
@@ -263,6 +266,7 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
     ReflectionResult res;
     res.BaseColor = float4(0, 0, 0, 0);
     res.NdotL     = 0.0;
+    res.Emissive  = float3(0, 0, 0);
     res.Found     = false;
 
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
@@ -293,6 +297,9 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
         res.BaseColor = Mtr.BaseColorMask * g_Textures[NonUniformResourceIndex(Mtr.BaseColorTexInd)].SampleLevel(g_Sampler, UV, 0);
         // Roughness-driven reflection attenuation: rougher surfaces reflect less.
         res.BaseColor *= (1.0 - Mtr.Roughness * g_RTConstants.ReflectionBlur);
+        // Self-emission is NOT attenuated by roughness and is not light-tinted:
+        // a glowing surface keeps its color when reflected.
+        res.Emissive = Mtr.Emissive.rgb * Mtr.Emissive.w;
         res.NdotL     = max(0.0, dot(LightDir, Norm));
         res.Found     = true;
 
@@ -322,12 +329,13 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
             float3 col2;
             if (q2.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
             {
-                // Simplified second-bounce shading: material base color only.
+                // Simplified second-bounce shading: material base color + self-emission.
                 uint          InstId2 = q2.CommittedInstanceID();
                 uint          GeoId2  = q2.CommittedGeometryIndex();
                 ObjectAttribs   Obj2   = g_ObjectAttribs[InstId2 + GeoId2];
                 MaterialAttribs Mtr2   = g_MaterialAttribs[Obj2.MaterialId];
-                col2 = Mtr2.BaseColorMask.rgb * (1.0 - Mtr2.Roughness * g_RTConstants.ReflectionBlur);
+                col2 = Mtr2.BaseColorMask.rgb * (1.0 - Mtr2.Roughness * g_RTConstants.ReflectionBlur)
+                     + Mtr2.Emissive.rgb * Mtr2.Emissive.w;
             }
             else
             {
@@ -426,10 +434,11 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
         if (refl.Found)
         {
             // Reflection point lighting: ambient and direct are both tinted by the
-            // light color (consistent with the compose diffuse term).
+            // light color (consistent with the compose diffuse term). Self-emission
+            // of the hit surface is added afterwards, untinted.
             float3 lightColor = g_RTConstants.LightColor.rgb;
             float3 lit = (g_RTConstants.AmbientLight + max(0.0, refl.NdotL) * g_RTConstants.LightIntensity) * lightColor;
-            Color = float4(refl.BaseColor.rgb * lit, 1.0);
+            Color = float4(refl.BaseColor.rgb * lit + refl.Emissive.rgb, 1.0);
         }
         else
             Color = GetSkyColor(reflect(ViewDir, WNormal)) * (1.0 - roughness * g_RTConstants.ReflectionBlur);
@@ -454,11 +463,12 @@ void main(uint vid : SV_VertexID, out PSIn o) {
 )";
 
 static const char* g_ComposePS = R"(
-Texture2D<float4> g_GBufferColor  : register(t0);
-Texture2D<float4> g_GBufferNormal : register(t1);
-Texture2D<float>  g_GBufferDepth  : register(t2);
-Texture2D<float4> g_RayTracedTex  : register(t3);
-SamplerState      g_Sampler       : register(s0);
+Texture2D<float4> g_GBufferColor    : register(t0);
+Texture2D<float4> g_GBufferNormal   : register(t1);
+Texture2D<float>  g_GBufferDepth    : register(t2);
+Texture2D<float4> g_RayTracedTex    : register(t3);
+Texture2D<float4> g_GBufferEmissive : register(t4);
+SamplerState      g_Sampler         : register(s0);
 cbuffer ComposeCB : register(b0) {
     float4x4 g_ViewProjInv;
     float4   g_CameraPos;
@@ -498,6 +508,8 @@ float4 main(PSIn i) : SV_Target
     float3 Normal = normalize(g_GBufferNormal.Load(tc).xyz);
     // The ray traced texture is half resolution; bilinear upsample.
     float4 RT     = g_RayTracedTex.SampleLevel(g_Sampler, UV, 0);
+    // Emissive comes from the (full-resolution) G-buffer emissive target.
+    float3 Emissive = g_GBufferEmissive.Load(tc).rgb;
 
     float3 WPos    = ScreenPosToWorldPos(UV, Depth, g_ViewProjInv);
     float3 ViewDir = normalize(g_CameraPos.xyz - WPos);
@@ -508,7 +520,7 @@ float4 main(PSIn i) : SV_Target
     {
         case RENDER_MODE_G_BUFFER_COLOR:   return Color;
         case RENDER_MODE_G_BUFFER_NORMAL:  return float4(abs(Normal), 1.0);
-        case RENDER_MODE_DIFFUSE_LIGHTING: return float4(Color.rgb * RT.a, 1.0);
+        case RENDER_MODE_DIFFUSE_LIGHTING: return float4(Color.rgb * RT.a + Emissive, 1.0);
         case RENDER_MODE_REFLECTIONS:      return float4(RT.rgb, 1.0);
         case RENDER_MODE_FRESNEL_TERM:     return float4(R, R, R, 1.0);
         case RENDER_MODE_RT_ALPHA:         return float4(RT.a, RT.a, RT.a, 1.0);
@@ -517,10 +529,107 @@ float4 main(PSIn i) : SV_Target
         {
             // Diffuse: albedo * lighting factor * light color.
             float3 Shaded = Color.rgb * RT.a * g_LightColor.rgb;
-            float3 Final  = lerp(Shaded, RT.rgb, R);
+            // Reflection (RT.rgb) blended by Fresnel, then self-emission added
+            // untinted (it is not lit by the sun).
+            float3 Final  = lerp(Shaded, RT.rgb, R) + Emissive;
             return float4(Final, 1.0);
         }
     }
+}
+)";
+
+// ===================================================================
+// Denoise pass (SVGF-lite): temporal accumulation + edge-preserving
+// spatial filter. Runs at the RT output resolution; the raw RT input
+// is blended with the reprojected previous denoised frame, clamped to
+// the current 3x3 neighborhood (anti-ghosting) and spatially filtered
+// with depth/normal weights so edges are preserved.
+// ===================================================================
+static const char* g_DenoiseCS = R"(
+Texture2D<float4> g_RTInput       : register(t0);
+Texture2D<float4> g_PrevDenoised  : register(t1);
+Texture2D<float4> g_GBufferNormal : register(t2);
+Texture2D<float>  g_GBufferDepth  : register(t3);
+RWTexture2D<float4> g_OutDenoised : register(u0);
+SamplerState      g_Sampler       : register(s0);
+cbuffer DenoiseCB : register(b0) {
+    float4x4 g_ViewProjInv;      // current frame (unproject)
+    float4x4 g_PrevViewProj;     // previous frame (reproject)
+    float    g_HistoryWeight;    // 0..1 temporal blend
+    float    g_NormalWeight;     // spatial normal exponent
+    float    g_DepthScale;       // spatial depth sensitivity
+    float    g_DisocclusionReject; // relative luminance rejection threshold
+};
+
+float Luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
+[numthreads(8, 8, 1)]
+void CSMain(uint2 DTid : SV_DispatchThreadID)
+{
+    uint2 Dim;
+    g_RTInput.GetDimensions(Dim.x, Dim.y);
+    if (DTid.x >= Dim.x || DTid.y >= Dim.y) return;
+    int2 p = int2(DTid);
+
+    uint2 FullDim;
+    g_GBufferDepth.GetDimensions(FullDim.x, FullDim.y);
+    float2 scale = float2(FullDim) / float2(Dim); // ~2 when the RT runs at half res
+
+    int2 fpC = min(int2(p * scale + 0.5f), int2(FullDim) - 1);
+    float d0 = g_GBufferDepth.Load(int3(fpC, 0)).x;
+    float3 n0 = normalize(g_GBufferNormal.Load(int3(fpC, 0)).xyz);
+
+    float4 raw = g_RTInput.Load(int3(p, 0));
+    if (d0 >= 1.0) { g_OutDenoised[DTid] = raw; return; } // background pass-through
+
+    // ---- Spatial: 3x3 edge-preserving filter (depth + normal weights) ----
+    float4 sum = raw;
+    float  wsum = 1.0;
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            if (dx == 0 && dy == 0) continue;
+            int2 q = clamp(p + int2(dx, dy), int2(0, 0), int2(Dim) - 1);
+            int2 fq = min(int2(q * scale + 0.5f), int2(FullDim) - 1);
+            float dq = g_GBufferDepth.Load(int3(fq, 0)).x;
+            float3 nq = normalize(g_GBufferNormal.Load(int3(fq, 0)).xyz);
+            float w = exp(-abs(dq - d0) / max(0.01f, d0) * g_DepthScale)
+                    * pow(saturate(dot(nq, n0)), g_NormalWeight);
+            sum  += g_RTInput.Load(int3(q, 0)) * w;
+            wsum += w;
+        }
+    }
+    float4 spatial = sum / wsum;
+
+    // ---- 3x3 neighborhood of the raw input (history clamp range) ----
+    float4 mn = raw, mx = raw;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            int2 q = clamp(p + int2(dx, dy), int2(0, 0), int2(Dim) - 1);
+            float4 v = g_RTInput.Load(int3(q, 0));
+            mn = min(mn, v); mx = max(mx, v);
+        }
+
+    // ---- Temporal reprojection (camera motion only) ----
+    float2 uv = (float2(p) + 0.5f) / float2(Dim);
+    float4 clip = float4(uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), d0, 1.0f);
+    float4 wpos = mul(g_ViewProjInv, clip);
+    wpos.xyz /= max(wpos.w, 1e-5f);
+    float4 prevClip = mul(g_PrevViewProj, float4(wpos.xyz, 1.0f));
+    float2 ndc = prevClip.xy / max(prevClip.w, 1e-5f);
+    float2 prevUV = float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f);
+    bool inBounds = prevClip.w > 0.0f && all(prevUV > 0.0f) && all(prevUV < 1.0f);
+    float4 history = float4(0, 0, 0, 0);
+    if (inBounds) history = g_PrevDenoised.SampleLevel(g_Sampler, prevUV, 0);
+
+    // Clamp history to the current neighborhood (kills ghosting) and reject it
+    // softly when its luminance deviates from the filtered current sample.
+    float4 clamped = clamp(history, mn, mx);
+    float rej = abs(Luminance(clamped.rgb) - Luminance(spatial.rgb)) / max(Luminance(spatial.rgb), 0.01f);
+    float alpha = g_HistoryWeight * saturate(1.0f - rej * g_DisocclusionReject);
+    g_OutDenoised[DTid] = lerp(spatial, clamped, alpha);
 }
 )";
 
@@ -585,6 +694,18 @@ struct RayTracingSubsystem::Impl {
 	D::RefCntAutoPtr<D::IPipelineState> composePSO;
 	D::RefCntAutoPtr<D::IShaderResourceBinding> composeSRB;
 	D::RefCntAutoPtr<D::IBuffer> composeCB;
+
+	// Denoise pipeline (SVGF-lite): temporal accumulation + spatial filter.
+	D::RefCntAutoPtr<D::IPipelineState> denoisePSO;
+	D::RefCntAutoPtr<D::IShaderResourceBinding> denoiseSRB;
+	D::RefCntAutoPtr<D::IBuffer> denoiseCB;
+	D::RefCntAutoPtr<D::ITexture> denoiseTex[2];       ///< Ping-pong buffers.
+	D::RefCntAutoPtr<D::ITextureView> denoiseSRV[2];   ///< SRVs of the ping-pong buffers.
+	D::RefCntAutoPtr<D::ITextureView> denoiseUAV[2];   ///< UAVs of the ping-pong buffers.
+	UInt32 denoiseFlip = 0;                            ///< Index of the last written frame.
+	bool  denoiseHasPrev = false;                      ///< History valid (false on first frame / resize).
+	Mat4  denoisePrevVP = Mat4(1.0f);                  ///< Previous frame view-projection.
+	F32   denoiseHistoryWeight = 0.9f;                 ///< Temporal blend strength (0..1).
 
 	Result<void, RenderError> buildTLAS(TLASData& dd, const Vector<TLASInstance>& instances);
 };
@@ -900,6 +1021,7 @@ Result<void, RenderError> RayTracingSubsystem::updateScene(const Vector<RayTrace
 				ma.baseColorTexInd = 0;
 				ma.roughness = desc->roughnessFactor;
 				ma.metallic = desc->metallicFactor;
+				ma.emissive = Vec4(desc->emissiveFactor, 1.0f);
 				if (desc->baseColorTexture.isValid()) {
 					bool texFound = false;
 					for (size_t t = 0; t < texKeys.size(); ++t) {
@@ -1057,13 +1179,13 @@ Result<void, RenderError> RayTracingSubsystem::trace(const RayTraceConstants& c,
 }
 
 Result<void, RenderError> RayTracingSubsystem::compose(void* gBufferColor, void* gBufferNormal, void* gBufferDepth,
-	void* rtTex, void* outputRTV, void* depthDSV, UInt32 drawMode,
+	void* gBufferEmissive, void* rtTex, void* outputRTV, void* depthDSV, UInt32 drawMode,
 	const Mat4& viewProjInv, const Vec3& cameraPos, const Vec3& lightColor,
 	UInt32 width, UInt32 height) {
 	auto& p = *m_impl;
 	auto* ctx = p.ctx(); if (!ctx) return RenderError::NotInitialized;
 	if (!p.ok || !p.composePSO || !p.composeSRB) return RenderError::OperationFailed;
-	if (!gBufferColor || !gBufferNormal || !gBufferDepth || !rtTex || !outputRTV) return RenderError::InvalidArgument;
+	if (!gBufferColor || !gBufferNormal || !gBufferDepth || !gBufferEmissive || !rtTex || !outputRTV) return RenderError::InvalidArgument;
 
 	{
 		// ComposeCB: float4x4 + float4 + uint + 3 floats padding + lightColor (16-byte aligned).
@@ -1081,6 +1203,7 @@ Result<void, RenderError> RayTracingSubsystem::compose(void* gBufferColor, void*
 	if (auto* v = p.composeSRB->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_GBufferColor")) v->Set(static_cast<D::ITextureView*>(gBufferColor), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	if (auto* v = p.composeSRB->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_GBufferNormal")) v->Set(static_cast<D::ITextureView*>(gBufferNormal), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	if (auto* v = p.composeSRB->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_GBufferDepth")) v->Set(static_cast<D::ITextureView*>(gBufferDepth), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = p.composeSRB->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_GBufferEmissive")) v->Set(static_cast<D::ITextureView*>(gBufferEmissive), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	if (auto* v = p.composeSRB->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_RayTracedTex")) v->Set(static_cast<D::ITextureView*>(rtTex), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 
 	D::ITextureView* rtv = static_cast<D::ITextureView*>(outputRTV);
@@ -1090,6 +1213,77 @@ Result<void, RenderError> RayTracingSubsystem::compose(void* gBufferColor, void*
 	ctx->CommitShaderResources(p.composeSRB, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	ctx->Draw(D::DrawAttribs{ 3, D::DRAW_FLAG_VERIFY_ALL });
 	return {};
+}
+
+Result<void, RenderError> RayTracingSubsystem::denoise(void* rtSRV, void* gBufferNormalSRV, void* gBufferDepthSRV,
+	const Mat4& viewProjInv, const Mat4& viewProj, UInt32 width, UInt32 height) {
+	auto& p = *m_impl;
+	auto* ctx = p.ctx(); if (!ctx) return RenderError::NotInitialized;
+	auto* dev = p.device(); if (!dev) return RenderError::NotInitialized;
+	if (!p.ok || !p.denoisePSO || !p.denoiseSRB) return RenderError::OperationFailed;
+	if (!rtSRV || !gBufferNormalSRV || !gBufferDepthSRV) return RenderError::InvalidArgument;
+
+	// (Re)create the ping-pong buffers when the RT resolution changed.
+	auto* rtView = static_cast<D::ITextureView*>(rtSRV);
+	auto* rtTex = rtView->GetTexture();
+	const auto& td = rtTex->GetDesc();
+	const UInt32 w = td.Width, h = td.Height;
+	if (!p.denoiseTex[0] || p.denoiseTex[0]->GetDesc().Width != w || p.denoiseTex[0]->GetDesc().Height != h) {
+		for (int i = 0; i < 2; ++i) {
+			D::TextureDesc tdd; tdd.Name = "RT Denoise"; tdd.Type = D::RESOURCE_DIM_TEX_2D;
+			tdd.Width = w; tdd.Height = h; tdd.Format = D::TEX_FORMAT_RGBA16_FLOAT;
+			tdd.BindFlags = D::BIND_SHADER_RESOURCE | D::BIND_UNORDERED_ACCESS; tdd.Usage = D::USAGE_DEFAULT;
+			p.denoiseTex[i].Release(); p.denoiseSRV[i].Release(); p.denoiseUAV[i].Release();
+			dev->CreateTexture(tdd, nullptr, &p.denoiseTex[i]);
+			if (p.denoiseTex[i]) {
+				p.denoiseSRV[i] = p.denoiseTex[i]->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
+				p.denoiseUAV[i] = p.denoiseTex[i]->GetDefaultView(D::TEXTURE_VIEW_UNORDERED_ACCESS);
+			}
+		}
+		p.denoiseHasPrev = false; // history from another resolution is invalid
+	}
+
+	// CB: current inverse VP (unproject) + previous frame VP (reproject).
+	struct { Mat4 viewProjInv; Mat4 prevViewProj; float historyWeight; float normalWeight; float depthScale; float disocclusionReject; } cb;
+	cb.viewProjInv = viewProjInv;
+	cb.prevViewProj = p.denoiseHasPrev ? p.denoisePrevVP : viewProj;
+	cb.historyWeight = p.denoiseHasPrev ? p.denoiseHistoryWeight : 0.0f;
+	cb.normalWeight = 64.0f;
+	cb.depthScale = 16.0f;
+	cb.disocclusionReject = 2.0f;
+	void* m = nullptr;
+	ctx->MapBuffer(p.denoiseCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
+	if (m) { memcpy(m, &cb, sizeof(cb)); ctx->UnmapBuffer(p.denoiseCB, D::MAP_WRITE); }
+
+	const UInt32 prevIdx = p.denoiseFlip;      // last written denoised frame
+	const UInt32 outIdx  = p.denoiseFlip ^ 1;  // write the other buffer
+
+	if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_RTInput")) v->Set(rtView, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_PrevDenoised")) v->Set(p.denoiseSRV[prevIdx], D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_GBufferNormal")) v->Set(static_cast<D::ITextureView*>(gBufferNormalSRV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_GBufferDepth")) v->Set(static_cast<D::ITextureView*>(gBufferDepthSRV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutDenoised")) v->Set(p.denoiseUAV[outIdx], D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+
+	D::DispatchComputeAttribs da;
+	da.ThreadGroupCountX = (width + 7) / 8;
+	da.ThreadGroupCountY = (height + 7) / 8;
+	ctx->SetPipelineState(p.denoisePSO);
+	ctx->CommitShaderResources(p.denoiseSRB, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ctx->DispatchCompute(da);
+
+	p.denoiseFlip = outIdx;
+	p.denoisePrevVP = viewProj;
+	p.denoiseHasPrev = true;
+	return {};
+}
+
+void* RayTracingSubsystem::getDenoisedSRV() const {
+	auto& p = *m_impl;
+	return p.ok && p.denoiseSRV[p.denoiseFlip] ? p.denoiseSRV[p.denoiseFlip].RawPtr() : nullptr;
+}
+
+void RayTracingSubsystem::setDenoiseStrength(F32 historyWeight) {
+	m_impl->denoiseHistoryWeight = glm::clamp(historyWeight, 0.0f, 1.0f);
 }
 
 // ===================================================================
@@ -1228,6 +1422,9 @@ Result<void, CoreError> RayTracingSubsystem::onInitialize() {
 		// The compose pass is bound with the renderer's MSAA depth (to keep the
 		// DSV state consistent for later 2D/UI passes), so the PSO must declare it.
 		gci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
+		// The HDR target and depth are multisampled; declare the matching sample
+		// count (all samples get the identical fullscreen-triangle output).
+		gci.GraphicsPipeline.SmplDesc.Count = p.renderer ? (D::Uint8)p.renderer->msaaSamples() : 1;
 		gci.GraphicsPipeline.PrimitiveTopology = D::PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 		gci.GraphicsPipeline.RasterizerDesc.CullMode = D::CULL_MODE_NONE;
 		gci.GraphicsPipeline.DepthStencilDesc.DepthEnable = false;
@@ -1248,6 +1445,49 @@ Result<void, CoreError> RayTracingSubsystem::onInitialize() {
 		}
 	}
 
+	// Denoise compute shader + PSO (SVGF-lite: temporal + spatial). Non-fatal:
+	// if the shader fails to compile, denoise() reports OperationFailed and the
+	// caller falls back to the raw ray traced output.
+	{
+		D::ShaderCreateInfo ci;
+		ci.Desc.ShaderType = D::SHADER_TYPE_COMPUTE;
+		ci.Desc.Name = "RT Denoise CS";
+		ci.Desc.UseCombinedTextureSamplers = false;
+		ci.EntryPoint = "CSMain";
+		ci.SourceLanguage = D::SHADER_SOURCE_LANGUAGE_HLSL;
+		ci.ShaderCompiler = D::SHADER_COMPILER_DXC;
+		ci.HLSLVersion = { 6, 5 };
+		ci.Source = g_DenoiseCS;
+		ci.SourceLength = (D::Uint32)strlen(g_DenoiseCS);
+		D::RefCntAutoPtr<D::IShader> cs;
+		dev->CreateShader(ci, &cs);
+		if (!cs || cs->GetStatus() != D::SHADER_STATUS_READY) {
+			EError("RayTracing: failed to compile denoise compute shader - temporal denoising disabled");
+		}
+		else {
+			D::ComputePipelineStateCreateInfo dci;
+			dci.PSODesc.Name = "RT Denoise PSO";
+			dci.PSODesc.PipelineType = D::PIPELINE_TYPE_COMPUTE;
+			dci.PSODesc.ResourceLayout.DefaultVariableType = D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE;
+			D::SamplerDesc sdesc; sdesc.AddressU = D::TEXTURE_ADDRESS_CLAMP; sdesc.AddressV = D::TEXTURE_ADDRESS_CLAMP; sdesc.AddressW = D::TEXTURE_ADDRESS_CLAMP;
+			D::ImmutableSamplerDesc im2[] = { { D::SHADER_TYPE_COMPUTE, "g_Sampler", sdesc } };
+			dci.PSODesc.ResourceLayout.ImmutableSamplers = im2;
+			dci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+			dci.pCS = cs;
+			dev->CreateComputePipelineState(dci, &p.denoisePSO);
+			if (!p.denoisePSO) { EError("RayTracing: failed to create denoise PSO - temporal denoising disabled"); }
+			else {
+				p.denoisePSO->CreateShaderResourceBinding(&p.denoiseSRB, true);
+				D::BufferDesc bd; bd.Name = "RT Denoise CB"; bd.Size = sizeof(Mat4) * 2 + sizeof(float) * 4;
+				bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DYNAMIC; bd.CPUAccessFlags = D::CPU_ACCESS_WRITE;
+				dev->CreateBuffer(bd, nullptr, &p.denoiseCB);
+				if (p.denoiseSRB) {
+					if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "DenoiseCB")) v->Set(p.denoiseCB);
+				}
+			}
+		}
+	}
+
 	p.ok = true;
 	EInfo("RayTracing subsystem initialized (inline ray tracing ready).");
 	return {};
@@ -1258,6 +1498,9 @@ void RayTracingSubsystem::onShutdown() {
 	p.rtPSO.Release(); p.rtSRB.Release(); p.constantsBuf.Release();
 	p.traceQuery.Release(); p.traceQueryEnded = false;
 	p.composePSO.Release(); p.composeSRB.Release(); p.composeCB.Release();
+	p.denoisePSO.Release(); p.denoiseSRB.Release(); p.denoiseCB.Release();
+	for (int i = 0; i < 2; ++i) { p.denoiseTex[i].Release(); p.denoiseSRV[i].Release(); p.denoiseUAV[i].Release(); }
+	p.denoiseHasPrev = false; p.denoiseFlip = 0;
 	p.objectAttribsBuf.Release(); p.materialAttribsBuf.Release();
 	p.sceneTLAS = TLASData{};
 	p.blases.reset(); p.tlases.reset();

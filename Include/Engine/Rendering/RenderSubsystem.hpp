@@ -145,6 +145,18 @@ public:
 	/// @brief Get the depth-stencil view of a texture (nullptr if not created as a depth target).
 	TextureDSV getTextureDSV(TextureHandle texture) const;
 
+	/**
+	 * @brief Resolve an MSAA G-buffer into single-sample targets with a compute pass.
+	 *
+	 * Color/normal/emissive are averaged over all samples, depth takes the nearest
+	 * (min) sample. Runs only when the renderer MSAA sample count is > 1.
+	 * @param colorSRV,normalSRV,emissiveSRV,depthSRV  SRVs of the MSAA G-buffer targets.
+	 * @param colorUAV,normalUAV,emissiveUAV,depthUAV  UAVs of the 1x resolve targets.
+	 * @param width,height G-buffer dimensions (dispatch size).
+	 */
+	Result<void, RenderError> resolveGBufferMSAA(void* colorSRV, void* normalSRV, void* emissiveSRV, void* depthSRV,
+		void* colorUAV, void* normalUAV, void* emissiveUAV, void* depthUAV, UInt32 width, UInt32 height);
+
 	/// @brief Get the renderer's internal (MSAA) depth-stencil view.
 	TextureDSV getDepthStencil() const;
 
@@ -155,14 +167,16 @@ public:
 	/**
 	 * @brief Begin a G-buffer pass.
 	 *
-	 * Subsequent drawMesh()/drawMeshInstanced() calls write albedo (color) and world
-	 * normal into the given render targets instead of the final shaded color, and the
-	 * depth is written to depthDSV. Call endGBuffer() to restore normal shading.
-	 * @param colorRT  Render target view for albedo (RGBA8_UNORM/SRGB).
-	 * @param normalRT Render target view for world normal (RGBA16_FLOAT).
-	 * @param depthDSV Depth-stencil view (D32_FLOAT, non-MSAA recommended).
+	 * Subsequent drawMesh()/drawMeshInstanced() calls write albedo (color), world
+	 * normal and emissive into the given render targets instead of the final
+	 * shaded color, and the depth is written to depthDSV. Call endGBuffer() to
+	 * restore normal shading.
+	 * @param colorRT    Render target view for albedo (RGBA8_UNORM/SRGB).
+	 * @param normalRT   Render target view for world normal (RGBA16_FLOAT).
+	 * @param emissiveRT Render target view for emissive (RGBA16_FLOAT).
+	 * @param depthDSV   Depth-stencil view (D32_FLOAT, non-MSAA recommended).
 	 */
-	void beginGBuffer(TextureRTV colorRT, TextureRTV normalRT, TextureDSV depthDSV);
+	void beginGBuffer(TextureRTV colorRT, TextureRTV normalRT, TextureRTV emissiveRT, TextureDSV depthDSV);
 
 	/// @brief End the G-buffer pass and restore the default shading mode.
 	void endGBuffer();
@@ -209,6 +223,10 @@ public:
 
 	/// @brief Create a material from a descriptor and pipeline state.
 	Result<MaterialHandle, RenderError> createMaterial(const MaterialDesc& desc, PSOHandle pso);
+
+	/// @brief Get the default PBR pipeline state handle (used by model materials).
+	///        Handy for creating Demo-side materials (e.g. emissive showcase objects).
+	PSOHandle defaultPSO() const;
 
 	// -------------------------------------------------------------------
 	// Camera management

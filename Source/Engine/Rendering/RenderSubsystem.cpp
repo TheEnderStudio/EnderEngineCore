@@ -257,6 +257,7 @@ cbuffer Object : register(b2)
     float4x4 g_Normal;
     float4   g_BaseColor;
     float4   g_MetallicRough;
+    float4   g_Emissive;
 };
 
 struct PSIn
@@ -337,7 +338,8 @@ float4 main(PSIn i) : SV_TARGET
     float m = g_MetallicRough.x;
     float r = g_MetallicRough.y;
     float3 lit = DoLight(i.WP, N, V, bc, m, r);
-    return float4(lit, a);
+    // Emissive is self-emission: added after lighting (not tinted by the light).
+    return float4(lit + g_Emissive.rgb * g_Emissive.w, a);
 }
 )";
 
@@ -367,6 +369,7 @@ cbuffer Object : register(b2)
     float4x4 g_Normal;
     float4   g_BaseColor;
     float4   g_MetallicRough;
+    float4   g_Emissive;
 };
 
 struct PSIn
@@ -381,6 +384,7 @@ struct PSOut
 {
     float4 Color : SV_Target0; ///< Albedo (RGBA8_SRGB).
     float4 Norm  : SV_Target1; ///< World normal in rgb, roughness in alpha (RGBA16_FLOAT).
+    float4 Emis  : SV_Target2; ///< Emissive color * intensity (RGBA16_FLOAT, rgb used).
 };
 
 PSOut main(PSIn i)
@@ -388,7 +392,63 @@ PSOut main(PSIn i)
     PSOut o;
     o.Color = t_BC.Sample(t_BC_sampler, i.UV) * g_BaseColor;
     o.Norm  = float4(normalize(i.N), g_MetallicRough.y);
+    o.Emis  = float4(g_Emissive.rgb * g_Emissive.w, 1.0);
     return o;
+}
+)";
+
+// ===================================================================
+// G-buffer MSAA resolve (compute). Replaces the hardware
+// ResolveSubresource, which only supports a subset of formats (classic
+// D3D12 ResolveSubresource is color-only; depth/sRGB paths are
+// backend-dependent and fail command-list close with "Failed to close
+// the command list"). Color is decoded sRGB->linear and averaged over
+// all samples (matching the hardware AVERAGE resolve), normal/emissive
+// are averaged in linear, depth takes the nearest sample (min).
+// Outputs: color/normal/emissive = RGBA16F, depth = R32F (depth cannot
+// be a UAV in D3D12, and sRGB formats cannot be UAVs either).
+// ===================================================================
+static const char* g_ResolveCS = R"(
+Texture2DMS<float4, 16> g_MSAAColor    : register(t0);
+Texture2DMS<float4, 16> g_MSAANormal   : register(t1);
+Texture2DMS<float4, 16> g_MSAAEmissive : register(t2);
+Texture2DMS<float,  16> g_MSAADepth    : register(t3);
+RWTexture2D<float4> g_OutColor    : register(u0);
+RWTexture2D<float4> g_OutNormal   : register(u1);
+RWTexture2D<float4> g_OutEmissive : register(u2);
+RWTexture2D<float>  g_OutDepth    : register(u3);
+
+float3 SRGBToLinear(float3 c)
+{
+    return select(c <= 0.04045, c / 12.92, pow((c + 0.055) / 1.055, 2.4));
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint2 DTid : SV_DispatchThreadID)
+{
+    uint2 Dim; uint Samples;
+    g_MSAAColor.GetDimensions(Dim.x, Dim.y, Samples);
+    if (DTid.x >= Dim.x || DTid.y >= Dim.y) return;
+    int3 tc = int3(DTid, 0);
+    float4 cSum = float4(0, 0, 0, 0);
+    float4 nSum = float4(0, 0, 0, 0);
+    float4 eSum = float4(0, 0, 0, 0);
+    float  dMin = 1.0;
+    [loop]
+    for (uint s = 0; s < min(Samples, 16u); ++s)
+    {
+        float4 c = g_MSAAColor.Load(tc, s);
+        cSum.rgb += SRGBToLinear(c.rgb); // MSAA storage is sRGB-encoded; average in linear
+        cSum.a   += c.a;
+        nSum += g_MSAANormal.Load(tc, s);
+        eSum += g_MSAAEmissive.Load(tc, s);
+        dMin  = min(dMin, g_MSAADepth.Load(tc, s));
+    }
+    float inv = 1.0 / (float)Samples;
+    g_OutColor[DTid]    = cSum * inv;
+    g_OutNormal[DTid]   = nSum * inv;
+    g_OutEmissive[DTid] = eSum * inv;
+    g_OutDepth[DTid]    = dMin;
 }
 )";
 
@@ -527,6 +587,10 @@ struct RenderSubsystem::RenderBackend {
 	UInt64 fn = 0; UInt32 dc = 0; bool ok = false; bool wireframe = false;
 	bool gBufferActive = false; ///< When true, draw()/drawInstanced() write the G-buffer instead of shaded color.
 	UInt8 msaaSamples = 1;
+	// G-buffer MSAA resolve (compute pass, created lazily).
+	D::RefCntAutoPtr<D::IPipelineState> resolvePSO;
+	D::RefCntAutoPtr<D::IShaderResourceBinding> resolveSRB;
+	bool resolvePSOAttempted = false; ///< Guard: never retry a failed lazy creation per frame.
 	// Ray tracing device feature request + reported capabilities.
 	bool requestRayTracing = true;
 	bool rtFeatureEnabled = false; ///< Whether the device actually enabled the ray tracing feature.
@@ -632,6 +696,31 @@ struct RenderSubsystem::RenderBackend {
 			rtCaps = static_cast<RayTracingCaps>(static_cast<UInt8>(rt.CapFlags));
 			rtMaxRecursionDepth = rt.MaxRecursionDepth;
 			rtMaxInstancesPerTLAS = rt.MaxInstancesPerTLAS;
+		}
+
+		// Clamp the requested MSAA sample count to what the device supports for
+		// the formats used by the scene and the G-buffer. The depth format
+		// (D32F) is usually the tightest constraint - e.g. RDNA2 caps depth at
+		// 8x while RGBA8 supports 16x, so requesting 16x would fail texture and
+		// pipeline creation.
+		if (msaaSamples > 1) {
+			const auto maxSamplesFor = [&](D::TEXTURE_FORMAT f) -> UInt8 {
+				const auto& fi = device->GetTextureFormatInfoExt(f);
+				if (fi.SampleCounts & D::SAMPLE_COUNT_32) return 32;
+				if (fi.SampleCounts & D::SAMPLE_COUNT_16) return 16;
+				if (fi.SampleCounts & D::SAMPLE_COUNT_8)  return 8;
+				if (fi.SampleCounts & D::SAMPLE_COUNT_4)  return 4;
+				if (fi.SampleCounts & D::SAMPLE_COUNT_2)  return 2;
+				return 1;
+			};
+			UInt8 cap = maxSamplesFor(scd.DepthBufferFormat);
+			cap = std::min(cap, maxSamplesFor(D::TEX_FORMAT_RGBA8_UNORM_SRGB));
+			cap = std::min(cap, maxSamplesFor(D::TEX_FORMAT_RGBA16_FLOAT));
+			if (msaaSamples > cap) {
+				EWarn("MSAA {}x requested but the device supports at most {}x for the used formats - clamped to {}x.",
+					(int)msaaSamples, (int)cap, (int)cap);
+				msaaSamples = cap;
+			}
 		}
 
 		D::TextureDesc td; td.Name = "Depth"; td.Type = D::RESOURCE_DIM_TEX_2D; td.Width = scd.Width; td.Height = scd.Height; td.Format = scd.DepthBufferFormat; td.BindFlags = D::BIND_DEPTH_STENCIL; td.Usage = D::USAGE_DEFAULT; td.SampleCount = msaaSamples;
@@ -1009,14 +1098,16 @@ struct RenderSubsystem::RenderBackend {
 		if (!vs || !ps) return RenderError::InvalidHandle;
 		D::GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = d.name.c_str(); ci.PSODesc.PipelineType = D::PIPELINE_TYPE_GRAPHICS;
 			ci.pVS = vs->shader; ci.pPS = ps->shader;
-			ci.GraphicsPipeline.NumRenderTargets = gbuffer ? 2 : 1;
+			ci.GraphicsPipeline.NumRenderTargets = gbuffer ? 3 : 1;
 			// Scene passes render into the (RGBA16_FLOAT) HDR target; the G-buffer
-			// pass keeps its 8-bit albedo target.
+			// pass keeps its 8-bit albedo target + RGBA16F normal/emissive targets.
 			ci.GraphicsPipeline.RTVFormats[0] = gbuffer ? D::TEX_FORMAT_RGBA8_UNORM_SRGB : D::TEX_FORMAT_RGBA16_FLOAT;
 			if (gbuffer) ci.GraphicsPipeline.RTVFormats[1] = D::TEX_FORMAT_RGBA16_FLOAT;
+			if (gbuffer) ci.GraphicsPipeline.RTVFormats[2] = D::TEX_FORMAT_RGBA16_FLOAT;
 			ci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_D32_FLOAT;
-			// G-buffer pass uses non-MSAA targets (read back by the ray tracing compute shader).
-			ci.GraphicsPipeline.SmplDesc.Count = gbuffer ? 1 : msaaSamples;
+			// The G-buffer pass runs at the configured MSAA sample count too; the
+			// Demo resolves it to 1x before the ray tracing compute pass reads it.
+			ci.GraphicsPipeline.SmplDesc.Count = msaaSamples;
 		ci.GraphicsPipeline.PrimitiveTopology = toDTopo(d.topology);
 		ci.GraphicsPipeline.RasterizerDesc.FillMode = toDFill(d.rasterizer.fillMode);
 		ci.GraphicsPipeline.RasterizerDesc.CullMode = toDCull(d.rasterizer.cullMode);
@@ -1091,6 +1182,7 @@ struct RenderSubsystem::RenderBackend {
 	Result<TextureHandle, RenderError> mkTex(const TextureDesc& d) {
 		const bool renderTargetLike = d.asRenderTarget || d.asUAV || d.asDepthStencil;
 		D::TextureDesc td; td.Name = "Tex"; td.Type = D::RESOURCE_DIM_TEX_2D; td.Width = d.w; td.Height = d.h; td.Format = toDFmt(d.fmt); td.MipLevels = d.mipLevels;
+		td.SampleCount = d.sampleCount;
 		td.BindFlags = D::BIND_SHADER_RESOURCE;
 		if (d.asRenderTarget) td.BindFlags |= D::BIND_RENDER_TARGET;
 		if (d.asUAV) td.BindFlags |= D::BIND_UNORDERED_ACCESS;
@@ -1184,7 +1276,7 @@ struct RenderSubsystem::RenderBackend {
 		for (UInt32 si = 0; si < (UInt32)md->sub.size(); si++) {
 			auto& s = md->sub[si];
 			auto* mt = materials.get(s.material.index, s.material.generation);
-			if (mt && mt->objCB) { ObjectConstants oc; oc.world = wm; oc.normalMat = nm; oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
+			if (mt && mt->objCB) { ObjectConstants oc; oc.world = wm; oc.normalMat = nm; oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
 			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
 			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
 			if (mt && srb) {
@@ -1267,7 +1359,7 @@ struct RenderSubsystem::RenderBackend {
 
 		for (auto& s : md->sub) {
 			auto* mt = materials.get(s.material.index, s.material.generation);
-			if (mt && mt->objCB) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
+			if (mt && mt->objCB) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
 			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
 			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
 			if (mt && srb) {
@@ -1317,7 +1409,7 @@ struct RenderSubsystem::RenderBackend {
 
 			if (mt) {
 				void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
-				if (m) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); }
+				if (m) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); }
 				if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_VERTEX, "Object"))
 					v->Set(mt->objCB, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 			}
@@ -1531,6 +1623,11 @@ struct RenderSubsystem::RenderBackend {
 					}
 				}
 			}
+			// glTF emissiveFactor: self-emission color (also feeds RT reflections).
+			{
+				auto& ef = m.emissiveFactor;
+				md.emissiveFactor = Vec3(ef[0], ef[1], ef[2]);
+			}
 			ETrace("Material[{}] '{}': baseColor=({:.2f},{:.2f},{:.2f},{:.2f}) metal={:.2f} rough={:.2f} tex={}",
 				i, md.name, md.baseColorFactor.x, md.baseColorFactor.y, md.baseColorFactor.z, md.baseColorFactor.w,
 				md.metallicFactor, md.roughnessFactor, hasTex ? "yes" : "no");
@@ -1623,6 +1720,8 @@ Result<MeshHandle, RenderError> RenderSubsystem::createMesh(const MeshDesc& d) {
 Result<TextureHandle, RenderError> RenderSubsystem::createTexture(const TextureDesc& d) { if (!m_backend->ok) return RenderError::NotInitialized; return m_backend->mkTex(d); }
 Result<SamplerHandle, RenderError> RenderSubsystem::createSampler(const SamplerDesc& d) { if (!m_backend->ok) return RenderError::NotInitialized; return m_backend->mkSampler(d); }
 Result<MaterialHandle, RenderError> RenderSubsystem::createMaterial(const MaterialDesc& d, PSOHandle p) { if (!m_backend->ok) return RenderError::NotInitialized; return m_backend->mkMat(d, p); }
+
+PSOHandle RenderSubsystem::defaultPSO() const { return m_backend->ok ? m_backend->defPSO : PSOHandle{}; }
 
 Result<CameraHandle, RenderError> RenderSubsystem::createCamera(const CameraDesc& d) {
 	if (!m_backend->ok) return RenderError::NotInitialized;
@@ -1933,20 +2032,82 @@ TextureDSV RenderSubsystem::getTextureDSV(TextureHandle texture) const {
 	return td ? td->dsv.RawPtr() : nullptr;
 }
 
+Result<void, RenderError> RenderSubsystem::resolveGBufferMSAA(void* colorSRV, void* normalSRV, void* emissiveSRV, void* depthSRV,
+	void* colorUAV, void* normalUAV, void* emissiveUAV, void* depthUAV, UInt32 width, UInt32 height) {
+	auto& b = *m_backend;
+	if (!b.ok) return RenderError::NotInitialized;
+	if (!colorSRV || !normalSRV || !emissiveSRV || !depthSRV || !colorUAV || !normalUAV || !emissiveUAV || !depthUAV) return RenderError::InvalidArgument;
+	if (b.msaaSamples <= 1) return {}; // single-sample G-buffer needs no resolve
+
+	// Lazy-create the resolve compute pipeline (DXC). Attempt once even on
+	// failure so a broken shader does not get recompiled every frame.
+	if (!b.resolvePSO) {
+		if (b.resolvePSOAttempted) return RenderError::ShaderCompilationFailed;
+		b.resolvePSOAttempted = true;
+		D::ShaderCreateInfo ci;
+		ci.Desc.ShaderType = D::SHADER_TYPE_COMPUTE;
+		ci.Desc.Name = "GBuffer Resolve CS";
+		ci.Desc.UseCombinedTextureSamplers = false;
+		ci.EntryPoint = "CSMain";
+		ci.SourceLanguage = D::SHADER_SOURCE_LANGUAGE_HLSL;
+		ci.ShaderCompiler = D::SHADER_COMPILER_DXC;
+		ci.HLSLVersion = { 6, 5 };
+		ci.Source = g_ResolveCS;
+		ci.SourceLength = (D::Uint32)strlen(g_ResolveCS);
+		D::RefCntAutoPtr<D::IShader> cs;
+		b.device->CreateShader(ci, &cs);
+		if (!cs || cs->GetStatus() != D::SHADER_STATUS_READY) {
+			EError("RenderSubsystem: failed to compile G-buffer resolve compute shader");
+			return RenderError::ShaderCompilationFailed;
+		}
+		D::ComputePipelineStateCreateInfo cci;
+		cci.PSODesc.Name = "GBuffer Resolve PSO";
+		cci.PSODesc.PipelineType = D::PIPELINE_TYPE_COMPUTE;
+		cci.PSODesc.ResourceLayout.DefaultVariableType = D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE;
+		cci.pCS = cs;
+		b.device->CreateComputePipelineState(cci, &b.resolvePSO);
+		if (!b.resolvePSO) {
+			EError("RenderSubsystem: failed to create G-buffer resolve PSO");
+			return RenderError::PipelineStateCreationFailed;
+		}
+		b.resolvePSO->CreateShaderResourceBinding(&b.resolveSRB, true);
+		EInfo("RenderSubsystem: G-buffer MSAA resolve ready ({}x -> 1x).", (int)b.msaaSamples);
+	}
+
+	if (auto* v = b.resolveSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_MSAAColor")) v->Set(static_cast<D::ITextureView*>(colorSRV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = b.resolveSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_MSAANormal")) v->Set(static_cast<D::ITextureView*>(normalSRV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = b.resolveSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_MSAAEmissive")) v->Set(static_cast<D::ITextureView*>(emissiveSRV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = b.resolveSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_MSAADepth")) v->Set(static_cast<D::ITextureView*>(depthSRV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = b.resolveSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutColor")) v->Set(static_cast<D::ITextureView*>(colorUAV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = b.resolveSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutNormal")) v->Set(static_cast<D::ITextureView*>(normalUAV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = b.resolveSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutEmissive")) v->Set(static_cast<D::ITextureView*>(emissiveUAV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = b.resolveSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutDepth")) v->Set(static_cast<D::ITextureView*>(depthUAV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+
+	D::DispatchComputeAttribs da;
+	da.ThreadGroupCountX = (width + 7) / 8;
+	da.ThreadGroupCountY = (height + 7) / 8;
+	b.ctx->SetPipelineState(b.resolvePSO);
+	b.ctx->CommitShaderResources(b.resolveSRB, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	b.ctx->DispatchCompute(da);
+	return {};
+}
+
 TextureDSV RenderSubsystem::getDepthStencil() const { return m_backend->dsv.RawPtr(); }
 
-void RenderSubsystem::beginGBuffer(TextureRTV colorRT, TextureRTV normalRT, TextureDSV depthDSV) {
-	if (!m_backend->ok || !colorRT || !normalRT || !depthDSV) return;
+void RenderSubsystem::beginGBuffer(TextureRTV colorRT, TextureRTV normalRT, TextureRTV emissiveRT, TextureDSV depthDSV) {
+	if (!m_backend->ok || !colorRT || !normalRT || !emissiveRT || !depthDSV) return;
 	auto& b = *m_backend;
 	b.gBufferActive = true;
 	auto* cRTV = static_cast<D::ITextureView*>(colorRT);
 	auto* nRTV = static_cast<D::ITextureView*>(normalRT);
+	auto* eRTV = static_cast<D::ITextureView*>(emissiveRT);
 	auto* dDSV = static_cast<D::ITextureView*>(depthDSV);
-	D::ITextureView* rtvs[2] = { cRTV, nRTV };
-	b.ctx->SetRenderTargets(2, rtvs, dDSV, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	D::ITextureView* rtvs[3] = { cRTV, nRTV, eRTV };
+	b.ctx->SetRenderTargets(3, rtvs, dDSV, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	const float cc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 	b.ctx->ClearRenderTarget(cRTV, cc, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	b.ctx->ClearRenderTarget(nRTV, cc, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	b.ctx->ClearRenderTarget(eRTV, cc, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	b.ctx->ClearDepthStencil(dDSV, D::CLEAR_DEPTH_FLAG, 1.0f, 0, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	b.dc = 0;
 }

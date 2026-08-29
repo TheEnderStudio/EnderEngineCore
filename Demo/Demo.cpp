@@ -1,4 +1,4 @@
-#include <Engine/Core/Core.hpp>
+﻿#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -194,7 +194,7 @@ int WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int)
 	RenderSubsystem renderer;
 	renderer.setWindow(window.glfwWindow());
 	renderer.setBackend(RenderBackendType::D3D12);
-	renderer.setMSAASampleCount(4);
+	renderer.setMSAASampleCount(16);
 	{
 		auto rerr = renderer.initialize();
 		if (rerr.isErr()) {
@@ -235,7 +235,7 @@ int WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int)
 	postProcess.setSwapChain(renderer.getSwapChain());
 	postProcess.initialize();
 	PostProcessConfig ppCfg; ppCfg.toneMap.mode = ToneMapMode::ACES; ppCfg.bloom.intensity = 0.3f;
-	ppCfg.sampleCount = 4; // MSAA 4x
+	ppCfg.sampleCount = renderer.msaaSamples();
 	postProcess.setConfig(ppCfg);
 
 	// --- Render 2D ---
@@ -343,9 +343,13 @@ float4 main(PSIn i) : SV_TARGET {
 	F32 rtReflectionBlur = 0.7f; // roughness-driven reflection attenuation
 	UInt32 rtMaxBounces = 1;     // max reflection bounces (0 = single, 1 = two-bounce)
 	F32 rtBounceRoughness = 1.0f; // second-bounce roughness threshold (1.0 = force all surfaces)
+	bool rtDenoise = true;       // temporal + spatial denoiser (SVGF-lite)
+	F32 rtDenoiseStrength = 0.9f; // temporal history weight (0 = off, 1 = full history)
 	float rtResScale = 0.5f; // RT resolution scale (0.5 / 1.0)
 	bool rtResAuto = true;   // auto-pick the scale from the distance to the nearest object
-	TextureHandle gbufColor, gbufNormal, gbufDepth, rtTex;
+	TextureHandle gbufColor, gbufNormal, gbufEmissive, gbufDepth, rtTex;
+	// Single-sample resolve targets for the MSAA G-buffer (read by RT/compose).
+	TextureHandle resColor, resNormal, resEmissive, resDepth;
 	// (Re)create the ray traced output texture at the current rtResScale.
 	auto createRTTex = [&](UInt32 w, UInt32 h) {
 		renderer.destroyTexture(rtTex);
@@ -357,18 +361,40 @@ float4 main(PSIn i) : SV_TARGET {
 		if (auto r = renderer.createTexture(td); r.isOk()) rtTex = r.value();
 	};
 	// (Re)create the window-sized G-buffer (always full resolution) + RT output.
+	// The G-buffer targets are MSAA (same sample count as the renderer, so the
+	// hybrid path gets real antialiasing at geometry edges); the RT trace and
+	// compose passes read their single-sample resolves.
 	auto createGBufferTextures = [&](UInt32 w, UInt32 h) {
 		renderer.destroyTexture(gbufColor);
 		renderer.destroyTexture(gbufNormal);
+		renderer.destroyTexture(gbufEmissive);
 		renderer.destroyTexture(gbufDepth);
-		gbufColor = gbufNormal = gbufDepth = TextureHandle{};
+		renderer.destroyTexture(resColor);
+		renderer.destroyTexture(resNormal);
+		renderer.destroyTexture(resEmissive);
+		renderer.destroyTexture(resDepth);
+		gbufColor = gbufNormal = gbufEmissive = gbufDepth = TextureHandle{};
+		resColor = resNormal = resEmissive = resDepth = TextureHandle{};
+		const UInt8 ms = renderer.msaaSamples();
 		TextureDesc td;
 		td.w = w; td.h = h; td.fmt = TextureFormat::RGBA8_UNorm_SRGB; td.asRenderTarget = true;
+		td.sampleCount = ms;
 		if (auto r = renderer.createTexture(td); r.isOk()) gbufColor = r.value();
 		td.fmt = TextureFormat::RGBA16_Float;
 		if (auto r = renderer.createTexture(td); r.isOk()) gbufNormal = r.value();
+		if (auto r = renderer.createTexture(td); r.isOk()) gbufEmissive = r.value();
 		td.fmt = TextureFormat::D32_Float; td.asRenderTarget = false; td.asDepthStencil = true;
 		if (auto r = renderer.createTexture(td); r.isOk()) gbufDepth = r.value();
+		// Single-sample resolve targets. Color/normal/emissive are RGBA16F (the
+		// resolve decodes the sRGB MSAA color storage to linear); depth is R32F
+		// because a depth format cannot be a UAV (the resolve writes the min depth).
+		td.asDepthStencil = false; td.asRenderTarget = false; td.asUAV = true; td.sampleCount = 1;
+		td.fmt = TextureFormat::RGBA16_Float;
+		if (auto r = renderer.createTexture(td); r.isOk()) resColor = r.value();
+		if (auto r = renderer.createTexture(td); r.isOk()) resNormal = r.value();
+		if (auto r = renderer.createTexture(td); r.isOk()) resEmissive = r.value();
+		td.fmt = TextureFormat::R32_Float;
+		if (auto r = renderer.createTexture(td); r.isOk()) resDepth = r.value();
 		createRTTex(w, h);
 	};
 	{
@@ -380,6 +406,56 @@ float4 main(PSIn i) : SV_TARGET {
 			EInfo("Hybrid ray tracing disabled: device does not support inline ray tracing.");
 		}
 		createGBufferTextures(fw, fh);
+	}
+
+	// ---- Emissive showcase: a self-illuminated cube that glows in the direct
+	// view and appears lit inside ray traced reflections. ----
+	MeshHandle emissiveCubeMesh;
+	MaterialHandle emissiveCubeMat;
+	static const Transform emissiveCubeTf{ .position = Vec3(0.0f, 2.5f, 4.0f) };
+	{
+		MaterialDesc mat;
+		mat.name = "EmissiveLamp";
+		mat.baseColorFactor = Vec4(0.92f, 0.92f, 0.86f, 1.0f);
+		mat.metallicFactor = 0.0f;
+		mat.roughnessFactor = 0.35f;
+		mat.emissiveFactor = Vec3(2.6f, 1.0f, 0.2f); // warm lamp glow (HDR > 1)
+		auto cr = renderer.createMaterial(mat, renderer.defaultPSO());
+		if (cr.isOk()) emissiveCubeMat = cr.value();
+
+		auto makeCube = [&](F32 s) -> MeshDesc {
+			MeshDesc md;
+			auto pushFace = [&](Vec3 n, Vec3 u, Vec3 v) {
+				UInt32 base = (UInt32)md.vertices.size();
+				for (int i = 0; i < 4; ++i) {
+					F32 uu = (i == 1 || i == 2) ? 1.0f : 0.0f;
+					F32 vv = (i == 2 || i == 3) ? 1.0f : 0.0f;
+					Vertex vert;
+					vert.position = (n * 0.5f + u * (uu - 0.5f) + v * (vv - 0.5f)) * s;
+					vert.normal = n;
+					vert.texCoord = Vec2(uu, vv);
+					vert.tangent = Vec4(u, 1.0f);
+					md.vertices.push_back(vert);
+				}
+				UInt32 idx[6] = { base, base + 1, base + 2, base, base + 2, base + 3 };
+				for (UInt32 k = 0; k < 6; ++k) md.indices.push_back(idx[k]);
+			};
+			// u x v == n keeps the CCW (front-facing) winding used by the renderer
+			// and by the RT ray queries (back-face culling).
+			pushFace(Vec3(1, 0, 0), Vec3(0, 0, -1), Vec3(0, 1, 0));
+			pushFace(Vec3(-1, 0, 0), Vec3(0, 0, 1), Vec3(0, 1, 0));
+			pushFace(Vec3(0, 1, 0), Vec3(1, 0, 0), Vec3(0, 0, -1));
+			pushFace(Vec3(0, -1, 0), Vec3(1, 0, 0), Vec3(0, 0, 1));
+			pushFace(Vec3(0, 0, 1), Vec3(1, 0, 0), Vec3(0, 1, 0));
+			pushFace(Vec3(0, 0, -1), Vec3(-1, 0, 0), Vec3(0, 1, 0));
+			SubMesh sub; sub.indexOffset = 0; sub.indexCount = (UInt32)md.indices.size(); sub.vertexOffset = 0;
+			sub.material = emissiveCubeMat;
+			md.subMeshes.push_back(sub);
+			return md;
+		};
+		MeshDesc md = makeCube(1.2f);
+		auto mr = renderer.createMesh(md);
+		if (mr.isOk()) emissiveCubeMesh = mr.value();
 	}
 
 	// GPU culling buffers
@@ -791,6 +867,10 @@ HALT
 				rtMaxBounces = rtMaxBounces ? 0 : 1;
 			}
 			if (debugUI.sliderFloat("Bounce Rough", &rtBounceRoughness, 0.0f, 1.0f)) {}
+			if (debugUI.button(fmt::format("RT Denoise: {}", rtDenoise ? "On" : "Off").c_str())) {
+				rtDenoise = !rtDenoise;
+			}
+			if (debugUI.sliderFloat("Denoise Strength", &rtDenoiseStrength, 0.0f, 1.0f)) {}
 		}
 		{
 			static size_t visibleCount = 0;
@@ -1034,6 +1114,8 @@ HALT
 				renderer.renderShadowPass(shadow, terrMesh, Transform{}.computeWorldMatrix());
 			for (auto& wallMesh : wall)
 				renderer.renderShadowPass(shadow, wallMesh, Transform{ .position = Vec3(20, -19, 20) }.computeWorldMatrix());
+			if (emissiveCubeMesh.isValid())
+				renderer.renderShadowPass(shadow, emissiveCubeMesh, emissiveCubeTf.computeWorldMatrix());
 			// Indirect shadow for Furinas (all instances, GPU-culled)
 			for (size_t mi = 0; mi < model.size(); mi++)
 				renderer.renderShadowPassIndirect(shadow, model[mi], wmSRV, idxSRV, argsBuf, static_cast<UInt32>(mi * sizeof(IndirectDrawArgs)));
@@ -1138,6 +1220,7 @@ HALT
 			static const Transform trans{ .position = Vec3(20, -19, 20) };
 			renderer.drawMesh(wallMesh, trans);
 		}
+		if (emissiveCubeMesh.isValid()) renderer.drawMesh(emissiveCubeMesh, emissiveCubeTf);
 
 		// Draw camera body model when free-fly (F5 detached)
 		if (!fly.boundToBody && fly.cameraBody != InvalidRigidBody && !model.empty()) {
@@ -1179,9 +1262,10 @@ HALT
 			// ---- Hybrid ray tracing path (M3) ----
 			// G-buffer pass (albedo + world normal + depth). Note: the Furina model
 			// consists of 5 separate meshes, so every mesh must be drawn.
-			renderer.beginGBuffer(renderer.getTextureRTV(gbufColor), renderer.getTextureRTV(gbufNormal), renderer.getTextureDSV(gbufDepth));
+			renderer.beginGBuffer(renderer.getTextureRTV(gbufColor), renderer.getTextureRTV(gbufNormal), renderer.getTextureRTV(gbufEmissive), renderer.getTextureDSV(gbufDepth));
 			for (auto& terrMesh : terrian) renderer.drawMesh(terrMesh, Transform{});
 			for (auto& wallMesh : wall) renderer.drawMesh(wallMesh, Transform{ .position = Vec3(20, -19, 20) });
+			if (emissiveCubeMesh.isValid()) renderer.drawMesh(emissiveCubeMesh, emissiveCubeTf);
 			if (!model.empty() && modelLoadCompleted.load(std::memory_order_acquire)) {
 				Vector<Mat4> wmats(1000);
 				for (size_t i = 0; i < 1000; ++i) wmats[i] = transv[i].computeWorldMatrix();
@@ -1189,6 +1273,25 @@ HALT
 					renderer.drawMeshInstanced(model[mi], wmats);
 			}
 			renderer.endGBuffer();
+
+			// Resolve the MSAA G-buffer to single-sample targets for the RT trace
+			// and compose passes (the compute shaders read with Load/1x sampling).
+			TextureHandle rtColorSrc = gbufColor, rtNormalSrc = gbufNormal;
+			TextureHandle rtEmissiveSrc = gbufEmissive, rtDepthSrc = gbufDepth;
+			if (renderer.msaaSamples() > 1) {
+				auto rr = renderer.resolveGBufferMSAA(renderer.getTextureSRV(gbufColor), renderer.getTextureSRV(gbufNormal),
+					renderer.getTextureSRV(gbufEmissive), renderer.getTextureSRV(gbufDepth),
+					renderer.getTextureUAV(resColor), renderer.getTextureUAV(resNormal),
+					renderer.getTextureUAV(resEmissive), renderer.getTextureUAV(resDepth), ww, wh);
+				if (rr.isErr()) {
+					static bool resolveWarned = false;
+					if (!resolveWarned) { EError("G-buffer MSAA resolve failed: {}", ToString(rr.error())); resolveWarned = true; }
+				}
+				else {
+					rtColorSrc = resColor; rtNormalSrc = resNormal;
+					rtEmissiveSrc = resEmissive; rtDepthSrc = resDepth;
+				}
+			}
 
 			// RT scene groups: terrain/wall (meshes merged per model) + physics
 			// bodies (all Furina meshes share one BLAS per body).
@@ -1213,6 +1316,15 @@ HALT
 					}
 					rtGroups.push_back(std::move(g));
 				}
+				// Emissive showcase cube: also present in the RT scene so it glows
+				// inside reflections.
+				if (emissiveCubeMesh.isValid() && emissiveCubeMat.isValid()) {
+					RayTracedObjectGroup g;
+					g.transform = emissiveCubeTf;
+					RayTracedObject o; o.mesh = emissiveCubeMesh; o.material = emissiveCubeMat;
+					g.objects.push_back(o);
+					rtGroups.push_back(std::move(g));
+				}
 				if (!model.empty() && modelLoadCompleted.load(std::memory_order_acquire)) {
 					for (size_t i = 0; i < physHandles.size(); ++i) {
 						RayTracedObjectGroup g;
@@ -1235,7 +1347,8 @@ HALT
 			}
 
 			Mat4 view, proj; renderer.getCameraMatrices(view, proj);
-			Mat4 vpInv = glm::inverse(proj * view);
+			Mat4 vp = proj * view;
+			Mat4 vpInv = glm::inverse(vp);
 			Vec3 sunDir = glm::normalize(Vec3(cos(glm::radians(sunYaw)) * cos(glm::radians(sunPitch)),
 				-sin(glm::radians(sunPitch)), sin(glm::radians(sunYaw)) * cos(glm::radians(sunPitch))));
 			rayTracing.setSkybox(s_skyMode == 3, skyCubeTexHandle, s_skyCorners);
@@ -1291,10 +1404,10 @@ HALT
 					createRTTex(ww, wh); // recreate only the RT texture - no blank frame
 				}
 			}
+			UInt32 rtw = std::max<UInt32>(1, (UInt32)(ww * rtResScale));
+			UInt32 rth = std::max<UInt32>(1, (UInt32)(wh * rtResScale));
 			{
-				UInt32 rtw = std::max<UInt32>(1, (UInt32)(ww * rtResScale));
-				UInt32 rth = std::max<UInt32>(1, (UInt32)(wh * rtResScale));
-				auto tr = rayTracing.trace(rc, renderer.getTextureSRV(gbufNormal), renderer.getTextureSRV(gbufDepth),
+				auto tr = rayTracing.trace(rc, renderer.getTextureSRV(rtNormalSrc), renderer.getTextureSRV(rtDepthSrc),
 					renderer.getTextureUAV(rtTex), rtw, rth);
 				if (tr.isErr()) {
 					static bool traceWarned = false;
@@ -1302,12 +1415,25 @@ HALT
 				}
 			}
 
+			// Temporal + spatial denoise (SVGF-lite): stabilize AO/shadows/reflections.
+			void* rtComposeSRV = renderer.getTextureSRV(rtTex);
+			if (rtDenoise) {
+				rayTracing.setDenoiseStrength(rtDenoiseStrength);
+				auto dr = rayTracing.denoise(renderer.getTextureSRV(rtTex), renderer.getTextureSRV(rtNormalSrc),
+					renderer.getTextureSRV(rtDepthSrc), vpInv, vp, rtw, rth);
+				if (dr.isErr()) {
+					static bool denoiseWarned = false;
+					if (!denoiseWarned) { EError("RT denoise failed: {}", ToString(dr.error())); denoiseWarned = true; }
+				}
+				if (auto* ds = rayTracing.getDenoisedSRV()) rtComposeSRV = ds;
+			}
+
 			// HDR pass: skybox + compose.
 			renderer.setRenderTarget(postProcess.getHDRRTV());
 			renderer.beginFrame();
 			{
-				auto cr = rayTracing.compose(renderer.getTextureSRV(gbufColor), renderer.getTextureSRV(gbufNormal),
-					renderer.getTextureSRV(gbufDepth), renderer.getTextureSRV(rtTex),
+				auto cr = rayTracing.compose(renderer.getTextureSRV(rtColorSrc), renderer.getTextureSRV(rtNormalSrc),
+					renderer.getTextureSRV(rtDepthSrc), renderer.getTextureSRV(rtEmissiveSrc), rtComposeSRV,
 					postProcess.getHDRRTV(), renderer.getDepthStencil(), rtDrawMode,
 					vpInv, fly.pos, Vec3(sunColorR, sunColorG, sunColorB), ww, wh);
 				if (cr.isErr()) {

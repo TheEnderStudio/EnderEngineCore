@@ -156,6 +156,7 @@ struct ShaderDesc {
 struct TextureDesc {
 	UInt32 w = 0; UInt32 h = 0; TextureFormat fmt = TextureFormat::RGBA8_UNorm;
 	UInt32 mipLevels = 1; const void* data = nullptr; UInt32 dataSize = 0;
+	UInt8 sampleCount = 1;       ///< MSAA sample count (1 = no MSAA).
 	bool asRenderTarget = false; ///< Also bind as a render target (BIND_RENDER_TARGET, usage DEFAULT).
 	bool asUAV = false;          ///< Also bind as an unordered access view (BIND_UNORDERED_ACCESS).
 	bool asDepthStencil = false; ///< Also bind as a depth-stencil target (BIND_DEPTH_STENCIL).
@@ -239,10 +240,11 @@ struct alignas(16) LightData {
 /// @brief Light constant buffer containing all scene lights.
 struct alignas(16) LightConstants { LightData lights[MaxLights]; };
 
-/// @brief Per-object constant buffer (world matrix, normal matrix, base color, metallic/roughness).
+/// @brief Per-object constant buffer (world matrix, normal matrix, base color, metallic/roughness, emissive).
 struct alignas(16) ObjectConstants {
 	Mat4 world; Mat4 normalMat;
 	Vec4 baseColor; Vec4 metallicRough;
+	Vec4 emissive; ///< Emissive color (rgb) + intensity (w).
 };
 
 // ---------------------------------------------------------------------------
