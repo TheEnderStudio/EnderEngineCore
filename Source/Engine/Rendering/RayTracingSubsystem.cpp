@@ -99,8 +99,8 @@ struct RTConstants {
     float    ReflectionBlur;
     uint     MaxBounces;
     float    BounceRoughness;
-    float    _padB0;
-    float    _padB1;
+    uint     ReflectionSamples;
+    uint     FrameIndex;
 };
 
 RaytracingAccelerationStructure g_TLAS            : register(t0);
@@ -295,8 +295,10 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
         Norm = normalize(mul((float3x3)Obj.NormalMat, Norm));
 
         res.BaseColor = Mtr.BaseColorMask * g_Textures[NonUniformResourceIndex(Mtr.BaseColorTexInd)].SampleLevel(g_Sampler, UV, 0);
-        // Roughness-driven reflection attenuation: rougher surfaces reflect less.
-        res.BaseColor *= (1.0 - Mtr.Roughness * g_RTConstants.ReflectionBlur);
+        // Note: no roughness-based attenuation here anymore - the GGX
+        // importance sampling in CSMain weights the reflected radiance by the
+        // Smith G geometry term (roughness energy), so a rough surface's
+        // reflection is blurred AND dimmed correctly.
         // Self-emission is NOT attenuated by roughness and is not light-tinted:
         // a glowing surface keeps its color when reflected.
         res.Emissive = Mtr.Emissive.rgb * Mtr.Emissive.w;
@@ -354,6 +356,59 @@ float3 ScreenPosToWorldPos(float2 uv, float depth, float4x4 vpInv)
     return w.xyz / w.w;
 }
 
+// -------------------------------------------------------------------
+// GGX importance-sampled reflections.
+// -------------------------------------------------------------------
+
+// Radical inverse (Van der Corput) for the Hammersley sequence.
+float RadicalInverse_VdC(uint bits)
+{
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10; // 0x100000000
+}
+
+float2 Hammersley(uint i, uint N)
+{
+    return float2(float(i) / float(N), RadicalInverse_VdC(i));
+}
+
+// Deterministic per-pixel hash (decorrelates adjacent pixels' sample patterns;
+// constant across frames so the temporal denoiser can accumulate them).
+float2 Hash2D(float2 p)
+{
+    return frac(sin(p * 127.1 + float2(311.7, 74.7)) * 43758.5453);
+}
+
+// Sample the GGX normal distribution (importance sampling of the NDF).
+// a = perceptual roughness^2 (alpha). Returns the half-vector in tangent space.
+float3 ImportanceSampleGGX(float2 Xi, float a)
+{
+    float phi = 6.2831853 * Xi.x;
+    float cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a * a - 1.0) * Xi.y));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    return float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+}
+
+// Tangent-space half-vector -> world space around the normal N.
+float3 TangentToWorld(float3 H, float3 N)
+{
+    float3 up = abs(N.y) < 0.999 ? float3(0, 1, 0) : float3(1, 0, 0);
+    float3 T  = normalize(cross(up, N));
+    float3 B  = cross(N, T);
+    return normalize(T * H.x + B * H.y + N * H.z);
+}
+
+// Smith G1 (height-correlated geometry term), a = alpha (roughness^2).
+float SmithG1(float NdotX, float a)
+{
+    float a2 = a * a;
+    return 2.0 * NdotX / max(NdotX + sqrt(a2 + (1.0 - a2) * NdotX * NdotX), 1e-4);
+}
+
 [numthreads(8, 8, 1)]
 void CSMain(uint2 DTid : SV_DispatchThreadID)
 {
@@ -407,7 +462,10 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
     float3 LightDir = g_RTConstants.LightDir.xyz;
     float3 WNormal = normalize(g_GBufferNormal.Load(int3(fpBest, 0)).xyz);
     float  DisToCam = length(WPos - g_RTConstants.CameraPos.xyz);
-    float3 ViewDir = (WPos - g_RTConstants.CameraPos.xyz) / max(DisToCam, 0.0001);
+    // Surface -> camera (matches the compose shader's ViewDir convention, so
+    // NdotV is positive for front-facing surfaces and the GGX reflection lobe
+    // points away from the surface).
+    float3 ViewDir = (g_RTConstants.CameraPos.xyz - WPos) / max(DisToCam, 0.0001);
 
     float NdotL = max(0.0, dot(LightDir, WNormal));
     if (NdotL > 0.0)
@@ -420,28 +478,62 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
 
     float4 Color = float4(0, 0, 0, 1);
     {
-        // Reflect from a point biased above the surface to avoid self-hit. The
-        // bias scales with distance (depth-reconstruction error grows ~z^2), the
-        // same fix that removed the shadow "triangle" artifacts.
+        // GGX importance-sampled reflection: sample the GGX NDF around the
+        // normal (spread driven by roughness * ReflectionBlur), trace each
+        // direction and weight by Smith G * VdotH/(NdotV*NdotH) - the
+        // Cook-Torrance specular / NDF-pdf ratio without the Fresnel term
+        // (the compose pass applies Fresnel via the Schlick blend). Smooth
+        // surfaces converge to the mirror reflection (weight -> 1); rough
+        // surfaces get blurred, energy-attenuated reflections instead of a
+        // dimmed mirror.
         float bias = max(0.002, 0.001 * DisToCam);
-        ReflectionResult refl = Reflect(WPos + WNormal * bias,
-                                        reflect(ViewDir, WNormal),
-                                        g_RTConstants.MaxRayLength,
-                                        g_RTConstants.MaxRayLength,
-                                        g_RTConstants.CameraPos.xyz,
-                                        LightDir,
-                                        0);
-        if (refl.Found)
+        float3 base = WPos + WNormal * bias;
+        float3 V = ViewDir;
+        // Small floors so the reflection fades smoothly instead of snapping to
+        // pure black when the GGX lobe is clipped by the surface (grazing view).
+        float  NdotV = max(saturate(dot(WNormal, V)), 0.05);
+        float  rough = clamp(roughness * g_RTConstants.ReflectionBlur, 0.001, 1.0);
+        float  a = rough * rough;
+        uint   ns = clamp(g_RTConstants.ReflectionSamples, 1u, 8u);
+        // Pixel hash decorrelates adjacent pixels; the frame offset ROTATES the
+        // pattern every frame so the temporal denoiser averages different GGX
+        // samples and actually converges (a frame-static pattern never reduces
+        // the per-pixel variance over time).
+        float2 pixHash = Hash2D((float2)fpBest + (float2)(g_RTConstants.FrameIndex & 63u) * 0.618f);
+        float3 lightColor = g_RTConstants.LightColor.rgb;
+        float3 acc = float3(0, 0, 0);
+        for (uint i = 0; i < ns; ++i)
         {
-            // Reflection point lighting: ambient and direct are both tinted by the
-            // light color (consistent with the compose diffuse term). Self-emission
-            // of the hit surface is added afterwards, untinted.
-            float3 lightColor = g_RTConstants.LightColor.rgb;
-            float3 lit = (g_RTConstants.AmbientLight + max(0.0, refl.NdotL) * g_RTConstants.LightIntensity) * lightColor;
-            Color = float4(refl.BaseColor.rgb * lit + refl.Emissive.rgb, 1.0);
+            float2 Xi = frac(Hammersley(i, ns) + pixHash);
+            float3 H  = ImportanceSampleGGX(Xi, a);
+            float3 Hw = TangentToWorld(H, WNormal);
+            float3 L  = normalize(2.0 * dot(V, Hw) * Hw - V); // reflect(-V, H)
+            float NdotL = max(saturate(dot(WNormal, L)), 0.03);
+            float NdotH = saturate(dot(WNormal, Hw));
+            float VdotH = saturate(dot(V, Hw));
+            if (NdotH <= 1e-4)
+                continue; // degenerate half-vector only
+
+            ReflectionResult refl = Reflect(base, L, g_RTConstants.MaxRayLength,
+                                            g_RTConstants.MaxRayLength,
+                                            g_RTConstants.CameraPos.xyz, LightDir, 0);
+            float3 rad;
+            if (refl.Found)
+            {
+                // Reflection point lighting: ambient and direct tinted by the light
+                // color (consistent with the compose diffuse term); self-emission of
+                // the hit surface added afterwards, untinted.
+                float3 lit = (g_RTConstants.AmbientLight + max(0.0, refl.NdotL) * g_RTConstants.LightIntensity) * lightColor;
+                rad = refl.BaseColor.rgb * lit + refl.Emissive.rgb;
+            }
+            else
+                rad = GetSkyColor(L).rgb;
+
+            float G = SmithG1(NdotV, a) * SmithG1(NdotL, a);
+            float w = G * VdotH / max(NdotV * NdotH, 1e-4);
+            acc += rad * w;
         }
-        else
-            Color = GetSkyColor(reflect(ViewDir, WNormal)) * (1.0 - roughness * g_RTConstants.ReflectionBlur);
+        Color = float4(acc / (float)ns, 1.0);
     }
 
     // Lighting factor: ambient (AO-shaded) + direct (shadowed, intensity-scaled).
@@ -624,11 +716,14 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
     float4 history = float4(0, 0, 0, 0);
     if (inBounds) history = g_PrevDenoised.SampleLevel(g_Sampler, prevUV, 0);
 
-    // Clamp history to the current neighborhood (kills ghosting) and reject it
-    // softly when its luminance deviates from the filtered current sample.
+    // Clamp history to the current neighborhood (kills ghosting) and blend.
+    // The motion guard only drops history for LARGE relative changes (fast
+    // moving objects); noise-level differences keep full history so the
+    // temporal accumulation actually converges (an aggressive rejection made
+    // every noisy frame count as disocclusion and caused constant flicker).
     float4 clamped = clamp(history, mn, mx);
     float rej = abs(Luminance(clamped.rgb) - Luminance(spatial.rgb)) / max(Luminance(spatial.rgb), 0.01f);
-    float alpha = g_HistoryWeight * saturate(1.0f - rej * g_DisocclusionReject);
+    float alpha = g_HistoryWeight * saturate(g_DisocclusionReject - rej);
     g_OutDenoised[DTid] = lerp(spatial, clamped, alpha);
 }
 )";
@@ -706,6 +801,7 @@ struct RayTracingSubsystem::Impl {
 	bool  denoiseHasPrev = false;                      ///< History valid (false on first frame / resize).
 	Mat4  denoisePrevVP = Mat4(1.0f);                  ///< Previous frame view-projection.
 	F32   denoiseHistoryWeight = 0.9f;                 ///< Temporal blend strength (0..1).
+	UInt32 traceFrameCounter = 0;                      ///< Frame counter (rotates the GGX sample pattern).
 
 	Result<void, RenderError> buildTLAS(TLASData& dd, const Vector<TLASInstance>& instances);
 };
@@ -1141,6 +1237,7 @@ Result<void, RenderError> RayTracingSubsystem::trace(const RayTraceConstants& c,
 		RayTraceConstants cc = c;
 		cc.skyMode = p.skyUseCubemap ? 1 : 0;
 		memcpy(cc.skyCorners, p.skyCorners, sizeof(p.skyCorners));
+		cc.frameIndex = p.traceFrameCounter++;
 		void* m = nullptr;
 		ctx->MapBuffer(p.constantsBuf, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
 		if (m) { memcpy(m, &cc, sizeof(cc)); ctx->UnmapBuffer(p.constantsBuf, D::MAP_WRITE); }
@@ -1250,7 +1347,7 @@ Result<void, RenderError> RayTracingSubsystem::denoise(void* rtSRV, void* gBuffe
 	cb.historyWeight = p.denoiseHasPrev ? p.denoiseHistoryWeight : 0.0f;
 	cb.normalWeight = 64.0f;
 	cb.depthScale = 16.0f;
-	cb.disocclusionReject = 2.0f;
+	cb.disocclusionReject = 3.0f; // relative-luminance threshold below which history is kept (noise keeps full history)
 	void* m = nullptr;
 	ctx->MapBuffer(p.denoiseCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
 	if (m) { memcpy(m, &cb, sizeof(cb)); ctx->UnmapBuffer(p.denoiseCB, D::MAP_WRITE); }

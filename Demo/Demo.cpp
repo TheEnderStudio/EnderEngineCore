@@ -1,4 +1,4 @@
-﻿#include <Engine/Core/Core.hpp>
+#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -340,11 +340,12 @@ float4 main(PSIn i) : SV_TARGET {
 	F32 rtAoRadius = 1.5f;   // AO ray length
 	UInt32 rtAoSamples = 4;  // AO rays per pixel (0 = off)
 	F32 rtLightSize = 0.05f; // PCSS light size (0 = fixed-cone PCF)
-	F32 rtReflectionBlur = 0.7f; // roughness-driven reflection attenuation
+	F32 rtReflectionBlur = 0.7f; // GGX reflection spread scale (0 = mirror, 1 = full roughness)
 	UInt32 rtMaxBounces = 1;     // max reflection bounces (0 = single, 1 = two-bounce)
 	F32 rtBounceRoughness = 1.0f; // second-bounce roughness threshold (1.0 = force all surfaces)
 	bool rtDenoise = true;       // temporal + spatial denoiser (SVGF-lite)
 	F32 rtDenoiseStrength = 0.9f; // temporal history weight (0 = off, 1 = full history)
+	UInt32 rtReflectionSamples = 4; // GGX reflection rays per pixel (1..8)
 	float rtResScale = 0.5f; // RT resolution scale (0.5 / 1.0)
 	bool rtResAuto = true;   // auto-pick the scale from the distance to the nearest object
 	TextureHandle gbufColor, gbufNormal, gbufEmissive, gbufDepth, rtTex;
@@ -863,6 +864,12 @@ HALT
 				}
 			}
 			if (debugUI.sliderFloat("Refl Blur", &rtReflectionBlur, 0.0f, 1.0f)) {}
+			{
+				float rsF = (float)rtReflectionSamples;
+				if (debugUI.sliderFloat("Refl Samples", &rsF, 1.0f, 8.0f)) {
+					rtReflectionSamples = (UInt32)(rsF + 0.5f);
+				}
+			}
 			if (debugUI.button(fmt::format("Refl Bounce: {}", rtMaxBounces ? "2" : "1").c_str())) {
 				rtMaxBounces = rtMaxBounces ? 0 : 1;
 			}
@@ -1369,6 +1376,7 @@ HALT
 			rc.reflectionBlur = rtReflectionBlur;
 			rc.maxBounces = rtMaxBounces;
 			rc.bounceRoughness = rtBounceRoughness;
+			rc.reflectionSamples = rtReflectionSamples;
 			// Packed disc samples for soft shadows (16 points, xy/zw pairs).
 			// The first sample is the center (no perturbation) so PCF=1 behaves
 			// like a plain single shadow ray.
