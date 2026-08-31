@@ -38,6 +38,7 @@ add_includedirs("ThirdParty/stb")
 add_includedirs("ThirdParty/libspng/include")
 add_includedirs("ThirdParty/FreeType/include/freetype2")
 add_includedirs("ThirdParty/EnderVFiles/include")
+add_includedirs("ThirdParty/oidn/include")
 add_includedirs("Backends/SteamAudio/include")
 add_includedirs("Backends/DiligentEngine/include")
 add_includedirs("Backends/DiligentEngine/include/DiligentTools/Imgui/interface")
@@ -94,6 +95,7 @@ if is_mode("debug") then
 	add_linkdirs("ThirdParty/libspng/lib/Debug")
 	add_linkdirs("ThirdParty/FreeType/lib")
 	add_linkdirs("ThirdParty/EnderVFiles/bin")
+	add_linkdirs("ThirdParty/oidn/lib")
 else
 	add_linkdirs("ThirdParty/spdlog/lib")
 	add_linkdirs("ThirdParty/glfw/lib-vc2022")
@@ -108,6 +110,7 @@ else
 	add_linkdirs("ThirdParty/libspng/lib/Release")
 	add_linkdirs("ThirdParty/FreeType/lib")
 	add_linkdirs("ThirdParty/EnderVFiles/bin")
+	add_linkdirs("ThirdParty/oidn/lib")
 end
 
 -- ---------------------------------------------------------------------------
@@ -172,6 +175,8 @@ target("EnderEngineCore")
 		add_links("PVDRuntime_64")
 		add_links("phonon")
 		add_links("EnderVFiles")
+		add_links("OpenImageDenoise")
+		add_links("OpenImageDenoise_core")
 	else
 		add_links("spdlog")
 		add_links("glfw3dll")
@@ -210,6 +215,8 @@ target("EnderEngineCore")
 		add_links("PhysXVehicle2_static_64")
 		add_links("phonon")
 		add_links("EnderVFiles")
+		add_links("OpenImageDenoise")
+		add_links("OpenImageDenoise_core")
 	end
 target_end()
 
@@ -263,6 +270,7 @@ target("Demo")
 	-- Copy the DirectX Shader Compiler (dxcompiler.dll + dxil.dll) next to the
 	-- executable so that Diligent can compile Shader Model 6.0+ (ray tracing).
 	-- Required for the RayTracingSubsystem's inline ray tracing (SM 6.5).
+	-- Also copy the Open Image Denoise runtime DLLs (all-GPU denoiser).
 	after_build(function(target)
 		if is_plat("windows") then
 			local kits = "C:/Program Files (x86)/Windows Kits/10/bin"
@@ -280,6 +288,10 @@ target("Demo")
 				if os.isfile(x64 .. "/dxil.dll") then
 					os.cp(x64 .. "/dxil.dll", path.join(target:targetdir(), "dxil.dll"))
 				end
+			end
+			local oidnBin = "ThirdParty/oidn/bin"
+			if os.isdir(oidnBin) then
+				os.cp(oidnBin .. "/*.dll", target:targetdir())
 			end
 		end
 	end)

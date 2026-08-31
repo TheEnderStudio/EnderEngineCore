@@ -134,45 +134,58 @@ public:
 	/**
 	 * @brief Trace shadow + reflection rays for the current G-buffer.
 	 *
-	 * Reads the G-buffer (world normal + depth), reconstructs world space
-	 * positions, casts one shadow ray toward the light and one reflection
-	 * ray per pixel, and writes the result into outRT (rgba16f UAV):
-	 * rgb = reflection color, a = lighting (max(ambient, NdotL)).
+	 * Reads the G-buffer (world normal + depth + color), reconstructs world
+	 * space positions, casts one shadow ray toward the light and one reflection
+	 * ray per pixel, and writes the result into outRT (rgba32f UAV):
+	 * rgb = reflection color, a = lighting (ambient + direct). Additionally
+	 * writes the RT-resolution albedo and world normal into outAlbedo/outNormal
+	 * (consumed by the denoiser; they match the depth-guided texel used for
+	 * lighting so the denoise features align with the color buffer).
 	 * @param c             Per-frame constants (view-proj inverse, light, camera).
 	 * @param gBufferNormal SRV of the G-buffer world normal (ITextureView* as void*).
 	 * @param gBufferDepth  SRV of the G-buffer depth (ITextureView* as void*).
+	 * @param gBufferColor  SRV of the G-buffer albedo (ITextureView* as void*).
 	 * @param outRT         UAV of the ray traced output texture (ITextureView* as void*).
+	 * @param outAlbedo     UAV of the RT-res albedo (ITextureView* as void*).
+	 * @param outNormal     UAV of the RT-res world normal (ITextureView* as void*).
 	 * @param width,height  G-buffer dimensions.
 	 */
 	Result<void, RenderError> trace(const RayTraceConstants& c,
-		void* gBufferNormal, void* gBufferDepth, void* outRT,
+		void* gBufferNormal, void* gBufferDepth, void* gBufferColor,
+		void* outRT, void* outAlbedo, void* outNormal,
 		UInt32 width, UInt32 height);
 
 	/**
-	 * @brief Temporal + spatial denoiser (SVGF-lite) for the ray traced output.
+	 * @brief Denoise the ray traced output.
 	 *
-	 * Reprojects the previous denoised frame into the current frame (camera
-	 * motion only), clamps it to the current 3x3 neighborhood and blends with
-	 * an edge-preserving spatial filter of the current frame. Run once per
-	 * frame right after trace(); compose() should then read getDenoisedSRV().
-	 * The internal ping-pong textures are (re)created to match the RT
-	 * resolution, so resolution switches are handled automatically.
+	 * When an Open Image Denoise GPU device with D3D12 external-memory import is
+	 * available, the frame is denoised entirely on the GPU (zero-copy shared
+	 * buffers, no CPU participation). Otherwise a temporal + spatial (SVGF-lite)
+	 * compute filter is used. compose() should then read getDenoisedSRV().
 	 * @param rtSRV           SRV of the raw ray traced output (from trace()).
+	 * @param gBufferAlbedoSRV SRV of the single-sample G-buffer albedo (OIDN input).
 	 * @param gBufferNormalSRV SRV of the G-buffer world normal.
-	 * @param gBufferDepthSRV  SRV of the G-buffer depth.
+	 * @param gBufferDepthSRV  SRV of the G-buffer depth (temporal path only).
 	 * @param viewProjInv     Inverse view-projection of the current frame.
-	 * @param viewProj        View-projection of the current frame (stored for the
-	 *                        next frame's reprojection).
+	 * @param viewProj        View-projection of the current frame (temporal path only).
 	 * @param width,height    RT output dimensions (dispatch size).
 	 */
-	Result<void, RenderError> denoise(void* rtSRV, void* gBufferNormalSRV, void* gBufferDepthSRV,
+	Result<void, RenderError> denoise(void* rtSRV, void* gBufferAlbedoSRV, void* gBufferNormalSRV, void* gBufferDepthSRV,
 		const Mat4& viewProjInv, const Mat4& viewProj, UInt32 width, UInt32 height);
+
+	/// @brief Whether the Open Image Denoise GPU path is active (all-GPU denoising).
+	EE_NODISCARD bool oidnActive() const;
 
 	/// @brief SRV of the latest denoised frame (nullptr until denoise() runs).
 	void* getDenoisedSRV() const;
 
 	/// @brief Set the temporal history weight (0 = no history, 1 = full history).
 	void setDenoiseStrength(F32 historyWeight);
+
+	/// @brief Choose the OIDN pipeline when it is available: async (1-frame
+	///        latency, denoise overlaps with rendering) or sync (0 latency,
+	///        denoise serialized with rendering). Ignored when OIDN is off.
+	void setOIDNAsync(bool enable);
 
 	/**
 	 * @brief Compose G-buffer + ray traced results over the scene.
@@ -208,6 +221,9 @@ protected:
 	void onShutdown() override;
 
 private:
+	bool tryInitOIDN(UInt32 width, UInt32 height);      ///< Lazy-init the OIDN GPU path (once).
+	void shutdownOIDN();                                 ///< Release all OIDN/D3D12 shared resources.
+	void oidnDenoise(void* rtSRV, void* albedoSRV, void* normalSRV, UInt32 width, UInt32 height);
 	struct Impl;
 	Uptr<Impl> m_impl;
 };

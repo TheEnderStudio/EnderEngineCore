@@ -343,23 +343,34 @@ float4 main(PSIn i) : SV_TARGET {
 	F32 rtReflectionBlur = 0.7f; // GGX reflection spread scale (0 = mirror, 1 = full roughness)
 	UInt32 rtMaxBounces = 1;     // max reflection bounces (0 = single, 1 = two-bounce)
 	F32 rtBounceRoughness = 1.0f; // second-bounce roughness threshold (1.0 = force all surfaces)
-	bool rtDenoise = true;       // temporal + spatial denoiser (SVGF-lite)
+	bool rtDenoise = true;       // temporal + spatial denoiser (SVGF-lite) / OIDN GPU path
 	F32 rtDenoiseStrength = 0.9f; // temporal history weight (0 = off, 1 = full history)
+	bool rtOIDNAsync = true;     // OIDN async pipeline (1-frame latency) vs sync (0 latency)
 	UInt32 rtReflectionSamples = 4; // GGX reflection rays per pixel (1..8)
 	float rtResScale = 0.5f; // RT resolution scale (0.5 / 1.0)
 	bool rtResAuto = true;   // auto-pick the scale from the distance to the nearest object
 	TextureHandle gbufColor, gbufNormal, gbufEmissive, gbufDepth, rtTex;
+	// RT-resolution albedo/normal written by the RT shader for the denoiser.
+	TextureHandle rtAlbedo, rtNormal;
 	// Single-sample resolve targets for the MSAA G-buffer (read by RT/compose).
 	TextureHandle resColor, resNormal, resEmissive, resDepth;
 	// (Re)create the ray traced output texture at the current rtResScale.
+	// RGBA32F: the Open Image Denoise GPU path consumes 32-bit float images
+	// (OIDN has no 16-bit format), so the shared buffers and the output match.
+	// rtAlbedo/rtNormal are the RT-resolution albedo/normal the RT shader writes
+	// for the denoiser (same size as rtTex).
 	auto createRTTex = [&](UInt32 w, UInt32 h) {
 		renderer.destroyTexture(rtTex);
-		rtTex = TextureHandle{};
+		renderer.destroyTexture(rtAlbedo);
+		renderer.destroyTexture(rtNormal);
+		rtTex = rtAlbedo = rtNormal = TextureHandle{};
 		TextureDesc td;
-		td.fmt = TextureFormat::RGBA16_Float; td.asDepthStencil = false; td.asUAV = true;
+		td.fmt = TextureFormat::RGBA32_Float; td.asDepthStencil = false; td.asUAV = true;
 		td.w = std::max<UInt32>(1, (UInt32)(w * rtResScale));
 		td.h = std::max<UInt32>(1, (UInt32)(h * rtResScale));
 		if (auto r = renderer.createTexture(td); r.isOk()) rtTex = r.value();
+		if (auto r = renderer.createTexture(td); r.isOk()) rtAlbedo = r.value();
+		if (auto r = renderer.createTexture(td); r.isOk()) rtNormal = r.value();
 	};
 	// (Re)create the window-sized G-buffer (always full resolution) + RT output.
 	// The G-buffer targets are MSAA (same sample count as the renderer, so the
@@ -386,13 +397,15 @@ float4 main(PSIn i) : SV_TARGET {
 		if (auto r = renderer.createTexture(td); r.isOk()) gbufEmissive = r.value();
 		td.fmt = TextureFormat::D32_Float; td.asRenderTarget = false; td.asDepthStencil = true;
 		if (auto r = renderer.createTexture(td); r.isOk()) gbufDepth = r.value();
-		// Single-sample resolve targets. Color/normal/emissive are RGBA16F (the
-		// resolve decodes the sRGB MSAA color storage to linear); depth is R32F
-		// because a depth format cannot be a UAV (the resolve writes the min depth).
+		// Single-sample resolve targets. Color/normal are RGBA32F (OIDN consumes
+		// 32-bit float images; the resolve decodes the sRGB MSAA color to linear);
+		// emissive stays RGBA16F; depth is R32F because a depth format cannot be
+		// a UAV (the resolve writes the min depth).
 		td.asDepthStencil = false; td.asRenderTarget = false; td.asUAV = true; td.sampleCount = 1;
-		td.fmt = TextureFormat::RGBA16_Float;
+		td.fmt = TextureFormat::RGBA32_Float;
 		if (auto r = renderer.createTexture(td); r.isOk()) resColor = r.value();
 		if (auto r = renderer.createTexture(td); r.isOk()) resNormal = r.value();
+		td.fmt = TextureFormat::RGBA16_Float;
 		if (auto r = renderer.createTexture(td); r.isOk()) resEmissive = r.value();
 		td.fmt = TextureFormat::R32_Float;
 		if (auto r = renderer.createTexture(td); r.isOk()) resDepth = r.value();
@@ -876,6 +889,16 @@ HALT
 			if (debugUI.sliderFloat("Bounce Rough", &rtBounceRoughness, 0.0f, 1.0f)) {}
 			if (debugUI.button(fmt::format("RT Denoise: {}", rtDenoise ? "On" : "Off").c_str())) {
 				rtDenoise = !rtDenoise;
+			}
+			if (rayTracing.oidnActive()) {
+				if (debugUI.button(fmt::format("OIDN Async: {}", rtOIDNAsync ? "On" : "Off").c_str())) {
+					rtOIDNAsync = !rtOIDNAsync;
+					rayTracing.setOIDNAsync(rtOIDNAsync);
+				}
+				debugUI.text("Denoiser: OIDN (GPU, zero-copy)");
+			}
+			else {
+				debugUI.text("Denoiser: temporal + spatial");
 			}
 			if (debugUI.sliderFloat("Denoise Strength", &rtDenoiseStrength, 0.0f, 1.0f)) {}
 		}
@@ -1416,18 +1439,21 @@ HALT
 			UInt32 rth = std::max<UInt32>(1, (UInt32)(wh * rtResScale));
 			{
 				auto tr = rayTracing.trace(rc, renderer.getTextureSRV(rtNormalSrc), renderer.getTextureSRV(rtDepthSrc),
-					renderer.getTextureUAV(rtTex), rtw, rth);
+					renderer.getTextureSRV(rtColorSrc),
+					renderer.getTextureUAV(rtTex), renderer.getTextureUAV(rtAlbedo), renderer.getTextureUAV(rtNormal), rtw, rth);
 				if (tr.isErr()) {
 					static bool traceWarned = false;
 					if (!traceWarned) { EError("RT trace failed: {}", ToString(tr.error())); traceWarned = true; }
 				}
 			}
 
-			// Temporal + spatial denoise (SVGF-lite): stabilize AO/shadows/reflections.
+			// Denoise: Open Image Denoise GPU path (if available) or temporal+spatial (SVGF-lite).
+			// The albedo/normal are the RT-resolution buffers written by trace().
 			void* rtComposeSRV = renderer.getTextureSRV(rtTex);
 			if (rtDenoise) {
 				rayTracing.setDenoiseStrength(rtDenoiseStrength);
-				auto dr = rayTracing.denoise(renderer.getTextureSRV(rtTex), renderer.getTextureSRV(rtNormalSrc),
+				auto dr = rayTracing.denoise(renderer.getTextureSRV(rtTex), renderer.getTextureSRV(rtAlbedo),
+					renderer.getTextureSRV(rtNormal),
 					renderer.getTextureSRV(rtDepthSrc), vpInv, vp, rtw, rth);
 				if (dr.isErr()) {
 					static bool denoiseWarned = false;

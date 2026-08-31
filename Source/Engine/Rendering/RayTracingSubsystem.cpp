@@ -14,6 +14,15 @@
 #include <DiligentCore/Common/interface/RefCntAutoPtr.hpp>
 #include <DiligentCore/Common/interface/AdvancedMath.hpp>
 
+// OIDN GPU denoiser with zero-copy D3D12 interop (all-GPU, no CPU participation).
+#define NOMINMAX
+#include <Windows.h>
+#include <d3d12.h>
+#include <OpenImageDenoise/oidn.h>
+#include <DiligentCore/Graphics/GraphicsEngineD3D12/interface/RenderDeviceD3D12.h>
+#include <DiligentCore/Graphics/GraphicsEngineD3D12/interface/DeviceContextD3D12.h>
+#include <DiligentCore/Graphics/GraphicsEngineD3D12/interface/TextureD3D12.h>
+
 #include "ResourcePool.hpp"
 
 #include <cstring>
@@ -112,7 +121,10 @@ Texture2D<float4>                 g_GBufferNormal : register(t5);
 Texture2D<float>                  g_GBufferDepth  : register(t6);
 Texture2D<float4>                 g_Textures[16]  : register(t7);
 TextureCube<float4>               g_SkyCube       : register(t23);
+Texture2D<float4>                 g_GBufferColor  : register(t24);
 RWTexture2D<float4>               g_OutRT         : register(u0);
+RWTexture2D<float4>               g_OutAlbedo     : register(u1); ///< RT-res albedo (OIDN input, matches fpBest).
+RWTexture2D<float4>               g_OutNormal     : register(u2); ///< RT-res world normal (OIDN input).
 SamplerState                      g_Sampler       : register(s0);
 ConstantBuffer<RTConstants>       g_RTConstants   : register(b0);
 
@@ -454,6 +466,8 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
     if (Depth >= 1.0)
     {
         g_OutRT[DTid] = float4(0, 0, 0, 1);
+        g_OutAlbedo[DTid] = float4(0, 0, 0, 0);
+        g_OutNormal[DTid] = float4(0, 0, 0, 0);
         return;
     }
 
@@ -539,6 +553,10 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
     // Lighting factor: ambient (AO-shaded) + direct (shadowed, intensity-scaled).
     // Compose uses Color * RT.a for the diffuse term.
     Color.a = g_RTConstants.AmbientLight * ao + NdotL * g_RTConstants.LightIntensity;
+    // RT-res albedo/normal for the denoiser (OIDN consumes these at the RT
+    // resolution; they match the depth-guided fpBest texel used for lighting).
+    g_OutAlbedo[DTid] = g_GBufferColor.Load(int3(fpBest, 0));
+    g_OutNormal[DTid] = g_GBufferNormal.Load(int3(fpBest, 0));
     g_OutRT[DTid] = Color;
 }
 )";
@@ -802,6 +820,37 @@ struct RayTracingSubsystem::Impl {
 	Mat4  denoisePrevVP = Mat4(1.0f);                  ///< Previous frame view-projection.
 	F32   denoiseHistoryWeight = 0.9f;                 ///< Temporal blend strength (0..1).
 	UInt32 traceFrameCounter = 0;                      ///< Frame counter (rotates the GGX sample pattern).
+
+	// ------------------------------------------------------------------
+	// Open Image Denoise GPU denoiser (zero-copy D3D12 shared-memory interop).
+	// All-GPU: the denoise kernels run on the GPU, buffers are shared D3D12
+	// memory imported through Win32 NT handles - the CPU never touches pixels.
+	// Disabled (with a clear log) when no GPU device / external memory support.
+	// ------------------------------------------------------------------
+	bool oidnReady = false;
+	bool oidnAttempted = false;              ///< Init attempted once; a failure disables OIDN for the session.
+	OIDNDevice oidnDev = nullptr;
+	OIDNFilter oidnFilter = nullptr;
+	OIDNFilter oidnFilterAlpha = nullptr;    ///< Optional 1-channel pass for the lighting factor (RT.a).
+	D::IRenderDeviceD3D12* oidnD3D12DevIface = nullptr;  ///< Borrowed raw D3D12 interface (renderer owns it).
+	ID3D12Device* oidnD3D12Dev = nullptr;
+	UInt32 oidnW = 0, oidnH = 0;
+	ID3D12Resource* oidnBuf[4] = {};   ///< Shared D3D12 buffers: color, albedo, normal, output.
+	OIDNBuffer oidnImg[4] = {};        ///< OIDN imports of the same shared memory.
+	// Async pipeline: D3D12 fence imported as an OIDN semaphore lets the OIDN
+	// GPU kernels run concurrently with the next frame's rendering (1-frame
+	// latency). Falls back to a blocking (Flush+WaitForIdle) pipeline when the
+	// device lacks external semaphore support.
+	bool  oidnAsync = false;
+	bool  oidnSyncOverride = false;      ///< UI toggle: force the blocking (0-latency) pipeline even when async is available.
+	ID3D12Fence* oidnFence = nullptr;
+	OIDNSemaphore oidnSem = nullptr;
+	UInt64 oidnNextValue = 0;          ///< Next monotonic fence value.
+	UInt64 oidnWaitValue = 0;          ///< Output value of the last launched OIDN (queue waits on it).
+	bool  oidnHasOutput = false;       ///< An OIDN result exists (skip the output copy on the first frame).
+	D::RefCntAutoPtr<D::ITexture> oidnOutTex;      ///< Denoised output texture (compose reads this).
+	D::RefCntAutoPtr<D::ITextureView> oidnOutSRV;
+	D::RefCntAutoPtr<D::IBuffer> oidnOpenListBuf;  ///< Tiny scratch used to force an open command list.
 
 	Result<void, RenderError> buildTLAS(TLASData& dd, const Vector<TLASInstance>& instances);
 };
@@ -1226,11 +1275,12 @@ Result<void, RenderError> RayTracingSubsystem::updateScene(const Vector<RayTrace
 // ===================================================================
 
 Result<void, RenderError> RayTracingSubsystem::trace(const RayTraceConstants& c,
-	void* gBufferNormal, void* gBufferDepth, void* outRT, UInt32 width, UInt32 height) {
+	void* gBufferNormal, void* gBufferDepth, void* gBufferColor,
+	void* outRT, void* outAlbedo, void* outNormal, UInt32 width, UInt32 height) {
 	auto& p = *m_impl;
 	auto* ctx = p.ctx(); if (!ctx) return RenderError::NotInitialized;
 	if (!p.ok || !p.rtPSO || !p.rtSRB) return RenderError::OperationFailed;
-	if (!gBufferNormal || !gBufferDepth || !outRT || width == 0 || height == 0) return RenderError::InvalidArgument;
+	if (!gBufferNormal || !gBufferDepth || !gBufferColor || !outRT || !outAlbedo || !outNormal || width == 0 || height == 0) return RenderError::InvalidArgument;
 
 	// Upload constants (skybox data is merged in from the subsystem state).
 	{
@@ -1245,7 +1295,10 @@ Result<void, RenderError> RayTracingSubsystem::trace(const RayTraceConstants& c,
 
 	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_GBufferNormal")) v->Set(static_cast<D::ITextureView*>(gBufferNormal), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_GBufferDepth")) v->Set(static_cast<D::ITextureView*>(gBufferDepth), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_GBufferColor")) v->Set(static_cast<D::ITextureView*>(gBufferColor), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutRT")) v->Set(static_cast<D::ITextureView*>(outRT), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutAlbedo")) v->Set(static_cast<D::ITextureView*>(outAlbedo), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutNormal")) v->Set(static_cast<D::ITextureView*>(outNormal), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	// Bind the skybox cubemap (or the white CUBEMAP fallback when not in cubemap mode).
 	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_SkyCube")) {
 		D::ITextureView* srv = p.whiteCubeSRV.RawPtr();
@@ -1312,13 +1365,456 @@ Result<void, RenderError> RayTracingSubsystem::compose(void* gBufferColor, void*
 	return {};
 }
 
-Result<void, RenderError> RayTracingSubsystem::denoise(void* rtSRV, void* gBufferNormalSRV, void* gBufferDepthSRV,
+// -------------------------------------------------------------------
+// Open Image Denoise GPU path.
+// All-GPU: the denoise kernels run on the GPU. Inputs (raw RT output, G-buffer
+// albedo/normal) are copied from Diligent textures into D3D12 shared buffers
+// (injected as raw copies on Diligent's command list), imported into OIDN
+// through Win32 NT handles, and the output buffer is copied back into a
+// Diligent texture - the CPU never touches pixel data.
+// -------------------------------------------------------------------
+
+static bool OIDNCheckError(OIDNDevice dev, const char* where) {
+	const char* msg = nullptr;
+	if (oidnGetDeviceError(dev, &msg) != OIDN_ERROR_NONE) {
+		EError("OIDN {} failed: {}", where, msg ? msg : "unknown error");
+		return false;
+	}
+	return true;
+}
+
+void RayTracingSubsystem::shutdownOIDN() {
+	auto& p = *m_impl;
+	if (p.oidnFilter) { oidnReleaseFilter(p.oidnFilter); p.oidnFilter = nullptr; }
+	if (p.oidnFilterAlpha) { oidnReleaseFilter(p.oidnFilterAlpha); p.oidnFilterAlpha = nullptr; }
+	for (int i = 0; i < 4; ++i) {
+		if (p.oidnImg[i]) { oidnReleaseBuffer(p.oidnImg[i]); p.oidnImg[i] = nullptr; }
+		if (p.oidnBuf[i]) { p.oidnBuf[i]->Release(); p.oidnBuf[i] = nullptr; }
+	}
+	if (p.oidnSem) { oidnReleaseSemaphore(p.oidnSem); p.oidnSem = nullptr; }
+	if (p.oidnFence) { p.oidnFence->Release(); p.oidnFence = nullptr; }
+	if (p.oidnDev) { oidnReleaseDevice(p.oidnDev); p.oidnDev = nullptr; }
+	p.oidnD3D12DevIface = nullptr;
+	p.oidnD3D12Dev = nullptr;
+	p.oidnOutTex.Release(); p.oidnOutSRV.Release();
+	p.oidnOpenListBuf.Release();
+	p.oidnW = p.oidnH = 0;
+	p.oidnAsync = false; p.oidnHasOutput = false;
+	p.oidnNextValue = 0; p.oidnWaitValue = 0;
+	p.oidnReady = false;
+}
+
+bool RayTracingSubsystem::tryInitOIDN(UInt32 w, UInt32 h) {
+	auto& p = *m_impl;
+	if (p.oidnReady && p.oidnW == w && p.oidnH == h) return true;
+	shutdownOIDN();
+	p.oidnW = w; p.oidnH = h;
+
+	auto* dev = p.device();
+	if (!dev) return false;
+
+	// Raw D3D12 device (D3D12-only interop).
+	dev->QueryInterface(D::IID_RenderDeviceD3D12, reinterpret_cast<D::IObject**>(&p.oidnD3D12DevIface));
+	if (!p.oidnD3D12DevIface) {
+		EError("OIDN: renderer is not a D3D12 device - GPU denoiser disabled (Vulkan backend needs a different interop path)");
+		return false;
+	}
+	p.oidnD3D12Dev = p.oidnD3D12DevIface->GetD3D12Device();
+	if (!p.oidnD3D12Dev) { EError("OIDN: no raw D3D12 device"); return false; }
+
+	// Enumerate OIDN physical devices (GPU-only per design); prefer the one
+	// matching the D3D12 adapter LUID so the shared memory lands on the same GPU.
+	const LUID adapterLuid = p.oidnD3D12Dev->GetAdapterLuid();
+	int picked = -1;
+	const int num = oidnGetNumPhysicalDevices();
+	EInfo("OIDN: {} physical device(s) enumerated", num);
+	for (int i = 0; i < num; ++i) {
+		const int   type = oidnGetPhysicalDeviceInt(i, "type");
+		const char* name = oidnGetPhysicalDeviceString(i, "name");
+		EInfo("OIDN physical device {}: type={} name={}", i, type, name ? name : "?");
+		if (type == OIDN_DEVICE_TYPE_CPU) continue; // CPU is forbidden by design
+		if (oidnGetPhysicalDeviceBool(i, "luidSupported")) {
+			size_t sz = 0;
+			const void* luidData = oidnGetPhysicalDeviceData(i, "luid", &sz);
+			if (luidData && sz >= sizeof(LUID) && memcmp(luidData, &adapterLuid, sizeof(LUID)) == 0) {
+				picked = i;
+				EInfo("OIDN: physical device {} matches the D3D12 adapter LUID", i);
+				break;
+			}
+		}
+		if (picked < 0) picked = i; // fallback: first GPU device
+	}
+	if (picked < 0) {
+		EError("OIDN: no GPU physical device available - GPU denoiser disabled (device list is CPU-only). "
+			"AMD RDNA GPUs need the AMD HIP SDK (ROCm for Windows) or a Level Zero driver so the HIP/SYCL device is enumerated.");
+		return false;
+	}
+	p.oidnDev = oidnNewDeviceByLUID(&adapterLuid);
+	if (!p.oidnDev) p.oidnDev = oidnNewDeviceByID(picked);
+	if (!p.oidnDev) { EError("OIDN: device creation failed"); return false; }
+	oidnCommitDevice(p.oidnDev);
+	if (!OIDNCheckError(p.oidnDev, "device commit")) { shutdownOIDN(); return false; }
+	const unsigned int emt = oidnGetDeviceUInt(p.oidnDev, "externalMemoryTypes");
+	if ((emt & OIDN_EXTERNAL_MEMORY_TYPE_FLAG_D3D12_RESOURCE) == 0) {
+		EError("OIDN: device does not support D3D12 external memory import (externalMemoryTypes=0x{:X}) - GPU denoiser disabled", emt);
+		shutdownOIDN(); return false;
+	}
+
+	// Async pipeline: import a D3D12 fence as an OIDN semaphore so the GPU
+	// denoise kernels can overlap with the next frame's rendering.
+	const unsigned int est = oidnGetDeviceUInt(p.oidnDev, "externalSemaphoreTypes");
+	if (est & OIDN_EXTERNAL_SEMAPHORE_TYPE_FLAG_D3D12_FENCE) {
+		if (SUCCEEDED(p.oidnD3D12Dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&p.oidnFence)))) {
+			HANDLE fh = nullptr;
+			if (SUCCEEDED(p.oidnD3D12Dev->CreateSharedHandle(p.oidnFence, nullptr, GENERIC_ALL, nullptr, &fh))) {
+				p.oidnSem = oidnNewSharedSemaphoreFromWin32Handle(p.oidnDev, OIDN_EXTERNAL_SEMAPHORE_TYPE_FLAG_D3D12_FENCE, fh, nullptr);
+				CloseHandle(fh);
+				p.oidnAsync = (p.oidnSem != nullptr);
+			}
+		}
+	}
+	if (!p.oidnAsync) {
+		EWarn("OIDN: D3D12 fence semaphore import failed - using the blocking (Flush+WaitForIdle) pipeline");
+	}
+
+	// Shared D3D12 buffers (RGBA32F data, 256-byte aligned row pitch) + imports.
+	// OIDN only supports 32-bit float formats (FLOAT4 = 16 bytes/pixel).
+	const UInt32 rowPitch = ((w * 16) + 255u) & ~255u;
+	const size_t bytes = (size_t)rowPitch * h;
+	for (int i = 0; i < 4; ++i) {
+		D3D12_RESOURCE_DESC rd{};
+		rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		rd.Width = bytes;
+		rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+		rd.Format = DXGI_FORMAT_UNKNOWN;
+		rd.SampleDesc.Count = 1;
+		rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+		D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+		HRESULT hr = p.oidnD3D12Dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd,
+			D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&p.oidnBuf[i]));
+		if (FAILED(hr)) { EError("OIDN: failed to create shared D3D12 buffer {} (hr=0x{:08X})", i, (unsigned)hr); shutdownOIDN(); return false; }
+		HANDLE handle = nullptr;
+		hr = p.oidnD3D12Dev->CreateSharedHandle(p.oidnBuf[i], nullptr, GENERIC_ALL, nullptr, &handle);
+		if (FAILED(hr) || !handle) { EError("OIDN: CreateSharedHandle failed (hr=0x{:08X})", (unsigned)hr); shutdownOIDN(); return false; }
+		p.oidnImg[i] = oidnNewSharedBufferFromWin32Handle(p.oidnDev, OIDN_EXTERNAL_MEMORY_TYPE_FLAG_D3D12_RESOURCE,
+			handle, nullptr, bytes);
+		CloseHandle(handle); // ownership is NOT transferred to OIDN
+		if (!p.oidnImg[i]) { EError("OIDN: failed to import shared buffer {} via D3D12 external memory", i); shutdownOIDN(); return false; }
+	}
+
+	// Output texture the compose pass reads (denoised, RT resolution, RGBA32F).
+	{
+		D::TextureDesc tdd; tdd.Name = "OIDN Output"; tdd.Type = D::RESOURCE_DIM_TEX_2D;
+		tdd.Width = w; tdd.Height = h; tdd.Format = D::TEX_FORMAT_RGBA32_FLOAT;
+		tdd.BindFlags = D::BIND_SHADER_RESOURCE; tdd.Usage = D::USAGE_DEFAULT;
+		dev->CreateTexture(tdd, nullptr, &p.oidnOutTex);
+		if (p.oidnOutTex) p.oidnOutSRV = p.oidnOutTex->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
+	}
+	// Tiny scratch buffer used to force an open command list for raw copies.
+	// USAGE_DEFAULT so ctx->UpdateBuffer() works (UpdateData only accepts
+	// USAGE_DEFAULT/USAGE_SPARSE).
+	{
+		D::BufferDesc bd; bd.Name = "OIDN ListOpener"; bd.Size = 16;
+		bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DEFAULT;
+		dev->CreateBuffer(bd, nullptr, &p.oidnOpenListBuf);
+	}
+
+	// RT filter: denoise the beauty RGB using albedo + normal features. OIDN's
+	// RT filter takes 3-channel float images; our buffers are RGBA32F, so the
+	// pixel stride is 16 bytes (the alpha channel is skipped via the stride).
+	p.oidnFilter = oidnNewFilter(p.oidnDev, "RT");
+	if (!p.oidnFilter) { EError("OIDN: filter creation failed"); shutdownOIDN(); return false; }
+	oidnSetFilterImage(p.oidnFilter, "color",  p.oidnImg[0], OIDN_FORMAT_FLOAT3, w, h, 0, 16, rowPitch);
+	oidnSetFilterImage(p.oidnFilter, "albedo", p.oidnImg[1], OIDN_FORMAT_FLOAT3, w, h, 0, 16, rowPitch);
+	oidnSetFilterImage(p.oidnFilter, "normal", p.oidnImg[2], OIDN_FORMAT_FLOAT3, w, h, 0, 16, rowPitch);
+	oidnSetFilterImage(p.oidnFilter, "output", p.oidnImg[3], OIDN_FORMAT_FLOAT3, w, h, 0, 16, rowPitch);
+	oidnSetFilterBool(p.oidnFilter, "hdr", true);
+	oidnSetFilterInt(p.oidnFilter, "quality", OIDN_QUALITY_FAST); // interactive/preview mode (1.5-2x faster)
+	oidnCommitFilter(p.oidnFilter);
+	if (!OIDNCheckError(p.oidnDev, "filter commit")) { shutdownOIDN(); return false; }
+
+	// Optional second pass: denoise the alpha channel (the diffuse lighting
+	// factor in RT.a) in place, reading/writing only the 4th float of every
+	// RGBA32F pixel (byte offset 12). Skipped gracefully if unsupported.
+	p.oidnFilterAlpha = oidnNewFilter(p.oidnDev, "RT");
+	if (p.oidnFilterAlpha) {
+		oidnSetFilterImage(p.oidnFilterAlpha, "color",  p.oidnImg[0], OIDN_FORMAT_FLOAT, w, h, 12, 16, rowPitch);
+		oidnSetFilterImage(p.oidnFilterAlpha, "output", p.oidnImg[3], OIDN_FORMAT_FLOAT, w, h, 12, 16, rowPitch);
+		oidnSetFilterBool(p.oidnFilterAlpha, "hdr", true);
+		oidnSetFilterInt(p.oidnFilterAlpha, "quality", OIDN_QUALITY_FAST);
+		oidnCommitFilter(p.oidnFilterAlpha);
+		if (!OIDNCheckError(p.oidnDev, "alpha filter commit")) {
+			EWarn("OIDN: alpha-channel pass unsupported - the diffuse lighting factor stays as-is, only reflections are denoised");
+			oidnReleaseFilter(p.oidnFilterAlpha);
+			p.oidnFilterAlpha = nullptr;
+		}
+	}
+
+	p.oidnReady = true;
+	EInfo("OIDN GPU denoiser ready: {}x{} zero-copy D3D12 shared memory (all-GPU, no CPU).", w, h);
+	return true;
+}
+
+void RayTracingSubsystem::oidnDenoise(void* rtSRV, void* albedoSRV, void* normalSRV, UInt32 w, UInt32 h) {
+	auto& p = *m_impl;
+	if (!p.oidnReady) return;
+	auto* ctx = p.ctx(); if (!ctx) return;
+	if (p.oidnW != w || p.oidnH != h) {
+		if (!tryInitOIDN(w, h)) return; // RT resolution switched -> recreate the shared setup
+	}
+
+	D::IDeviceContextD3D12* ctxD3D = nullptr;
+	ctx->QueryInterface(D::IID_DeviceContextD3D12, reinterpret_cast<D::IObject**>(&ctxD3D));
+	if (!ctxD3D) {
+		EError("OIDN: renderer context is not D3D12"); return;
+	}
+	auto* rtView = static_cast<D::ITextureView*>(rtSRV);
+	auto* alView = static_cast<D::ITextureView*>(albedoSRV);
+	auto* nmView = static_cast<D::ITextureView*>(normalSRV);
+	if (!rtView || !alView || !nmView) return;
+	D::ITexture* texs[3] = { rtView->GetTexture(), alView->GetTexture(), nmView->GetTexture() };
+
+	const UInt32 rowPitch = ((w * 16) + 255u) & ~255u;
+	const D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{ 0, { DXGI_FORMAT_R32G32B32A32_FLOAT, w, h, 1, rowPitch } };
+
+	const auto rawBarrier = [](ID3D12GraphicsCommandList* cmd, ID3D12Resource* res, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+		D3D12_RESOURCE_BARRIER b{};
+		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.pResource = res;
+		b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		b.Transition.StateBefore = before;
+		b.Transition.StateAfter = after;
+		cmd->ResourceBarrier(1, &b);
+	};
+	const auto openList = [&](ID3D12GraphicsCommandList*& cmd) {
+		if (p.oidnOpenListBuf) {
+			const UInt32 dummy = 0;
+			ctx->UpdateBuffer(p.oidnOpenListBuf, 0, sizeof(dummy), &dummy, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		}
+		cmd = ctxD3D->GetD3D12CommandList();
+		return cmd != nullptr;
+	};
+	const auto queueFence = [&](bool wait, UInt64 v) {
+		auto* q = ctx->LockCommandQueue();
+		if (q) {
+			D::ICommandQueueD3D12* qd3d = nullptr;
+			q->QueryInterface(D::IID_CommandQueueD3D12, reinterpret_cast<D::IObject**>(&qd3d));
+			if (qd3d) {
+				if (wait) qd3d->WaitFence(p.oidnFence, v);
+				else      qd3d->EnqueueSignal(p.oidnFence, v);
+			}
+		}
+		ctx->UnlockCommandQueue();
+	};
+
+	// Input textures -> COPY_SOURCE: raw barriers (querying the current tracked
+	// state), restored afterwards with SetD3D12ResourceState so we never depend
+	// on Diligent's deferred barrier recording for the raw copies.
+	D::ITextureD3D12* inD3D[3] = {};
+	D3D12_RESOURCE_STATES inState[3] = {};
+	for (int i = 0; i < 3; ++i) {
+		texs[i]->QueryInterface(D::IID_TextureD3D12, reinterpret_cast<D::IObject**>(&inD3D[i]));
+		if (!inD3D[i]) { EError("OIDN: input texture is not D3D12"); return; }
+		inState[i] = inD3D[i]->GetD3D12ResourceState();
+	}
+
+	if (p.oidnAsync && !p.oidnSyncOverride) {
+		// ------------------------------------------------------------------
+		// Async pipeline (1-frame latency, no host stalls): submit the frame's
+		// rendering first so it overlaps with the previous OIDN run, then copy
+		// into the shared buffers, signal a D3D12 fence and launch the OIDN
+		// kernels asynchronously; the result is published (copied into
+		// oidnOutTex) at the START of the next frame after the queue waits on
+		// the fence.
+		// ------------------------------------------------------------------
+		ctx->Flush(); // submit the G-buffer/resolve/trace work of this frame
+		queueFence(true, p.oidnWaitValue); // wait for the previous OIDN to finish
+
+		ID3D12GraphicsCommandList* cmd = nullptr;
+		if (!openList(cmd)) { EError("OIDN: no open D3D12 command list (async)"); return; }
+
+		// Output copy: publish the previous OIDN result into the compose texture.
+		if (p.oidnHasOutput && p.oidnOutTex) {
+			D::ITextureD3D12* outD3D = nullptr;
+			p.oidnOutTex->QueryInterface(D::IID_TextureD3D12, reinterpret_cast<D::IObject**>(&outD3D));
+			if (!outD3D) { EError("OIDN: output texture is not D3D12"); return; }
+			const D3D12_RESOURCE_STATES outState = outD3D->GetD3D12ResourceState();
+			if (outState != D3D12_RESOURCE_STATE_COPY_DEST) {
+				rawBarrier(cmd, outD3D->GetD3D12Texture(), outState, D3D12_RESOURCE_STATE_COPY_DEST);
+				outD3D->SetD3D12ResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+			}
+			rawBarrier(cmd, p.oidnBuf[3], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			{
+				D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = p.oidnBuf[3]; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = fp;
+				D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = outD3D->GetD3D12Texture(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
+				cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+			}
+			rawBarrier(cmd, p.oidnBuf[3], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+			if (outState != D3D12_RESOURCE_STATE_COPY_DEST) {
+				rawBarrier(cmd, outD3D->GetD3D12Texture(), D3D12_RESOURCE_STATE_COPY_DEST, outState);
+				outD3D->SetD3D12ResourceState(outState);
+			}
+		}
+
+		// Input copies: this frame's RT output into the shared buffers.
+		for (int i = 0; i < 3; ++i) {
+			if (inState[i] != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+				rawBarrier(cmd, inD3D[i]->GetD3D12Texture(), inState[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
+				inD3D[i]->SetD3D12ResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+			}
+		}
+		{
+			D3D12_RESOURCE_BARRIER bs[3] = {};
+			for (int i = 0; i < 3; ++i) {
+				bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				bs[i].Transition.pResource = p.oidnBuf[i];
+				bs[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+				bs[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+				bs[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+			}
+			cmd->ResourceBarrier(3, bs);
+		}
+		for (int i = 0; i < 3; ++i) {
+			D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = inD3D[i]->GetD3D12Texture(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+			D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = p.oidnBuf[i]; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fp;
+			cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+		}
+		{
+			D3D12_RESOURCE_BARRIER bs[3] = {};
+			for (int i = 0; i < 3; ++i) {
+				bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				bs[i].Transition.pResource = p.oidnBuf[i];
+				bs[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+				bs[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+				bs[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+			}
+			cmd->ResourceBarrier(3, bs);
+		}
+		for (int i = 0; i < 3; ++i) {
+			if (inState[i] != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+				rawBarrier(cmd, inD3D[i]->GetD3D12Texture(), D3D12_RESOURCE_STATE_COPY_SOURCE, inState[i]);
+				inD3D[i]->SetD3D12ResourceState(inState[i]);
+			}
+		}
+
+		// Submit the copies, then signal the fence and launch OIDN async.
+		ctx->Flush();
+		const UInt64 inV = ++p.oidnNextValue;
+		const UInt64 outV = ++p.oidnNextValue;
+		queueFence(false, inV); // the queue signals after the copies
+		oidnWaitSemaphoresAsync(p.oidnDev, &p.oidnSem, &inV, nullptr, 1); // OIDN waits for the copies
+		oidnExecuteFilterAsync(p.oidnFilter);
+		if (p.oidnFilterAlpha) oidnExecuteFilterAsync(p.oidnFilterAlpha);
+		oidnSignalSemaphoresAsync(p.oidnDev, &p.oidnSem, &outV, 1); // OIDN signals when done
+		p.oidnWaitValue = outV;
+		p.oidnHasOutput = true;
+		return;
+	}
+
+	// ------------------------------------------------------------------
+	// Blocking pipeline (fallback when external semaphores are unavailable):
+	// input copies -> Flush + WaitForIdle -> OIDN execute -> output copy.
+	// ------------------------------------------------------------------
+	ID3D12GraphicsCommandList* cmd = nullptr;
+	if (!openList(cmd)) { EError("OIDN: no open D3D12 command list for the input copies"); return; }
+
+	for (int i = 0; i < 3; ++i) {
+		if (inState[i] != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+			rawBarrier(cmd, inD3D[i]->GetD3D12Texture(), inState[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
+			inD3D[i]->SetD3D12ResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+		}
+	}
+	{
+		D3D12_RESOURCE_BARRIER bs[3] = {};
+		for (int i = 0; i < 3; ++i) {
+			bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			bs[i].Transition.pResource = p.oidnBuf[i];
+			bs[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			bs[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+			bs[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+		}
+		cmd->ResourceBarrier(3, bs);
+	}
+	for (int i = 0; i < 3; ++i) {
+		D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = inD3D[i]->GetD3D12Texture(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+		D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = p.oidnBuf[i]; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fp;
+		cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+	}
+	{
+		D3D12_RESOURCE_BARRIER bs[3] = {};
+		for (int i = 0; i < 3; ++i) {
+			bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			bs[i].Transition.pResource = p.oidnBuf[i];
+			bs[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			bs[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+			bs[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+		}
+		cmd->ResourceBarrier(3, bs);
+	}
+	for (int i = 0; i < 3; ++i) {
+		if (inState[i] != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+			rawBarrier(cmd, inD3D[i]->GetD3D12Texture(), D3D12_RESOURCE_STATE_COPY_SOURCE, inState[i]);
+			inD3D[i]->SetD3D12ResourceState(inState[i]);
+		}
+	}
+	// Submit and wait (host-blocking; OIDN must not read while copies are queued).
+	ctx->Flush();
+	ctx->WaitForIdle();
+
+	oidnExecuteFilter(p.oidnFilter);
+	if (!OIDNCheckError(p.oidnDev, "execute")) return;
+	if (p.oidnFilterAlpha) {
+		oidnExecuteFilter(p.oidnFilterAlpha);
+		if (!OIDNCheckError(p.oidnDev, "alpha execute")) return;
+	}
+
+	if (!openList(cmd) || !p.oidnOutTex) { EError("OIDN: no open D3D12 command list for the output copy"); return; }
+	D::ITextureD3D12* outD3D = nullptr;
+	p.oidnOutTex->QueryInterface(D::IID_TextureD3D12, reinterpret_cast<D::IObject**>(&outD3D));
+	if (!outD3D) { EError("OIDN: output texture is not D3D12"); return; }
+	const D3D12_RESOURCE_STATES outState = outD3D->GetD3D12ResourceState();
+	if (outState != D3D12_RESOURCE_STATE_COPY_DEST) {
+		rawBarrier(cmd, outD3D->GetD3D12Texture(), outState, D3D12_RESOURCE_STATE_COPY_DEST);
+		outD3D->SetD3D12ResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+	}
+	rawBarrier(cmd, p.oidnBuf[3], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+	{
+		D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = p.oidnBuf[3]; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = fp;
+		D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = outD3D->GetD3D12Texture(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
+		cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+	}
+	rawBarrier(cmd, p.oidnBuf[3], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+	if (outState != D3D12_RESOURCE_STATE_COPY_DEST) {
+		rawBarrier(cmd, outD3D->GetD3D12Texture(), D3D12_RESOURCE_STATE_COPY_DEST, outState);
+		outD3D->SetD3D12ResourceState(outState);
+	}
+	// The command list is left open; the compose pass later in this frame reads
+	// oidnOutTex on the same queue, so the ordering is guaranteed.
+	p.oidnHasOutput = true;
+}
+
+Result<void, RenderError> RayTracingSubsystem::denoise(void* rtSRV, void* gBufferAlbedoSRV, void* gBufferNormalSRV, void* gBufferDepthSRV,
 	const Mat4& viewProjInv, const Mat4& viewProj, UInt32 width, UInt32 height) {
 	auto& p = *m_impl;
 	auto* ctx = p.ctx(); if (!ctx) return RenderError::NotInitialized;
 	auto* dev = p.device(); if (!dev) return RenderError::NotInitialized;
-	if (!p.ok || !p.denoisePSO || !p.denoiseSRB) return RenderError::OperationFailed;
-	if (!rtSRV || !gBufferNormalSRV || !gBufferDepthSRV) return RenderError::InvalidArgument;
+	if (!p.ok) return RenderError::OperationFailed;
+	if (!rtSRV || !gBufferAlbedoSRV || !gBufferNormalSRV || !gBufferDepthSRV || width == 0 || height == 0) return RenderError::InvalidArgument;
+
+	// Open Image Denoise GPU path (all-GPU, zero-copy). Initialization is
+	// attempted once; on failure the temporal+spatial compute filter below is used.
+	if (!p.oidnReady && !p.oidnAttempted) {
+		p.oidnAttempted = true;
+		tryInitOIDN(width, height);
+	}
+	if (p.oidnReady) {
+		oidnDenoise(rtSRV, gBufferAlbedoSRV, gBufferNormalSRV, width, height);
+		return {};
+	}
+
+	// ---- Temporal + spatial (SVGF-lite) fallback ----
+	if (!p.denoisePSO || !p.denoiseSRB) return RenderError::OperationFailed;
 
 	// (Re)create the ping-pong buffers when the RT resolution changed.
 	auto* rtView = static_cast<D::ITextureView*>(rtSRV);
@@ -1376,11 +1872,24 @@ Result<void, RenderError> RayTracingSubsystem::denoise(void* rtSRV, void* gBuffe
 
 void* RayTracingSubsystem::getDenoisedSRV() const {
 	auto& p = *m_impl;
+	// Only expose the OIDN output once the first result exists (the first frame
+	// has nothing denoised yet); the caller then falls back to the raw RT tex.
+	if (p.oidnReady && p.oidnOutSRV && p.oidnHasOutput) return p.oidnOutSRV.RawPtr();
 	return p.ok && p.denoiseSRV[p.denoiseFlip] ? p.denoiseSRV[p.denoiseFlip].RawPtr() : nullptr;
+}
+
+bool RayTracingSubsystem::oidnActive() const {
+	return m_impl->oidnReady;
 }
 
 void RayTracingSubsystem::setDenoiseStrength(F32 historyWeight) {
 	m_impl->denoiseHistoryWeight = glm::clamp(historyWeight, 0.0f, 1.0f);
+}
+
+void RayTracingSubsystem::setOIDNAsync(bool enable) {
+	// Only meaningful when the async pipeline is available; the blocking
+	// pipeline is always used as the fallback anyway.
+	m_impl->oidnSyncOverride = !enable;
 }
 
 // ===================================================================
@@ -1592,6 +2101,7 @@ Result<void, CoreError> RayTracingSubsystem::onInitialize() {
 
 void RayTracingSubsystem::onShutdown() {
 	auto& p = *m_impl;
+	shutdownOIDN();
 	p.rtPSO.Release(); p.rtSRB.Release(); p.constantsBuf.Release();
 	p.traceQuery.Release(); p.traceQueryEnded = false;
 	p.composePSO.Release(); p.composeSRB.Release(); p.composeCB.Release();

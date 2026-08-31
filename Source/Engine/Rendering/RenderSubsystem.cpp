@@ -627,9 +627,17 @@ struct RenderSubsystem::RenderBackend {
 		if (tryD3D12) {
 			auto* f = D::GetEngineFactoryD3D12();
 			if (f) {
+				// Debug builds enable the D3D12 validation layer so raw
+				// interop commands (e.g. the OIDN zero-copy copies) report the
+				// exact validation error instead of a generic close failure.
+#ifdef EE_DEBUG
+				const D::VALIDATION_LEVEL vlevel = D::VALIDATION_LEVEL_1;
+#else
+				const D::VALIDATION_LEVEL vlevel = D::VALIDATION_LEVEL_DISABLED;
+#endif
 				// First attempt requests the ray tracing feature (if enabled).
 				{
-					D::EngineD3D12CreateInfo ci; ci.SetValidationLevel(D::VALIDATION_LEVEL_DISABLED);
+					D::EngineD3D12CreateInfo ci; ci.SetValidationLevel(vlevel);
 					if (requestRayTracing) ci.Features.RayTracing = D::DEVICE_FEATURE_STATE_ENABLED;
 					f->CreateDeviceAndContextsD3D12(ci, &device, &ctx);
 				}
@@ -638,7 +646,7 @@ struct RenderSubsystem::RenderBackend {
 				if (!device && requestRayTracing) {
 					EWarn("D3D12 device creation with ray tracing failed; retrying without ray tracing.");
 					device.Release(); ctx.Release();
-					D::EngineD3D12CreateInfo ci; ci.SetValidationLevel(D::VALIDATION_LEVEL_DISABLED);
+					D::EngineD3D12CreateInfo ci; ci.SetValidationLevel(vlevel);
 					f->CreateDeviceAndContextsD3D12(ci, &device, &ctx);
 				}
 				if (device) { f->CreateSwapChainD3D12(device, ctx, scd, D::FullScreenModeDesc{}, D::NativeWindow{ hwnd }, &sc); factory = f; backendType = RenderBackendType::D3D12; }

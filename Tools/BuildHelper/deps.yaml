@@ -258,3 +258,12 @@ dependencies:
     target: Backends/SteamAudio
     layout:
       - {configs: ["*"], from: ".", to: ".", source: stage}
+
+  - name: OpenImageDenoise
+    kind: archive
+    url: https://github.com/RenderKit/oidn/releases/download/v2.5.1/oidn-2.5.1.x64.windows.zip
+    archiveFile: oidn-2.5.1.x64.windows.zip
+    build: none
+    target: ThirdParty/oidn
+    layout:
+      - {configs: ["*"], from: ".", to: ".", source: stage}
