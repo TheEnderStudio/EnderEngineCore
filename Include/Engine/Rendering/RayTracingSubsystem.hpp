@@ -187,6 +187,10 @@ public:
 	///        denoise serialized with rendering). Ignored when OIDN is off.
 	void setOIDNAsync(bool enable);
 
+	/// @brief Force the temporal + spatial (SVGF-lite) path even when the OIDN
+	///        GPU device is available (used by the DebugUI denoiser switcher).
+	void setForceTemporal(bool force);
+
 	/**
 	 * @brief Compose G-buffer + ray traced results over the scene.
 	 *

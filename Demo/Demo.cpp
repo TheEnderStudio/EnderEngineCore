@@ -1,4 +1,4 @@
-#include <Engine/Core/Core.hpp>
+﻿#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -20,6 +20,7 @@
 #include <Engine/Rendering/ShadowSubsystem.hpp>
 #include <Engine/Rendering/ComputeSubsystem.hpp>
 #include <Engine/Rendering/RayTracingSubsystem.hpp>
+#include <Engine/Rendering/DenoisingSubsystem.hpp>
 
 #include <HelloWorld/HelloWorldExt.hpp>
 #include <EngineExt/AdaptiveMusic.hpp>
@@ -334,6 +335,9 @@ float4 main(PSIn i) : SV_TARGET {
 	// --- Ray tracing (hybrid, M3) ---
 	RayTracingSubsystem rayTracing;
 	rayTracing.attachToRenderer(&renderer);
+	// --- NRD denoiser (REBLUR, GPU compute) ---
+	DenoisingSubsystem denoising;
+	denoising.attachToRenderer(&renderer);
 	bool hybridRT = false; // F9 toggles between rasterization and hybrid ray tracing
 	UInt32 rtDrawMode = 0; // compose debug mode (0=shaded ... 5=Fresnel)
 	UInt32 rtShadowPCF = 4; // PCF shadow samples (1..16)
@@ -346,6 +350,7 @@ float4 main(PSIn i) : SV_TARGET {
 	bool rtDenoise = true;       // temporal + spatial denoiser (SVGF-lite) / OIDN GPU path
 	F32 rtDenoiseStrength = 0.9f; // temporal history weight (0 = off, 1 = full history)
 	bool rtOIDNAsync = true;     // OIDN async pipeline (1-frame latency) vs sync (0 latency)
+	int  rtDenoiserSel = 0;      // 0 = Auto, 1 = NRD, 2 = OIDN, 3 = Temporal
 	UInt32 rtReflectionSamples = 4; // GGX reflection rays per pixel (1..8)
 	float rtResScale = 0.5f; // RT resolution scale (0.5 / 1.0)
 	bool rtResAuto = true;   // auto-pick the scale from the distance to the nearest object
@@ -415,6 +420,8 @@ float4 main(PSIn i) : SV_TARGET {
 		if (renderer.supportsInlineRayTracing()) {
 			auto r = rayTracing.initialize();
 			if (r.isErr()) { EError("RayTracing init failed: {}", ToString(r.error())); }
+			auto dr = denoising.initialize();
+			if (dr.isErr()) { EError("Denoising init failed: {}", ToString(dr.error())); }
 		}
 		else {
 			EInfo("Hybrid ray tracing disabled: device does not support inline ray tracing.");
@@ -890,15 +897,26 @@ HALT
 			if (debugUI.button(fmt::format("RT Denoise: {}", rtDenoise ? "On" : "Off").c_str())) {
 				rtDenoise = !rtDenoise;
 			}
-			if (rayTracing.oidnActive()) {
-				if (debugUI.button(fmt::format("OIDN Async: {}", rtOIDNAsync ? "On" : "Off").c_str())) {
-					rtOIDNAsync = !rtOIDNAsync;
-					rayTracing.setOIDNAsync(rtOIDNAsync);
+			{
+				static const char* denoiserNames[] = { "Auto", "NRD", "OIDN", "Temporal" };
+				if (debugUI.button(fmt::format("Denoiser: {}", denoiserNames[rtDenoiserSel]).c_str())) {
+					rtDenoiserSel = (rtDenoiserSel + 1) % 4;
 				}
-				debugUI.text("Denoiser: OIDN (GPU, zero-copy)");
-			}
-			else {
-				debugUI.text("Denoiser: temporal + spatial");
+				const bool activeNRD = denoising.isReady() && (rtDenoiserSel == 0 || rtDenoiserSel == 1);
+				const bool activeOIDN = !activeNRD && rayTracing.oidnActive() && rtDenoiserSel != 3;
+				if (activeNRD) {
+					debugUI.text("Active: NRD (REBLUR)");
+				}
+				else if (activeOIDN) {
+					if (debugUI.button(fmt::format("OIDN Async: {}", rtOIDNAsync ? "On" : "Off").c_str())) {
+						rtOIDNAsync = !rtOIDNAsync;
+						rayTracing.setOIDNAsync(rtOIDNAsync);
+					}
+					debugUI.text("Active: OIDN (GPU, zero-copy)");
+				}
+				else {
+					debugUI.text("Active: temporal + spatial");
+				}
 			}
 			if (debugUI.sliderFloat("Denoise Strength", &rtDenoiseStrength, 0.0f, 1.0f)) {}
 		}
@@ -1447,19 +1465,34 @@ HALT
 				}
 			}
 
-			// Denoise: Open Image Denoise GPU path (if available) or temporal+spatial (SVGF-lite).
-			// The albedo/normal are the RT-resolution buffers written by trace().
+			// Denoise: NRD (REBLUR) -> OIDN GPU -> temporal+spatial, switchable
+			// from the DebugUI ("Denoiser" button: Auto / NRD / OIDN / Temporal).
 			void* rtComposeSRV = renderer.getTextureSRV(rtTex);
 			if (rtDenoise) {
-				rayTracing.setDenoiseStrength(rtDenoiseStrength);
-				auto dr = rayTracing.denoise(renderer.getTextureSRV(rtTex), renderer.getTextureSRV(rtAlbedo),
-					renderer.getTextureSRV(rtNormal),
-					renderer.getTextureSRV(rtDepthSrc), vpInv, vp, rtw, rth);
-				if (dr.isErr()) {
-					static bool denoiseWarned = false;
-					if (!denoiseWarned) { EError("RT denoise failed: {}", ToString(dr.error())); denoiseWarned = true; }
+				bool nrdUsed = false;
+				const bool wantNRD = (rtDenoiserSel == 0 || rtDenoiserSel == 1) && denoising.isReady();
+				if (wantNRD) {
+					denoising.setStrength(rtDenoiseStrength);
+					auto dr = denoising.denoise(renderer.getTextureSRV(rtTex), renderer.getTextureSRV(rtNormal),
+						renderer.getTextureSRV(rtDepthSrc), view, proj, rtw, rth);
+					if (dr.isErr()) {
+						static bool nrdWarned = false;
+						if (!nrdWarned) { EError("NRD denoise failed: {}", ToString(dr.error())); nrdWarned = true; }
+					}
+					if (auto* ds = denoising.getDenoisedSRV()) { rtComposeSRV = ds; nrdUsed = true; }
 				}
-				if (auto* ds = rayTracing.getDenoisedSRV()) rtComposeSRV = ds;
+				if (!nrdUsed) {
+					rayTracing.setForceTemporal(rtDenoiserSel == 3);
+					rayTracing.setDenoiseStrength(rtDenoiseStrength);
+					auto dr = rayTracing.denoise(renderer.getTextureSRV(rtTex), renderer.getTextureSRV(rtAlbedo),
+						renderer.getTextureSRV(rtNormal),
+						renderer.getTextureSRV(rtDepthSrc), vpInv, vp, rtw, rth);
+					if (dr.isErr()) {
+						static bool denoiseWarned = false;
+						if (!denoiseWarned) { EError("RT denoise failed: {}", ToString(dr.error())); denoiseWarned = true; }
+					}
+					if (auto* ds = rayTracing.getDenoisedSRV()) rtComposeSRV = ds;
+				}
 			}
 
 			// HDR pass: skybox + compose.
@@ -1505,6 +1538,7 @@ HALT
 
 	audio.shutdown();
 	rayTracing.shutdown();
+	denoising.shutdown();
 	renderer.shutdown();
 	postProcess.shutdown();
 	debugUI.shutdown();

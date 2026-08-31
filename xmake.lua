@@ -39,6 +39,8 @@ add_includedirs("ThirdParty/libspng/include")
 add_includedirs("ThirdParty/FreeType/include/freetype2")
 add_includedirs("ThirdParty/EnderVFiles/include")
 add_includedirs("ThirdParty/oidn/include")
+add_includedirs("ThirdParty/nrd/Include")
+add_includedirs("ThirdParty/nrd/NRDShaders")
 add_includedirs("Backends/SteamAudio/include")
 add_includedirs("Backends/DiligentEngine/include")
 add_includedirs("Backends/DiligentEngine/include/DiligentTools/Imgui/interface")
@@ -96,6 +98,7 @@ if is_mode("debug") then
 	add_linkdirs("ThirdParty/FreeType/lib")
 	add_linkdirs("ThirdParty/EnderVFiles/bin")
 	add_linkdirs("ThirdParty/oidn/lib")
+	add_linkdirs("ThirdParty/nrd/Lib/Debug")
 else
 	add_linkdirs("ThirdParty/spdlog/lib")
 	add_linkdirs("ThirdParty/glfw/lib-vc2022")
@@ -111,6 +114,7 @@ else
 	add_linkdirs("ThirdParty/FreeType/lib")
 	add_linkdirs("ThirdParty/EnderVFiles/bin")
 	add_linkdirs("ThirdParty/oidn/lib")
+	add_linkdirs("ThirdParty/nrd/Lib/Release")
 end
 
 -- ---------------------------------------------------------------------------
@@ -130,6 +134,11 @@ target("EnderEngineCore")
 	add_files("Source/Engine/**/*.cpp")
 	add_files("Source/Engine/**/*.c")
 	add_headerfiles("Source/Engine/**/*.hpp")
+
+	-- DLL properties (.rc, Windows only)
+	if is_plat("windows") then
+		add_files("Source/Engine/Core/Version.rc")
+	end
 
 	-- Macros
 	add_defines("EE_PHYSICS_BACKEND_PHYSX5")
@@ -177,6 +186,7 @@ target("EnderEngineCore")
 		add_links("EnderVFiles")
 		add_links("OpenImageDenoise")
 		add_links("OpenImageDenoise_core")
+		add_links("NRD")
 	else
 		add_links("spdlog")
 		add_links("glfw3dll")
@@ -217,6 +227,7 @@ target("EnderEngineCore")
 		add_links("EnderVFiles")
 		add_links("OpenImageDenoise")
 		add_links("OpenImageDenoise_core")
+		add_links("NRD")
 	end
 target_end()
 
@@ -293,6 +304,17 @@ target("Demo")
 			if os.isdir(oidnBin) then
 				os.cp(oidnBin .. "/*.dll", target:targetdir())
 			end
+			if is_mode("debug") then
+				local nrdBin = "ThirdParty/nrd/Lib/Debug"
+				if os.isdir(nrdBin) then
+					os.cp(nrdBin .. "/NRD.dll", target:targetdir())
+				end
+			else
+				local nrdBin = "ThirdParty/nrd/Lib/Release"
+				if os.isdir(nrdBin) then
+					os.cp(nrdBin .. "/NRD.dll", target:targetdir())
+				end
+			end
 		end
 	end)
 
@@ -351,5 +373,19 @@ target("ResourcePacker")
 	add_includedirs("ThirdParty/EnderVFiles/include")
 	add_linkdirs("ThirdParty/EnderVFiles/bin")
 	add_links("EnderVFiles")
+
+target_end()
+
+-- ---------------------------------------------------------------------------
+-- dxcreflect (Offline tool: reflect DXBC/DXIL shader containers via DXC's
+-- IDxcContainerReflection - used by Tools/nrd/nrd_compile_shaders.ps1 to
+-- generate the per-shader resource name tables for the NRD subsystem)
+-- ---------------------------------------------------------------------------
+target("dxcreflect")
+	set_kind("binary")
+	add_files("Tools/nrd/dxcreflect/*.cpp")
+	if is_plat("windows") then
+		add_syslinks("kernel32", "dxguid")
+	end
 
 target_end()

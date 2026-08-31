@@ -30,8 +30,10 @@
 	ClassName() = default; \
 	~ClassName() = default;
 
-#define EE_STRINGFY(str) #str
-#define EE_CONCAT(a, b) a##b
+#define EE_STRINGFY_(str) #str
+#define EE_STRINGFY(str) EE_STRINGFY_(str)
+#define EE_CONCAT_(a, b) a##b
+#define EE_CONCAT(a, b) EE_CONCAT_(a, b)
 
 #define EE_UNUSED(a) (void)(a)
 
@@ -80,6 +82,6 @@
 #define EE_NAMESPACE_PHYSICS_END }
 
 #define EE_VERSION_MAJOR 0
-#define EE_VERSION_MINOR 1
+#define EE_VERSION_MINOR 2
 #define EE_VERSION_PATCH 1
-#define EE_VERSION_GUID  "4BDED345-8915-459A-A151-01810E820BF2"
+#define EE_VERSION_GUID  "D80B8929-6762-472F-BE33-617A6ABBB707"

@@ -843,6 +843,8 @@ struct RayTracingSubsystem::Impl {
 	// device lacks external semaphore support.
 	bool  oidnAsync = false;
 	bool  oidnSyncOverride = false;      ///< UI toggle: force the blocking (0-latency) pipeline even when async is available.
+	bool  oidnDisabled = false;          ///< UI toggle: force the temporal+spatial path even when OIDN is available.
+	bool  lastWasOIDN = false;           ///< The last denoise() ran the OIDN path (getDenoisedSRV must match).
 	ID3D12Fence* oidnFence = nullptr;
 	OIDNSemaphore oidnSem = nullptr;
 	UInt64 oidnNextValue = 0;          ///< Next monotonic fence value.
@@ -1808,10 +1810,12 @@ Result<void, RenderError> RayTracingSubsystem::denoise(void* rtSRV, void* gBuffe
 		p.oidnAttempted = true;
 		tryInitOIDN(width, height);
 	}
-	if (p.oidnReady) {
+	if (p.oidnReady && !p.oidnDisabled) {
+		p.lastWasOIDN = true;
 		oidnDenoise(rtSRV, gBufferAlbedoSRV, gBufferNormalSRV, width, height);
 		return {};
 	}
+	p.lastWasOIDN = false;
 
 	// ---- Temporal + spatial (SVGF-lite) fallback ----
 	if (!p.denoisePSO || !p.denoiseSRB) return RenderError::OperationFailed;
@@ -1873,8 +1877,9 @@ Result<void, RenderError> RayTracingSubsystem::denoise(void* rtSRV, void* gBuffe
 void* RayTracingSubsystem::getDenoisedSRV() const {
 	auto& p = *m_impl;
 	// Only expose the OIDN output once the first result exists (the first frame
-	// has nothing denoised yet); the caller then falls back to the raw RT tex.
-	if (p.oidnReady && p.oidnOutSRV && p.oidnHasOutput) return p.oidnOutSRV.RawPtr();
+	// has nothing denoised yet) and only while the OIDN path is actually active;
+	// the caller then falls back to the raw RT tex.
+	if (p.oidnReady && !p.oidnDisabled && p.lastWasOIDN && p.oidnOutSRV && p.oidnHasOutput) return p.oidnOutSRV.RawPtr();
 	return p.ok && p.denoiseSRV[p.denoiseFlip] ? p.denoiseSRV[p.denoiseFlip].RawPtr() : nullptr;
 }
 
@@ -1890,6 +1895,10 @@ void RayTracingSubsystem::setOIDNAsync(bool enable) {
 	// Only meaningful when the async pipeline is available; the blocking
 	// pipeline is always used as the fallback anyway.
 	m_impl->oidnSyncOverride = !enable;
+}
+
+void RayTracingSubsystem::setForceTemporal(bool force) {
+	m_impl->oidnDisabled = force;
 }
 
 // ===================================================================
