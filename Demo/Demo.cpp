@@ -1,4 +1,4 @@
-﻿#include <Engine/Core/Core.hpp>
+#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -21,6 +21,7 @@
 #include <Engine/Rendering/ComputeSubsystem.hpp>
 #include <Engine/Rendering/RayTracingSubsystem.hpp>
 #include <Engine/Rendering/DenoisingSubsystem.hpp>
+#include <Engine/Rendering/MeshShaderSubsystem.hpp>
 
 #include <HelloWorld/HelloWorldExt.hpp>
 #include <EngineExt/AdaptiveMusic.hpp>
@@ -55,7 +56,7 @@ using namespace EnderEngine::Extensions::AdaptiveMusic;
 struct FlyCamera {
 	Vec3 pos = Vec3(0, 3, 4);
 	F32 yaw = -90.0f, pitch = -15.0f;
-	F32 moveSpeed = 6.0f, lookSpeed = 0.15f;
+	F32 moveSpeed = 10.0f, lookSpeed = 0.15f;
 	bool boundToBody = true;   // F5 toggles between bound / free-fly
 	Vec3 freePos = Vec3(0, 2, 4);
 
@@ -338,6 +339,9 @@ float4 main(PSIn i) : SV_TARGET {
 	// --- NRD denoiser (REBLUR, GPU compute) ---
 	DenoisingSubsystem denoising;
 	denoising.attachToRenderer(&renderer);
+	// --- Mesh shader (GPU-driven amplification + mesh pipeline, LOD) ---
+	MeshShaderSubsystem meshShader;
+	meshShader.attachToRenderer(&renderer);
 	bool hybridRT = false; // F9 toggles between rasterization and hybrid ray tracing
 	UInt32 rtDrawMode = 0; // compose debug mode (0=shaded ... 5=Fresnel)
 	UInt32 rtShadowPCF = 4; // PCF shadow samples (1..16)
@@ -351,6 +355,29 @@ float4 main(PSIn i) : SV_TARGET {
 	F32 rtDenoiseStrength = 0.9f; // temporal history weight (0 = off, 1 = full history)
 	bool rtOIDNAsync = true;     // OIDN async pipeline (1-frame latency) vs sync (0 latency)
 	int  rtDenoiserSel = 0;      // 0 = Auto, 1 = NRD, 2 = OIDN, 3 = Temporal
+	bool msTestGrid = false;     // M1 mesh shader test grid (GPU-driven AS/MS pipeline)
+	bool msFrustumCull = true;   // toggle frustum culling in the test amplification shader
+	bool msFurinaScene = false;  // M2: draw the 1000 Furina bodies through the mesh shader path
+	bool msMeshesRegistered = false;
+	// Index ranges into the registered mesh list, one per scene object type.
+	UInt32 msTerrIdx = 0, msTerrCount = 0, msWallIdx = 0, msWallCount = 0;
+	UInt32 msCubeIdx = 0, msCubeCount = 0, msFurinaIdx = 0, msFurinaCount = 0;
+	UInt32 msMeshCount = 0, msGroupCount = 0;
+	Vector<MeshHandle> msRegisteredMeshes;
+	// Appends one instanced draw group for a mesh range (no-op when empty).
+	auto msAddGroup = [&](Vector<MeshShaderSubsystem::MeshDrawGroup>& groups, UInt32 idx, UInt32 count, Vector<Mat4> instances) {
+		if (count == 0 || instances.empty()) return;
+		MeshShaderSubsystem::MeshDrawGroup g;
+		g.meshIds.resize(count);
+		for (UInt32 i = 0; i < count; ++i) g.meshIds[i] = idx + i;
+		g.instanceMatrices = std::move(instances);
+		groups.push_back(std::move(g));
+	};
+	F32  msLodScale = 4.0f;      // M3: LOD selection threshold, in pixels of projected error
+	F32  msInstBudget = 16.0f;   // debug: instance cap for the mesh shader scene (start small - opening at 1000 TDRs the GPU)
+	F32  msClusterBudget = 16384.0f; // hard cap on cluster mesh groups dispatched per frame
+	int  msDebugTri = 0;         // MS diagnostic: 0 = off, 1 = fixed triangle, 2 = albedo only
+	int  msMeshFilter = 5;       // MS diagnostic: 0..4 = only that mesh, >4 = all
 	UInt32 rtReflectionSamples = 4; // GGX reflection rays per pixel (1..8)
 	float rtResScale = 0.5f; // RT resolution scale (0.5 / 1.0)
 	bool rtResAuto = true;   // auto-pick the scale from the distance to the nearest object
@@ -376,7 +403,7 @@ float4 main(PSIn i) : SV_TARGET {
 		if (auto r = renderer.createTexture(td); r.isOk()) rtTex = r.value();
 		if (auto r = renderer.createTexture(td); r.isOk()) rtAlbedo = r.value();
 		if (auto r = renderer.createTexture(td); r.isOk()) rtNormal = r.value();
-	};
+		};
 	// (Re)create the window-sized G-buffer (always full resolution) + RT output.
 	// The G-buffer targets are MSAA (same sample count as the renderer, so the
 	// hybrid path gets real antialiasing at geometry edges); the RT trace and
@@ -415,7 +442,7 @@ float4 main(PSIn i) : SV_TARGET {
 		td.fmt = TextureFormat::R32_Float;
 		if (auto r = renderer.createTexture(td); r.isOk()) resDepth = r.value();
 		createRTTex(w, h);
-	};
+		};
 	{
 		if (renderer.supportsInlineRayTracing()) {
 			auto r = rayTracing.initialize();
@@ -427,6 +454,15 @@ float4 main(PSIn i) : SV_TARGET {
 			EInfo("Hybrid ray tracing disabled: device does not support inline ray tracing.");
 		}
 		createGBufferTextures(fw, fh);
+	}
+	{
+		auto msr = meshShader.initialize();
+		if (msr.isErr()) {
+			// Expected when the device lacks mesh shader support; the DebugUI
+			// shows the actual state (supported / disabled).
+			if (!renderer.supportsMeshShaders()) EInfo("Mesh shaders: device does not support them - path disabled.");
+			else EError("MeshShader init failed: {}", ToString(msr.error()));
+		}
 	}
 
 	// ---- Emissive showcase: a self-illuminated cube that glows in the direct
@@ -460,7 +496,7 @@ float4 main(PSIn i) : SV_TARGET {
 				}
 				UInt32 idx[6] = { base, base + 1, base + 2, base, base + 2, base + 3 };
 				for (UInt32 k = 0; k < 6; ++k) md.indices.push_back(idx[k]);
-			};
+				};
 			// u x v == n keeps the CCW (front-facing) winding used by the renderer
 			// and by the RT ray queries (back-face culling).
 			pushFace(Vec3(1, 0, 0), Vec3(0, 0, -1), Vec3(0, 1, 0));
@@ -473,7 +509,7 @@ float4 main(PSIn i) : SV_TARGET {
 			sub.material = emissiveCubeMat;
 			md.subMeshes.push_back(sub);
 			return md;
-		};
+			};
 		MeshDesc md = makeCube(1.2f);
 		auto mr = renderer.createMesh(md);
 		if (mr.isOk()) emissiveCubeMesh = mr.value();
@@ -622,13 +658,13 @@ HALT
 		F32 dur = (ac.channels > 0 && ac.sampleRate > 0)
 			? (F32)ac.samples.size() / (F32)(ac.channels * ac.sampleRate) : 0.0f;
 		EInfo("Track '{}' bound as {} ({}s)", name, out, dur);
-	};
-	bindClip("intro",   ERes("bgm/Intro.wav"),   introH);
-	bindClip("mid",     ERes("bgm/Mid.wav"),     midH);
+		};
+	bindClip("intro", ERes("bgm/Intro.wav"), introH);
+	bindClip("mid", ERes("bgm/Mid.wav"), midH);
 	bindClip("climax1", ERes("bgm/Climax1.wav"), c1H);
 	bindClip("climax2", ERes("bgm/Climax2.wav"), c2H);
 	bindClip("climax3", ERes("bgm/Climax3.wav"), c3H);
-	bindClip("end",     ERes("bgm/End.wav"),     endH);
+	bindClip("end", ERes("bgm/End.wav"), endH);
 
 	HighLevelController::CompileError amErr;
 	if (!musicCtl.compile(g_AdaptiveScript, &amErr)) {
@@ -848,6 +884,43 @@ HALT
 		debugUI.text("Camera Z: {}", fly.pos.z);
 		debugUI.text("RayTracing: inline={} standalone={}", renderer.supportsInlineRayTracing(), renderer.supportsStandaloneRayTracing());
 		debugUI.text("RT Subsystem: {}", rayTracing.isReady() ? "ready" : "disabled");
+		debugUI.text("MeshShader: device={} subsystem={}", renderer.supportsMeshShaders() ? "supported" : "unsupported", meshShader.isReady() ? "ready" : "disabled");
+		if (meshShader.isReady()) {
+			if (msMeshesRegistered) {
+				if (debugUI.button(fmt::format("MS Scene (all objects): {}", msFurinaScene ? "On" : "Off").c_str())) {
+					msFurinaScene = !msFurinaScene;
+				}
+				if (debugUI.sliderFloat("MS Cluster Budget", &msClusterBudget, 256.0f, 262144.0f)) {
+					meshShader.setClusterBudget((UInt32)msClusterBudget);
+				}
+				if (debugUI.sliderFloat("MS Inst Budget", &msInstBudget, 1.0f, 1000.0f)) {}
+				if (debugUI.button(fmt::format("MS Debug: {}", msDebugTri == 0 ? "Off" : (msDebugTri == 1 ? "Triangle" : "Albedo")).c_str())) {
+					msDebugTri = (msDebugTri + 1) % 3;
+					meshShader.setDebugMode((UInt32)msDebugTri);
+				}
+				if (debugUI.button(fmt::format("MS Mesh Filter: {}", (msMeshFilter > (int)msMeshCount - 1) ? "All" : std::to_string(msMeshFilter)).c_str())) {
+					msMeshFilter = (msMeshFilter > (int)msMeshCount - 1) ? 0 : (msMeshFilter + 1);
+					meshShader.setMeshFilter((msMeshFilter > (int)msMeshCount - 1) ? 0xFFFFFFFFu : (UInt32)msMeshFilter);
+				}
+				if (msFurinaScene) {
+					debugUI.text("MS visible tasks: {} (of {} groups x {} meshes)", meshShader.lastSceneVisibleTasks(), msGroupCount, msMeshCount);
+					debugUI.text("MS visible clusters: {} / {} (demand {})", meshShader.lastSceneVisibleClusters(), (UInt32)msClusterBudget, meshShader.lastSceneClusterDemand());
+					if (debugUI.sliderFloat("MS LOD Error (px)", &msLodScale, 0.25f, 64.0f)) {
+						meshShader.setLodScale(msLodScale);
+					}
+				}
+			}
+			if (debugUI.button(fmt::format("MS Test Grid: {}", msTestGrid ? "On" : "Off").c_str())) {
+				msTestGrid = !msTestGrid;
+			}
+			if (msTestGrid) {
+				if (debugUI.button(fmt::format("MS Frustum Cull: {}", msFrustumCull ? "On" : "Off").c_str())) {
+					msFrustumCull = !msFrustumCull;
+					meshShader.setFrustumCulling(msFrustumCull);
+				}
+				debugUI.text("MS visible: {} / {}", meshShader.lastVisibleCount(), 32u * 32u);
+			}
+		}
 		if (hybridRT) {
 			debugUI.text("RT trace: {:.2f} ms", rayTracing.lastTraceMs());
 		}
@@ -1015,6 +1088,42 @@ HALT
 			}
 		}
 
+		// ---- Mesh shader scene registration -----------------------------
+		// Every drawable object goes into one shared cluster pool; the index
+		// ranges below let the draw build one instanced group per object type.
+		// Re-registration happens whenever the set of loaded meshes changes
+		// (the models arrive asynchronously), which also rebuilds the clusters.
+		{
+			Vector<MeshHandle> all;
+			const UInt32 terrIdx = (UInt32)all.size();
+			for (auto& m : terrian) all.push_back(m);
+			const UInt32 wallIdx = (UInt32)all.size();
+			for (auto& m : wall) all.push_back(m);
+			const UInt32 cubeIdx = (UInt32)all.size();
+			if (emissiveCubeMesh.isValid()) all.push_back(emissiveCubeMesh);
+			const UInt32 furinaIdx = (UInt32)all.size();
+			for (auto& m : model) all.push_back(m);
+
+			if (meshShader.isReady() && !all.empty() && all != msRegisteredMeshes) {
+				auto mr = meshShader.setMeshes(all);
+				if (mr.isOk()) {
+					msRegisteredMeshes = all;
+					msTerrIdx = terrIdx;   msTerrCount   = wallIdx - terrIdx;
+					msWallIdx = wallIdx;   msWallCount   = cubeIdx - wallIdx;
+					msCubeIdx = cubeIdx;   msCubeCount   = furinaIdx - cubeIdx;
+					msFurinaIdx = furinaIdx; msFurinaCount = (UInt32)all.size() - furinaIdx;
+					msMeshesRegistered = true;
+					msMeshCount = (UInt32)all.size();
+					msGroupCount = (msTerrCount ? 1u : 0u) + (msWallCount ? 1u : 0u) + (msCubeCount ? 1u : 0u) + (msFurinaCount ? 1u : 0u) + 1u; // +1 for the camera body
+					EInfo("MS: registered {} meshes (terrain {}, wall {}, cube {}, furina {})",
+						all.size(), msTerrCount, msWallCount, msCubeCount, msFurinaCount);
+				}
+				else {
+					EError("MeshShader: setMeshes failed: {}", ToString(mr.error()));
+				}
+			}
+		}
+
 		UInt32 fbW, fbH;
 		window.getFramebufferSize(fbW, fbH);
 		if (fbW != ww || fbH != wh) {
@@ -1167,12 +1276,12 @@ HALT
 			// Indirect shadow for Furinas (all instances, GPU-culled)
 			for (size_t mi = 0; mi < model.size(); mi++)
 				renderer.renderShadowPassIndirect(shadow, model[mi], wmSRV, idxSRV, argsBuf, static_cast<UInt32>(mi * sizeof(IndirectDrawArgs)));
-		renderer.setShadowSRV(shadow.getSRV());
-		{
-			Mat4 uv[4];
-			for (UInt32 ci = 0; ci < 4; ci++) uv[ci] = shadow.getWorldToShadowMapUVDepth(ci);
-			renderer.setShadowData(uv, shadow.getCascadeSplitDistances());
-		}
+			renderer.setShadowSRV(shadow.getSRV());
+			{
+				Mat4 uv[4];
+				for (UInt32 ci = 0; ci < 4; ci++) uv[ci] = shadow.getWorldToShadowMapUVDepth(ci);
+				renderer.setShadowData(uv, shadow.getCascadeSplitDistances());
+			}
 		}
 
 		// Update audio listener
@@ -1208,117 +1317,186 @@ HALT
 		debugUI.beginFrame(ww, wh);
 
 		if (!hybridRT) {
-		renderer.setRenderTarget(postProcess.getHDRRTV());
-		renderer.beginFrame();
+			renderer.setRenderTarget(postProcess.getHDRRTV());
+			renderer.beginFrame();
 
-		// GPU frustum culling + indirect draw
-		{
-			Mat4 view, proj; renderer.getCameraMatrices(view, proj);
-			auto fp = compute.computeFrustumPlanes(proj * view);
-			// Upload world matrices to GPU
+			// Whole scene: mesh shader cluster-LOD path (all objects in one
+			// DrawMesh), or the classic per-object draws.
 			{
-				Vector<Mat4> wm(1000);
-				for (size_t i = 0; i < 1000; i++) wm[i] = transv[i].computeWorldMatrix();
-				compute.updateBuffer(worldMatBuf, wm.data(), static_cast<UInt32>(1000 * sizeof(Mat4)));
-			}
-			// Upload culling instances
-			{
-				Vector<CullingInstance> insts(1000);
-				for (size_t i = 0; i < 1000; i++) {
-					insts[i].boundSphere = Vec4(transv[i].position, 0.8f);
-					insts[i].drawIndex = static_cast<UInt32>(i);
-				}
-				compute.updateBuffer(cullInstBuf, insts.data(), static_cast<UInt32>(insts.size() * sizeof(CullingInstance)));
-			}
-			// Pre-fill indirect args per mesh
-			IndirectDrawArgs argsTmpl[8] = {};
-			if (!model.empty()) {
-				for (size_t mi = 0; mi < model.size() && mi < 8; mi++) {
-					auto sub = renderer.getSubMesh(model[mi], 0);
-					argsTmpl[mi].indexCount = static_cast<UInt32>(sub.indexCount);
-					argsTmpl[mi].firstIndex = static_cast<UInt32>(sub.indexOffset);
-					argsTmpl[mi].baseVertex = static_cast<UInt32>(sub.vertexOffset);
-				}
-				compute.updateBuffer(argsBuf, argsTmpl, sizeof(argsTmpl));
-				compute.updateCullingCB(cullCBBuf, fp, 1000,
-					argsTmpl[0].indexCount, argsTmpl[0].firstIndex, argsTmpl[0].baseVertex);
-				// Clear counter before dispatch
-				{ UInt32 zero = 0; compute.updateBuffer(counterBuf, &zero, sizeof(zero)); }
-				compute.dispatchCullingCompact(cullInstBuf, cullCBBuf, cullVisBuf, indicesBuf, counterBuf, 1000);
-				// Copy instanceCount to all mesh entries
-				{
-					UInt32 visCount = 0;
-					compute.readback(cullStgBuf, counterBuf, sizeof(UInt32), &visCount);
-					gpuVisCount = visCount;
-					for (size_t mi = 0; mi < model.size() && mi < 8; mi++) {
-						argsTmpl[mi].instanceCount = visCount;
+				Mat4 view, proj; renderer.getCameraMatrices(view, proj);
+				const bool msSceneActive = msFurinaScene && msMeshesRegistered;
+				if (msSceneActive) {
+					// One draw group per scene object type; all of them are culled
+					// and LOD-selected by a single amplification dispatch.
+					Vector<MeshShaderSubsystem::MeshDrawGroup> groups;
+					msAddGroup(groups, msTerrIdx, msTerrCount, { Transform{}.computeWorldMatrix() });
+					msAddGroup(groups, msWallIdx, msWallCount, { Transform{ .position = Vec3(20, -19, 20) }.computeWorldMatrix() });
+					if (emissiveCubeMesh.isValid()) msAddGroup(groups, msCubeIdx, msCubeCount, { emissiveCubeTf.computeWorldMatrix() });
+					{
+						Vector<Mat4> wm(std::min<size_t>(1000, (size_t)msInstBudget));
+						for (size_t i = 0; i < wm.size(); i++) wm[i] = transv[i].computeWorldMatrix();
+						msAddGroup(groups, msFurinaIdx, msFurinaCount, wm);
 					}
-					compute.updateBuffer(argsBuf, argsTmpl, sizeof(argsTmpl));
+					if (!fly.boundToBody && fly.cameraBody != InvalidRigidBody && msFurinaCount > 0)
+						msAddGroup(groups, msFurinaIdx, msFurinaCount, { physicsBodies.getWorldTransform(fly.cameraBody).computeWorldMatrix() });
+
+					auto mr = meshShader.drawScene(groups, view, proj, (F32)gameTick * 0.02f);
+					if (mr.isErr()) {
+						static bool msSceneWarned = false;
+						if (!msSceneWarned) { EError("MeshShader scene failed: {}", ToString(mr.error())); msSceneWarned = true; }
+					}
+				}
+				// Furina instance + GPU-cull data. This runs in *both* modes: the
+				// mesh shader path culls on its own, but the indirect shadow pass
+				// (issued earlier in the frame) reads these buffers.
+				{
+					auto fp = compute.computeFrustumPlanes(proj * view);
+					// Upload world matrices to GPU
+					{
+						Vector<Mat4> wm(1000);
+						for (size_t i = 0; i < 1000; i++) wm[i] = transv[i].computeWorldMatrix();
+						compute.updateBuffer(worldMatBuf, wm.data(), static_cast<UInt32>(1000 * sizeof(Mat4)));
+					}
+					// Upload culling instances
+					{
+						Vector<CullingInstance> insts(1000);
+						for (size_t i = 0; i < 1000; i++) {
+							insts[i].boundSphere = Vec4(transv[i].position, 0.8f);
+							insts[i].drawIndex = static_cast<UInt32>(i);
+						}
+						compute.updateBuffer(cullInstBuf, insts.data(), static_cast<UInt32>(insts.size() * sizeof(CullingInstance)));
+					}
+					// Pre-fill indirect args per mesh
+					IndirectDrawArgs argsTmpl[8] = {};
+					if (!model.empty()) {
+						for (size_t mi = 0; mi < model.size() && mi < 8; mi++) {
+							auto sub = renderer.getSubMesh(model[mi], 0);
+							argsTmpl[mi].indexCount = static_cast<UInt32>(sub.indexCount);
+							argsTmpl[mi].firstIndex = static_cast<UInt32>(sub.indexOffset);
+							argsTmpl[mi].baseVertex = static_cast<UInt32>(sub.vertexOffset);
+						}
+						compute.updateBuffer(argsBuf, argsTmpl, sizeof(argsTmpl));
+						compute.updateCullingCB(cullCBBuf, fp, 1000,
+							argsTmpl[0].indexCount, argsTmpl[0].firstIndex, argsTmpl[0].baseVertex);
+						// Clear counter before dispatch
+						{ UInt32 zero = 0; compute.updateBuffer(counterBuf, &zero, sizeof(zero)); }
+						compute.dispatchCullingCompact(cullInstBuf, cullCBBuf, cullVisBuf, indicesBuf, counterBuf, 1000);
+						// Copy instanceCount to all mesh entries
+						{
+							UInt32 visCount = 0;
+							compute.readback(cullStgBuf, counterBuf, sizeof(UInt32), &visCount);
+							gpuVisCount = visCount;
+							for (size_t mi = 0; mi < model.size() && mi < 8; mi++) {
+								argsTmpl[mi].instanceCount = visCount;
+							}
+							compute.updateBuffer(argsBuf, argsTmpl, sizeof(argsTmpl));
+						}
+					}
+				}
+				if (!msSceneActive) {
+					for (size_t mi = 0; mi < model.size(); mi++)
+						renderer.drawMeshInstancedIndirect(model[mi], wmSRV, idxSRV, argsBuf, static_cast<UInt32>(mi * sizeof(IndirectDrawArgs)));
 				}
 			}
-			for (size_t mi = 0; mi < model.size(); mi++)
-				renderer.drawMeshInstancedIndirect(model[mi], wmSRV, idxSRV, argsBuf, static_cast<UInt32>(mi * sizeof(IndirectDrawArgs)));
-		}
 
-		for (auto& terrMesh : terrian) {
-			static const Transform trans{ .position = Vec3(0, 0, 0) };
-			renderer.drawMesh(terrMesh, trans);
-		}
-		for (auto& wallMesh : wall) {
-			static const Transform trans{ .position = Vec3(20, -19, 20) };
-			renderer.drawMesh(wallMesh, trans);
-		}
-		if (emissiveCubeMesh.isValid()) renderer.drawMesh(emissiveCubeMesh, emissiveCubeTf);
-
-		// Draw camera body model when free-fly (F5 detached)
-		if (!fly.boundToBody && fly.cameraBody != InvalidRigidBody && !model.empty()) {
-			Transform ct = physicsBodies.getWorldTransform(fly.cameraBody);
-			Mat4 cameraWorld = ct.computeWorldMatrix();
-			Vector<Mat4> camMats = { cameraWorld };
-			for (auto& meh : model) {
-				renderer.drawMeshInstanced(meh, camMats);
-			}
-		}
-
-		// Fog cloud around camera (toggle with '1')
-		{
-			static bool fogEnabled = true;
-			if (st.wasKeyPressedThisFrame(KeyCode::Num1)) { fogEnabled = !fogEnabled; EInfo("Fog: {}", fogEnabled ? "ON" : "OFF"); }
-			if (fogEnabled) {
-				static constexpr int N = 240;
-				static Vector<RenderSubsystem::BillboardDesc> fogs(N);
-				F32 t = (F32)(gameTick * 0.015);
-				for (int i = 0; i < N; i++) {
-					F32 phi = acosf(1.0f - 2.0f * ((F32)i + 0.5f) / N);
-					F32 theta = glm::two_pi<F32>() * (F32)i * 1.61803398875f;
-					F32 r = 3.0f + sinf(t * 0.7f + i * 0.5f) * 0.4f + sinf(i * 2.3f) * 0.6f;
-					fogs[i].position = fly.pos + Vec3(
-						sinf(phi) * cosf(theta) * r,
-						cosf(phi) * r + sinf(t + i * 0.3f) * 0.2f,
-						sinf(phi) * sinf(theta) * r);
-					fogs[i].size = Vec2(2.5f + sinf(i * 1.7f + t * 0.5f) * 1.0f);
-					fogs[i].color = Vec4(1, 1, 1, 0.3f + sinf(i * 2.6f + t) * 0.4f);
+			// Classic per-object draws (skipped while the mesh shader path owns
+			// the whole scene).
+			if (!msFurinaScene || !msMeshesRegistered) {
+				for (auto& terrMesh : terrian) {
+					static const Transform trans{ .position = Vec3(0, 0, 0) };
+					renderer.drawMesh(terrMesh, trans);
 				}
-				renderer.drawBillboards(fogs);
+				for (auto& wallMesh : wall) {
+					static const Transform trans{ .position = Vec3(20, -19, 20) };
+					renderer.drawMesh(wallMesh, trans);
+				}
+				if (emissiveCubeMesh.isValid()) renderer.drawMesh(emissiveCubeMesh, emissiveCubeTf);
 			}
-		}
 
-		renderer.endFrame();
-		renderer.setRenderTarget(nullptr);
+			// M1: mesh shader test grid (amplification culling + mesh shader draws).
+			if (msTestGrid && meshShader.isReady()) {
+				Mat4 msView, msProj; renderer.getCameraMatrices(msView, msProj);
+				auto mg = meshShader.drawGrid(msView, msProj, (F32)gameTick * 0.02f);
+				if (mg.isErr()) {
+					static bool msWarned = false;
+					if (!msWarned) { EError("MeshShader grid failed: {}", ToString(mg.error())); msWarned = true; }
+				}
+			}
+
+			// Draw camera body model when free-fly (F5 detached)
+			if (!msFurinaScene && !fly.boundToBody && fly.cameraBody != InvalidRigidBody && !model.empty()) {
+				Transform ct = physicsBodies.getWorldTransform(fly.cameraBody);
+				Mat4 cameraWorld = ct.computeWorldMatrix();
+				Vector<Mat4> camMats = { cameraWorld };
+				for (auto& meh : model) {
+					renderer.drawMeshInstanced(meh, camMats);
+				}
+			}
+
+			// Fog cloud around camera (toggle with '1')
+			{
+				static bool fogEnabled = true;
+				if (st.wasKeyPressedThisFrame(KeyCode::Num1)) { fogEnabled = !fogEnabled; EInfo("Fog: {}", fogEnabled ? "ON" : "OFF"); }
+				if (fogEnabled) {
+					static constexpr int N = 240;
+					static Vector<RenderSubsystem::BillboardDesc> fogs(N);
+					F32 t = (F32)(gameTick * 0.015);
+					for (int i = 0; i < N; i++) {
+						F32 phi = acosf(1.0f - 2.0f * ((F32)i + 0.5f) / N);
+						F32 theta = glm::two_pi<F32>() * (F32)i * 1.61803398875f;
+						F32 r = 3.0f + sinf(t * 0.7f + i * 0.5f) * 0.4f + sinf(i * 2.3f) * 0.6f;
+						fogs[i].position = fly.pos + Vec3(
+							sinf(phi) * cosf(theta) * r,
+							cosf(phi) * r + sinf(t + i * 0.3f) * 0.2f,
+							sinf(phi) * sinf(theta) * r);
+						fogs[i].size = Vec2(2.5f + sinf(i * 1.7f + t * 0.5f) * 1.0f);
+						fogs[i].color = Vec4(1, 1, 1, 0.3f + sinf(i * 2.6f + t) * 0.4f);
+					}
+					renderer.drawBillboards(fogs);
+				}
+			}
+
+			renderer.endFrame();
+			renderer.setRenderTarget(nullptr);
 		}
 		else {
 			// ---- Hybrid ray tracing path (M3) ----
 			// G-buffer pass (albedo + world normal + depth). Note: the Furina model
 			// consists of 5 separate meshes, so every mesh must be drawn.
 			renderer.beginGBuffer(renderer.getTextureRTV(gbufColor), renderer.getTextureRTV(gbufNormal), renderer.getTextureRTV(gbufEmissive), renderer.getTextureDSV(gbufDepth));
-			for (auto& terrMesh : terrian) renderer.drawMesh(terrMesh, Transform{});
-			for (auto& wallMesh : wall) renderer.drawMesh(wallMesh, Transform{ .position = Vec3(20, -19, 20) });
-			if (emissiveCubeMesh.isValid()) renderer.drawMesh(emissiveCubeMesh, emissiveCubeTf);
-			if (!model.empty() && modelLoadCompleted.load(std::memory_order_acquire)) {
-				Vector<Mat4> wmats(1000);
-				for (size_t i = 0; i < 1000; ++i) wmats[i] = transv[i].computeWorldMatrix();
-				for (size_t mi = 0; mi < model.size(); ++mi)
-					renderer.drawMeshInstanced(model[mi], wmats);
+			const bool msHybrid = msFurinaScene && msMeshesRegistered;
+			if (msHybrid) {
+				// The mesh shader cluster-LOD path writes the whole G-buffer (all
+				// objects, one DrawMesh); the RT compose pass does the shading.
+				Mat4 msView, msProj; renderer.getCameraMatrices(msView, msProj);
+				Vector<MeshShaderSubsystem::MeshDrawGroup> groups;
+				msAddGroup(groups, msTerrIdx, msTerrCount, { Transform{}.computeWorldMatrix() });
+				msAddGroup(groups, msWallIdx, msWallCount, { Transform{ .position = Vec3(20, -19, 20) }.computeWorldMatrix() });
+				if (emissiveCubeMesh.isValid()) msAddGroup(groups, msCubeIdx, msCubeCount, { emissiveCubeTf.computeWorldMatrix() });
+				{
+					Vector<Mat4> wm(std::min<size_t>(1000, (size_t)msInstBudget));
+					for (size_t i = 0; i < wm.size(); i++) wm[i] = transv[i].computeWorldMatrix();
+					msAddGroup(groups, msFurinaIdx, msFurinaCount, wm);
+				}
+				if (!fly.boundToBody && fly.cameraBody != InvalidRigidBody && msFurinaCount > 0)
+					msAddGroup(groups, msFurinaIdx, msFurinaCount, { physicsBodies.getWorldTransform(fly.cameraBody).computeWorldMatrix() });
+
+				auto mr = meshShader.drawSceneGBuffer(groups, msView, msProj, (F32)gameTick * 0.02f);
+				if (mr.isErr()) {
+					static bool msGbufWarned = false;
+					if (!msGbufWarned) { EError("MeshShader G-buffer scene failed: {}", ToString(mr.error())); msGbufWarned = true; }
+				}
+			}
+			else {
+				for (auto& terrMesh : terrian) renderer.drawMesh(terrMesh, Transform{});
+				for (auto& wallMesh : wall) renderer.drawMesh(wallMesh, Transform{ .position = Vec3(20, -19, 20) });
+				if (emissiveCubeMesh.isValid()) renderer.drawMesh(emissiveCubeMesh, emissiveCubeTf);
+				if (!model.empty() && modelLoadCompleted.load(std::memory_order_acquire)) {
+					Vector<Mat4> wmats(1000);
+					for (size_t i = 0; i < 1000; ++i) wmats[i] = transv[i].computeWorldMatrix();
+					for (size_t mi = 0; mi < model.size(); ++mi)
+						renderer.drawMeshInstanced(model[mi], wmats);
+				}
 			}
 			renderer.endGBuffer();
 
@@ -1539,6 +1717,7 @@ HALT
 	audio.shutdown();
 	rayTracing.shutdown();
 	denoising.shutdown();
+	meshShader.shutdown();
 	renderer.shutdown();
 	postProcess.shutdown();
 	debugUI.shutdown();

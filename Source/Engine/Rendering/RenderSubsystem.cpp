@@ -594,6 +594,8 @@ struct RenderSubsystem::RenderBackend {
 	// Ray tracing device feature request + reported capabilities.
 	bool requestRayTracing = true;
 	bool rtFeatureEnabled = false; ///< Whether the device actually enabled the ray tracing feature.
+	bool requestMeshShaders = true;
+	bool msFeatureEnabled = false; ///< Whether the device actually enabled the mesh shader feature.
 	RayTracingCaps rtCaps = RayTracingCaps::None;
 	UInt32 rtMaxRecursionDepth = 0;
 	UInt32 rtMaxInstancesPerTLAS = 0;
@@ -635,16 +637,17 @@ struct RenderSubsystem::RenderBackend {
 #else
 				const D::VALIDATION_LEVEL vlevel = D::VALIDATION_LEVEL_DISABLED;
 #endif
-				// First attempt requests the ray tracing feature (if enabled).
+				// First attempt requests the ray tracing and mesh shader features (if enabled).
 				{
 					D::EngineD3D12CreateInfo ci; ci.SetValidationLevel(vlevel);
 					if (requestRayTracing) ci.Features.RayTracing = D::DEVICE_FEATURE_STATE_ENABLED;
+					if (requestMeshShaders) ci.Features.MeshShaders = D::DEVICE_FEATURE_STATE_ENABLED;
 					f->CreateDeviceAndContextsD3D12(ci, &device, &ctx);
 				}
-				// If the GPU/driver does not support ray tracing, retry without it so that
-				// rasterization keeps working on non-RT hardware.
-				if (!device && requestRayTracing) {
-					EWarn("D3D12 device creation with ray tracing failed; retrying without ray tracing.");
+				// If the GPU/driver does not support the optional features, retry without
+				// them so that rasterization keeps working on older hardware.
+				if (!device && (requestRayTracing || requestMeshShaders)) {
+					EWarn("D3D12 device creation with ray tracing / mesh shaders failed; retrying without optional features.");
 					device.Release(); ctx.Release();
 					D::EngineD3D12CreateInfo ci; ci.SetValidationLevel(vlevel);
 					f->CreateDeviceAndContextsD3D12(ci, &device, &ctx);
@@ -662,10 +665,11 @@ struct RenderSubsystem::RenderBackend {
 				{
 					D::EngineVkCreateInfo ci;
 					if (requestRayTracing) ci.Features.RayTracing = D::DEVICE_FEATURE_STATE_ENABLED;
+					if (requestMeshShaders) ci.Features.MeshShaders = D::DEVICE_FEATURE_STATE_ENABLED;
 					f->CreateDeviceAndContextsVk(ci, &device, &ctx);
 				}
-				if (!device && requestRayTracing) {
-					EWarn("Vulkan device creation with ray tracing failed; retrying without ray tracing.");
+				if (!device && (requestRayTracing || requestMeshShaders)) {
+					EWarn("Vulkan device creation with ray tracing / mesh shaders failed; retrying without optional features.");
 					device.Release(); ctx.Release();
 					D::EngineVkCreateInfo ci;
 					f->CreateDeviceAndContextsVk(ci, &device, &ctx);
@@ -680,10 +684,11 @@ struct RenderSubsystem::RenderBackend {
 				{
 					D::EngineVkCreateInfo ci;
 					if (requestRayTracing) ci.Features.RayTracing = D::DEVICE_FEATURE_STATE_ENABLED;
+					if (requestMeshShaders) ci.Features.MeshShaders = D::DEVICE_FEATURE_STATE_ENABLED;
 					f->CreateDeviceAndContextsVk(ci, &device, &ctx);
 				}
-				if (!device && requestRayTracing) {
-					EWarn("Vulkan device creation with ray tracing failed; retrying without ray tracing.");
+				if (!device && (requestRayTracing || requestMeshShaders)) {
+					EWarn("Vulkan device creation with ray tracing / mesh shaders failed; retrying without optional features.");
 					device.Release(); ctx.Release();
 					D::EngineVkCreateInfo ci;
 					f->CreateDeviceAndContextsVk(ci, &device, &ctx);
@@ -704,6 +709,11 @@ struct RenderSubsystem::RenderBackend {
 			rtCaps = static_cast<RayTracingCaps>(static_cast<UInt8>(rt.CapFlags));
 			rtMaxRecursionDepth = rt.MaxRecursionDepth;
 			rtMaxInstancesPerTLAS = rt.MaxInstancesPerTLAS;
+			msFeatureEnabled = (adapter.Features.MeshShaders == D::DEVICE_FEATURE_STATE_ENABLED);
+			EInfo("RenderBackend: ray tracing {} (inline={}), mesh shaders {}",
+				rtFeatureEnabled ? "enabled" : "disabled",
+				hasRayTracingCap(rtCaps, RayTracingCaps::InlineRayTracing),
+				msFeatureEnabled ? "enabled" : "disabled");
 		}
 
 		// Clamp the requested MSAA sample count to what the device supports for
@@ -1709,6 +1719,10 @@ RenderBackendType RenderSubsystem::backend() const { return m_backend->backendTy
 
 void RenderSubsystem::setRayTracingEnabled(bool enable) { m_backend->requestRayTracing = enable; }
 bool RenderSubsystem::isRayTracingEnabled() const { return m_backend->requestRayTracing; }
+
+void RenderSubsystem::setMeshShadersEnabled(bool enable) { m_backend->requestMeshShaders = enable; }
+bool RenderSubsystem::isMeshShadersEnabled() const { return m_backend->requestMeshShaders; }
+bool RenderSubsystem::supportsMeshShaders() const { return m_backend->msFeatureEnabled; }
 RayTracingCaps RenderSubsystem::rayTracingCaps() const { return m_backend->rtCaps; }
 bool RenderSubsystem::supportsInlineRayTracing() const { return hasRayTracingCap(m_backend->rtCaps, RayTracingCaps::InlineRayTracing); }
 bool RenderSubsystem::supportsStandaloneRayTracing() const { return hasRayTracingCap(m_backend->rtCaps, RayTracingCaps::StandaloneShaders); }
@@ -1762,6 +1776,21 @@ Result<void, RenderError> RenderSubsystem::updateLight(LightHandle h, const Ligh
 	return {};
 }
 void RenderSubsystem::setAmbientLight(const Vec3& c, F32 i) { m_backend->ambient = Vec4(c, i); }
+
+Vec4 RenderSubsystem::getAmbientLight() const { return m_backend->ambient; }
+
+bool RenderSubsystem::getPrimaryDirectionalLight(Vec3& dir, Vec4& color) const {
+	if (!m_backend->ok) return false;
+	for (size_t i = 0; i < m_backend->activeLights.size(); ++i) {
+		const LightData& lc = m_backend->lcBuf.lights[i];
+		if ((UInt8)lc.DT.w == (UInt8)LightType::Directional) {
+			dir = Vec3(lc.DT);
+			color = lc.CI;
+			return true;
+		}
+	}
+	return false;
+}
 
 Result<ModelLoadResult, RenderError> RenderSubsystem::loadModel(const String& fp) {
 	if (!m_backend->ok) return RenderError::NotInitialized;

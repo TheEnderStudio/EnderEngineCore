@@ -1,4 +1,4 @@
-# ============================================================================
+﻿# ============================================================================
 # EnderEngine BuildHelper 依赖配置
 # 修改本文件后，在 GUI 中点击「重新加载配置」即可生效。
 #
@@ -276,3 +276,21 @@ dependencies:
       - {configs: ["*"], from: "Include", to: "Include"}
       - {configs: ["*"], from: "Lib", to: "Lib"}
       - {configs: ["*"], from: "LICENSE.txt", to: "LICENSE.txt"}
+
+  - name: MeshOptimizer
+    kind: git
+    url: https://github.com/zeux/meshoptimizer.git
+    ref: master
+    build: cmake
+    target: ThirdParty/meshopt
+    cmakeOptions: 
+      - -DMESHOPT_BUILD_SHARED_LIBS=ON
+    layout:
+      - {configs: ["*"], from: "include", to: "include"}
+      - {configs: ["*"], from: "demo/clusterlod.h", to: "include/clusterlod.h", source: repo}
+      - {configs: ["*"], from: "README.md", to: "README.md", source: repo}
+      - {configs: ["*"], from: "LICENSE.md", to: "LICENSE.md", source: repo}
+      - {configs: ["Debug"], from: "bin", to: "bin/Debug"}
+      - {configs: ["Debug"], from: "lib/meshoptimizer.lib", to: "lib/Debug/meshoptimizer.lib"}
+      - {configs: ["Release"], from: "bin", to: "bin/Release"}
+      - {configs: ["Release"], from: "lib/meshoptimizer.lib", to: "lib/Release/meshoptimizer.lib"}

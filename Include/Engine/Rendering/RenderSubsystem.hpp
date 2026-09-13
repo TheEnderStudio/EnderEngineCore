@@ -77,6 +77,29 @@ public:
 	/// @brief Maximum number of instances in a top-level acceleration structure (0 if ray tracing is unavailable).
 	EE_NODISCARD UInt32 maxInstancesPerTLAS() const;
 
+	/**
+	 * @brief Enable or disable the mesh shader device feature.
+	 *
+	 * When enabled (default), D3D12 and Vulkan device creation requests the
+	 * mesh shader feature (amplification + mesh stages). On GPUs/drivers
+	 * without support the feature simply stays disabled and the engine keeps
+	 * working with the regular vertex-shader path. Must be called before
+	 * initialize().
+	 * @param enable true to request mesh shaders.
+	 */
+	void setMeshShadersEnabled(bool enable);
+
+	/// @brief Whether the mesh shader device feature was requested (not whether it is available).
+	EE_NODISCARD bool isMeshShadersEnabled() const;
+
+	/**
+	 * @brief Whether the device actually enabled the mesh shader feature.
+	 *
+	 * Valid after initialize(). False means amplification/mesh stages cannot
+	 * be used (e.g. on D3D11 or older GPUs).
+	 */
+	EE_NODISCARD bool supportsMeshShaders() const;
+
 	/// @brief Set MSAA sample count (1=off, 2/4/8). Applied to all PSOs at creation.
 	void setMSAASampleCount(UInt8 count);
 	UInt8 msaaSamples() const;
@@ -251,6 +274,20 @@ public:
 	Result<void, RenderError> updateLight(LightHandle handle, const LightDesc& desc);
 	/// @brief Set the ambient light color and intensity.
 	void setAmbientLight(const Vec3& color, F32 intensity = 0.1f);
+
+	/// @brief Current ambient light (rgb = colour, a = intensity) as uploaded to the frame CB.
+	EE_NODISCARD Vec4 getAmbientLight() const;
+
+	/**
+	 * @brief Direction and colour of the first directional light in the scene.
+	 *
+	 * Lets alternative geometry paths (the mesh shader pipeline) shade with the
+	 * same sun as the forward renderer instead of a hard-coded direction.
+	 * @param [out] dir   Normalised light direction (world space, pointing *from* the light).
+	 * @param [out] color rgb = colour, a = intensity.
+	 * @return false when the scene has no directional light.
+	 */
+	EE_NODISCARD bool getPrimaryDirectionalLight(Vec3& dir, Vec4& color) const;
 
 	// -------------------------------------------------------------------
 	// Model loading

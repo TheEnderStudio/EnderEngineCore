@@ -1,4 +1,4 @@
-set_project("EnderEngine")
+﻿set_project("EnderEngine")
 set_xmakever("2.8.0")
 add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate")
@@ -41,6 +41,7 @@ add_includedirs("ThirdParty/EnderVFiles/include")
 add_includedirs("ThirdParty/oidn/include")
 add_includedirs("ThirdParty/nrd/Include")
 add_includedirs("ThirdParty/nrd/NRDShaders")
+add_includedirs("ThirdParty/meshopt/include")
 add_includedirs("Backends/SteamAudio/include")
 add_includedirs("Backends/DiligentEngine/include")
 add_includedirs("Backends/DiligentEngine/include/DiligentTools/Imgui/interface")
@@ -99,6 +100,7 @@ if is_mode("debug") then
 	add_linkdirs("ThirdParty/EnderVFiles/bin")
 	add_linkdirs("ThirdParty/oidn/lib")
 	add_linkdirs("ThirdParty/nrd/Lib/Debug")
+	add_linkdirs("ThirdParty/meshopt/lib/Debug")
 else
 	add_linkdirs("ThirdParty/spdlog/lib")
 	add_linkdirs("ThirdParty/glfw/lib-vc2022")
@@ -115,6 +117,7 @@ else
 	add_linkdirs("ThirdParty/EnderVFiles/bin")
 	add_linkdirs("ThirdParty/oidn/lib")
 	add_linkdirs("ThirdParty/nrd/Lib/Release")
+	add_linkdirs("ThirdParty/meshopt/lib/Release")
 end
 
 -- ---------------------------------------------------------------------------
@@ -187,6 +190,7 @@ target("EnderEngineCore")
 		add_links("OpenImageDenoise")
 		add_links("OpenImageDenoise_core")
 		add_links("NRD")
+		add_links("meshoptimizer")
 	else
 		add_links("spdlog")
 		add_links("glfw3dll")
@@ -228,6 +232,7 @@ target("EnderEngineCore")
 		add_links("OpenImageDenoise")
 		add_links("OpenImageDenoise_core")
 		add_links("NRD")
+		add_links("meshoptimizer")
 	end
 target_end()
 
@@ -313,6 +318,18 @@ target("Demo")
 				local nrdBin = "ThirdParty/nrd/Lib/Release"
 				if os.isdir(nrdBin) then
 					os.cp(nrdBin .. "/NRD.dll", target:targetdir())
+				end
+			end
+			if is_mode("debug") then
+				local meshoptBin = "ThirdParty/meshopt/bin/Debug"
+				if os.isdir(meshoptBin) then
+					os.cp(meshoptBin .. "/meshoptimizer.dll", target:targetdir())
+					os.cp(meshoptBin .. "/meshoptimizer.pdb", target:targetdir())
+				end
+			else
+				local meshoptBin = "ThirdParty/meshopt/bin/Debug"
+				if os.isdir(meshoptBin) then
+					os.cp(meshoptBin .. "/meshoptimizer.dll", target:targetdir())
 				end
 			end
 		end
