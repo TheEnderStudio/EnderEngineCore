@@ -1,4 +1,4 @@
-#include <Engine/Core/Core.hpp>
+﻿#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -1281,6 +1281,9 @@ HALT
 				Mat4 uv[4];
 				for (UInt32 ci = 0; ci < 4; ci++) uv[ci] = shadow.getWorldToShadowMapUVDepth(ci);
 				renderer.setShadowData(uv, shadow.getCascadeSplitDistances());
+				// The mesh shader path shades with the forward model, which
+				// includes the cascaded shadow term, so it needs the same data.
+				meshShader.setShadowMap(renderer.getShadowSRV(), uv, shadow.getCascadeSplitDistances());
 			}
 		}
 

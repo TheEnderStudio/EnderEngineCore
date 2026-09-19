@@ -411,6 +411,15 @@ struct MeshShaderSubsystem::Impl {
 	std::vector<D::IDeviceObject*>    mrSRVs;            // metallicRoughnessTexture
 	std::vector<D::IDeviceObject*>    emissiveSRVs;      // emissiveTexture
 	UInt32                            materialCount = 0;
+
+	// ---- Shadows (raster path only; the hybrid path uses ray traced shadows) ----
+	D::RefCntAutoPtr<D::ISampler>     shadowSampler;      // comparison sampler
+	D::RefCntAutoPtr<D::ITexture>     shadowDummyTex;     // 1x1x4 "fully lit" fallback
+	D::RefCntAutoPtr<D::ITextureView> shadowDummySRV;
+	D::RefCntAutoPtr<D::ITextureView> shadowMapSRV;       // borrowed from the renderer
+	Mat4                              shadowUV[4] = {};
+	Vec4                              cascadeSplits = Vec4(0);
+	bool                              shadowValid = false;
 };
 
 MeshShaderSubsystem::MeshShaderSubsystem() : Subsystem("MeshShader"), m_impl(std::make_unique<Impl>()) {}
@@ -434,6 +443,22 @@ UInt32 MeshShaderSubsystem::lastSceneVisibleClusters() const { return m_impl->sc
 UInt32 MeshShaderSubsystem::lastSceneClusterDemand() const { return m_impl->sceneClusterDemand; }
 void MeshShaderSubsystem::setClusterBudget(UInt32 budget) {
 	m_impl->clusterBudget = std::clamp<UInt32>(budget, 256u, kClusterMaxBudget);
+}
+
+void MeshShaderSubsystem::setShadowMap(TextureSRV shadowMap, const Mat4 worldToShadowUV[4], const Vec4& cascadeSplits) {
+	auto& p = *m_impl;
+	p.shadowMapSRV = shadowMap ? static_cast<D::ITextureView*>(shadowMap) : nullptr;
+	p.shadowValid = p.shadowMapSRV != nullptr;
+	for (int i = 0; i < 4; ++i) p.shadowUV[i] = worldToShadowUV ? worldToShadowUV[i] : Mat4(1.0f);
+	p.cascadeSplits = cascadeSplits;
+	// The binding already exists once the pipeline has been built; refresh it so
+	// a shadow map created after the first draw still takes effect.
+	if (p.clusterSrb) {
+		if (auto* v = p.clusterSrb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap")) {
+			auto* srv = p.shadowMapSRV ? p.shadowMapSRV.RawPtr() : (p.shadowDummySRV ? p.shadowDummySRV.RawPtr() : nullptr);
+			if (srv) v->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+		}
+	}
 }
 
 Result<void, CoreError> MeshShaderSubsystem::onInitialize() {
@@ -464,6 +489,7 @@ void MeshShaderSubsystem::onShutdown() {
 	p.clUV.Release(); p.whiteTex.Release(); p.whiteTexSRV.Release(); p.materialSampler.Release();
 	p.flatNormalTex.Release(); p.flatNormalSRV.Release();
 	p.flatMRTex.Release(); p.flatMRSRV.Release();
+	p.shadowSampler.Release(); p.shadowDummyTex.Release(); p.shadowDummySRV.Release(); p.shadowMapSRV.Release();
 	p.materialSRVs.clear(); p.normalSRVs.clear(); p.mrSRVs.clear(); p.emissiveSRVs.clear();
 	p.materialCount = 0;
 	p.sceneMeshList.clear();
@@ -711,8 +737,10 @@ struct SceneConstants { // 264 B payload (buffer 320 B; layout matches the HLSL 
 	Vec4   cameraPos = Vec4(0, 0, 0, 1);  // 304: world-space camera position (PBR view vector)
 	Vec4   ambient = Vec4(0.30f, 0.30f, 0.35f, 1.0f); // 320: rgb = ambient colour, a = intensity
 	Vec4   lightColor = Vec4(1, 1, 1, 1); // 336: rgb = sun colour, a = sun intensity
-}; // 352 B (buffer 512 B)
-static_assert(sizeof(SceneConstants) == 352, "SceneConstants must match the HLSL cbuffer layout");
+	Mat4   shadowMapUVDepth[4] = {};      // 352: world -> shadow UV/depth, one per cascade
+	Vec4   cascadeSplits = Vec4(0);       // 608: camera-space far distance of cascades 0..2
+}; // 624 B (buffer 1024 B)
+static_assert(sizeof(SceneConstants) == 624, "SceneConstants must match the HLSL cbuffer layout");
 
 struct SceneMeshInfo { // 96 B (16-byte aligned; layout must match the HLSL struct)
 	Vec4   center;           // 0  mesh-local LOD0 bounding-sphere center
@@ -966,6 +994,8 @@ cbuffer cbSceneConstants : register(b0) {
     float4   g_CameraPos;
     float4   g_Ambient;
     float4   g_LightColor;
+    float4x4 g_ShadowMapUVDepth[4];
+    float4   g_CascadeSplits;
 };
 
 struct ScenePayload {
@@ -1128,6 +1158,8 @@ cbuffer cbSceneConstants : register(b0) {
     float4   g_CameraPos;
     float4   g_Ambient;
     float4   g_LightColor;
+    float4x4 g_ShadowMapUVDepth[4];
+    float4   g_CascadeSplits;
 };
 
 struct PSInput {
@@ -1245,6 +1277,8 @@ cbuffer cbSceneConstants : register(b0) {
     float4   g_CameraPos;
     float4   g_Ambient;
     float4   g_LightColor;
+    float4x4 g_ShadowMapUVDepth[4];
+    float4   g_CascadeSplits;
 };
 struct PSInput {
     float4 Pos    : SV_POSITION;
@@ -1335,6 +1369,8 @@ cbuffer cbSceneConstants : register(b0) {
     float4   g_CameraPos;
     float4   g_Ambient;
     float4   g_LightColor;
+    float4x4 g_ShadowMapUVDepth[4];
+    float4   g_CascadeSplits;
 };
 
 // The visible-cluster list is handed to the child mesh shader groups through the
@@ -1544,6 +1580,8 @@ cbuffer cbSceneConstants : register(b0) {
     float4   g_CameraPos;
     float4   g_Ambient;
     float4   g_LightColor;
+    float4x4 g_ShadowMapUVDepth[4];
+    float4   g_CascadeSplits;
 };
 
 struct PSInput {
@@ -1658,6 +1696,8 @@ cbuffer cbSceneConstants : register(b0) {
     float4   g_CameraPos;
     float4   g_Ambient;
     float4   g_LightColor;
+    float4x4 g_ShadowMapUVDepth[4];
+    float4   g_CascadeSplits;
 };
 struct MaterialGPU {
     float4 baseColor;
@@ -1669,6 +1709,10 @@ Texture2D    g_Albedo[MAX_MATERIALS]   : register(t0);
 Texture2D    g_NormalMap[MAX_MATERIALS] : register(t32);
 Texture2D    g_MetalRough[MAX_MATERIALS] : register(t64);
 Texture2D    g_EmissiveMap[MAX_MATERIALS] : register(t96);
+// Cascaded shadow map, exactly as the forward PBR shader declares it (t4/s4
+// there; here the material palettes already own t0..t127).
+Texture2DArray g_ShadowMap : register(t128);
+SamplerComparisonState g_ShadowMapSampler : register(s1);
 SamplerState g_AlbedoSampler : register(s0);
 StructuredBuffer<MaterialGPU> Materials;
 
@@ -1723,7 +1767,8 @@ float4 main(in PSInput i) : SV_TARGET {
     float3 V = normalize(g_CameraPos.xyz - i.WorldPos);
 
     // Same shading model as the forward PBR shader: ambient + one directional
-    // light with half-Lambert diffuse and a Blinn specular lobe.
+    // light with half-Lambert diffuse and a Blinn specular lobe, attenuated by
+    // the cascaded shadow map.
     float3 col = g_Ambient.rgb * g_Ambient.a * bc;
     {
         float3 Ldir = normalize(-g_LightDir.xyz);
@@ -1733,7 +1778,24 @@ float4 main(in PSInput i) : SV_TARGET {
         float  spec = pow(max(dot(N, H), 0.001), specExp);
         float3 diff = bc * (1.0 - m);
         float3 specC = lerp(float3(0.04, 0.04, 0.04), bc, m);
-        col += (diff * NdotL + specC * spec) * g_LightColor.rgb * g_LightColor.a;
+
+        // Cascade selection + PCF comparison, matching g_PS_Forward's DoLight.
+        // Without this every object drawn through the mesh shader path would be
+        // lit as if nothing occluded it.
+        float shadow = 1.0;
+        if (g_LightColor.a > 0.0) {
+            const float camZ = abs(mul(g_ViewProj, float4(i.WorldPos, 1.0)).w);
+            uint c = 0;
+            if (camZ > g_CascadeSplits.x) c = 1;
+            if (camZ > g_CascadeSplits.y) c = 2;
+            if (camZ > g_CascadeSplits.z) c = 3;
+            float4 sc = mul(g_ShadowMapUVDepth[c], float4(i.WorldPos, 1.0));
+            sc.xyz /= max(sc.w, 1e-6);
+            const float bias = 0.005 + 0.01 * (1.0 - NdotL);
+            shadow = g_ShadowMap.SampleCmpLevelZero(g_ShadowMapSampler, float3(sc.xy, (float)c), sc.z - bias);
+        }
+
+        col += (diff * NdotL + specC * spec) * g_LightColor.rgb * g_LightColor.a * shadow;
     }
 
     // Emissive is self-emission: added after lighting (not tinted by the light).
@@ -1779,6 +1841,8 @@ cbuffer cbSceneConstants : register(b0) {
     float4   g_CameraPos;
     float4   g_Ambient;
     float4   g_LightColor;
+    float4x4 g_ShadowMapUVDepth[4];
+    float4   g_CascadeSplits;
 };
 
 struct MaterialGPU {
@@ -1900,7 +1964,7 @@ Result<void, RenderError> MeshShaderSubsystem::ensureScenePipeline(Impl& p, UInt
 
 	// Per-frame dynamic constants.
 	if (!p.sceneCB) {
-		D::BufferDesc bd; bd.Name = "MS Scene CB"; bd.Size = 512;
+		D::BufferDesc bd; bd.Name = "MS Scene CB"; bd.Size = 1024;
 		bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DYNAMIC; bd.CPUAccessFlags = D::CPU_ACCESS_WRITE;
 		dev->CreateBuffer(bd, nullptr, &p.sceneCB);
 		if (!p.sceneCB) { p.scenePso.Release(); return RenderError::BufferCreationFailed; }
@@ -2034,7 +2098,7 @@ Result<void, RenderError> MeshShaderSubsystem::ensureClusterPipeline(Impl& p, UI
 	// Shared frame buffers (identical to the ones the old scene path uses; the
 	// cluster path is self-sufficient so it creates them when it runs alone).
 	if (!p.sceneCB) {
-		D::BufferDesc bd; bd.Name = "MS Scene CB"; bd.Size = 512;
+		D::BufferDesc bd; bd.Name = "MS Scene CB"; bd.Size = 1024;
 		bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DYNAMIC; bd.CPUAccessFlags = D::CPU_ACCESS_WRITE;
 		dev->CreateBuffer(bd, nullptr, &p.sceneCB);
 		if (!p.sceneCB) { p.clusterPso.Release(); return RenderError::BufferCreationFailed; }
@@ -2121,6 +2185,17 @@ Result<void, RenderError> MeshShaderSubsystem::ensureClusterPipeline(Impl& p, UI
 		}
 		if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_AlbedoSampler"))
 			if (p.materialSampler) v->Set(p.materialSampler);
+
+		// Shadows (only the raster pixel shader declares these; the G-buffer
+		// variant leaves the light transport to the RT compose pass).
+		{
+			D::ITextureView* srv = p.shadowValid && p.shadowMapSRV ? p.shadowMapSRV.RawPtr()
+				: (p.shadowDummySRV ? p.shadowDummySRV.RawPtr() : nullptr);
+			if (srv) if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap"))
+				v->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+			if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMapSampler"))
+				if (p.shadowSampler) v->Set(p.shadowSampler);
+		}
 	};
 
 	bindCluster(p.clusterSrb);
@@ -2680,6 +2755,33 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 			dev->CreateSampler(sd, &p.materialSampler);
 			if (!p.materialSampler) { EError("MeshShader: failed to create the material sampler"); return RenderError::SamplerCreationFailed; }
 		}
+		// Shadow comparison sampler + a 1x1x4 "nothing occludes" fallback, so the
+		// mutable shadow variables are always bound even without a shadow pass.
+		if (!p.shadowSampler) {
+			D::SamplerDesc sd;
+			sd.MinFilter = D::FILTER_TYPE_COMPARISON_LINEAR; sd.MagFilter = D::FILTER_TYPE_COMPARISON_LINEAR;
+			sd.MipFilter = D::FILTER_TYPE_COMPARISON_LINEAR;
+			sd.AddressU = D::TEXTURE_ADDRESS_CLAMP; sd.AddressV = D::TEXTURE_ADDRESS_CLAMP; sd.AddressW = D::TEXTURE_ADDRESS_CLAMP;
+			sd.ComparisonFunc = D::COMPARISON_FUNC_LESS;
+			dev->CreateSampler(sd, &p.shadowSampler);
+			if (!p.shadowSampler) { EError("MeshShader: failed to create the shadow sampler"); return RenderError::SamplerCreationFailed; }
+		}
+		if (!p.shadowDummyTex) {
+			// Depth 1.0 in every slice => every comparison passes => fully lit.
+			// (nb: not named `far`, which windef.h defines as an empty macro.)
+			const UInt16 farDepth = 0xFFFF;
+			D::TextureDesc td;
+			td.Name = "MS ShadowDummy"; td.Type = D::RESOURCE_DIM_TEX_2D_ARRAY;
+			td.Width = 1; td.Height = 1; td.ArraySize = 4; td.MipLevels = 1;
+			td.Format = D::TEX_FORMAT_R16_UNORM;
+			td.BindFlags = D::BIND_SHADER_RESOURCE; td.Usage = D::USAGE_IMMUTABLE;
+			std::vector<D::TextureSubResData> sub(4);
+			std::vector<UInt16> far4(4, farDepth);
+			for (int i = 0; i < 4; ++i) { sub[i].pData = &far4[i]; sub[i].Stride = sizeof(UInt16); }
+			D::TextureData tdata(sub.data(), 4);
+			dev->CreateTexture(td, &tdata, &p.shadowDummyTex);
+			if (p.shadowDummyTex) p.shadowDummySRV = p.shadowDummyTex->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
+		}
 
 		// Neutral defaults are the multiplicative identity for each map, so the
 		// same shader works with or without a texture:
@@ -2901,6 +3003,10 @@ Result<void, RenderError> MeshShaderSubsystem::drawSceneImpl(const Vector<MeshDr
 		// path is lit exactly like the forward path (the sun is user-controlled).
 		cb.cameraPos = Vec4(Vec3(glm::inverse(view)[3]), 1.0f);
 		cb.ambient = p.renderer->getAmbientLight();
+		// Cascaded shadows (see setShadowMap). Without a shadow pass the cascade
+		// splits stay 0 so the last slice of the always-lit dummy is used.
+		for (int i = 0; i < 4; ++i) cb.shadowMapUVDepth[i] = p.shadowUV[i];
+		cb.cascadeSplits = p.cascadeSplits;
 		Vec3 sunDir(0); Vec4 sunColor(1, 1, 1, 1);
 		if (p.renderer->getPrimaryDirectionalLight(sunDir, sunColor)) {
 			cb.lightDir = Vec4(glm::normalize(sunDir), 0.0f);

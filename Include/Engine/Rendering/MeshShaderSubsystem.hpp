@@ -136,6 +136,19 @@ public:
 	void setClusterBudget(UInt32 budget);
 
 	/**
+	 * @brief Shadow map + cascades used by the raster pixel shader.
+	 *
+	 * The mesh shader path shades with the engine's forward model, which includes
+	 * the cascaded shadow term, so it needs the same data the forward renderer
+	 * binds per draw. Call once per frame after the shadow pass and before
+	 * drawScene(); without it every object is lit as if nothing occluded it.
+	 * @param shadowMap       Shadow map SRV (a Texture2DArray), or nullptr to disable.
+	 * @param worldToShadowUV 4 world->shadow-UV-depth matrices, one per cascade.
+	 * @param cascadeSplits   Camera-space far distance of cascades 0..2.
+	 */
+	void setShadowMap(TextureSRV shadowMap, const Mat4 worldToShadowUV[4], const Vec4& cascadeSplits);
+
+	/**
 	 * @brief Draw the M1 test grid (animated cubes with amplification/mesh shaders).
 	 *
 	 * Renders into the currently bound render target + depth buffer of the

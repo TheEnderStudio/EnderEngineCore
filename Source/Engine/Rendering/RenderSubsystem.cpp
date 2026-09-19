@@ -1733,6 +1733,7 @@ void RenderSubsystem::setMSAASampleCount(UInt8 c) { m_backend->msaaSamples = c; 
 UInt8 RenderSubsystem::msaaSamples() const { return m_backend->msaaSamples; }
 
 void RenderSubsystem::setShadowSRV(TextureSRV srv) { m_backend->shadowSRV = static_cast<D::ITextureView*>(srv); }
+TextureSRV RenderSubsystem::getShadowSRV() const { return m_backend->shadowSRV; }
 void RenderSubsystem::setShadowData(const Mat4(&uv)[4], const Vec4& splits) { auto& b=*m_backend; for(int i=0;i<4;i++) b.shadowMapUVDepth[i]=uv[i]; b.cascadeSplits=splits; }
 
 Result<ShaderHandle, RenderError> RenderSubsystem::createShader(const ShaderDesc& d) { if (!m_backend->ok) return RenderError::NotInitialized; return m_backend->mkShader(d); }
