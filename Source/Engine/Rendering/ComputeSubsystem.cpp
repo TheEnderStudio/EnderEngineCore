@@ -1,4 +1,4 @@
-﻿#include <Rendering/ComputeSubsystem.hpp>
+#include <Rendering/ComputeSubsystem.hpp>
 #include <Rendering/RenderSubsystem.hpp>
 #include <Core/Log.hpp>
 #include <vector>
@@ -26,18 +26,32 @@ struct CullingInstance {
     float _p0, _p1, _p2;
 };
 
+// Mirrors IndirectDrawArgs in RenderTypes.hpp (32 bytes: D3D12's indexed draw
+// arguments plus alignment padding).
+struct IndirectDrawArgs {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    uint baseVertex;
+    uint startInstance;
+    uint _p0, _p1, _p2;
+};
+
 cbuffer CullingCB : register(b0) {
     float4 g_FrustumPlanes[6];
     uint g_InstanceCount;
     uint g_IndexCount;
     uint g_FirstIndex;
     uint g_BaseVertex;
+    uint g_MeshCount;
+    uint _pad0, _pad1, _pad2;
 };
 
-StructuredBuffer<CullingInstance> g_Input  : register(t0);
-RWStructuredBuffer<uint>          g_Visible : register(u0);
-RWStructuredBuffer<uint>          g_Indices : register(u1);
-RWStructuredBuffer<uint>          g_Counter : register(u2);
+StructuredBuffer<CullingInstance>    g_Input    : register(t0);
+RWStructuredBuffer<uint>             g_Visible  : register(u0);
+RWStructuredBuffer<uint>             g_Indices  : register(u1);
+RWStructuredBuffer<uint>             g_Counter  : register(u2);
+RWStructuredBuffer<IndirectDrawArgs> g_DrawArgs : register(u3);
 
 [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -55,6 +69,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (visible) {
         uint idx; InterlockedAdd(g_Counter[0], 1, idx);
         g_Indices[idx] = i;
+        // Publish the visible count straight into this frame's indirect draw
+        // arguments - one entry per drawn mesh, all carrying the same count
+        // because they share the compacted instance list. Writing it here means
+        // the CPU never has to read the count back, which used to cost a full
+        // device synchronisation every frame.
+        for (uint m = 0; m < g_MeshCount; ++m) {
+            uint prev;
+            InterlockedAdd(g_DrawArgs[m].instanceCount, 1, prev);
+        }
     }
 }
 )";
@@ -175,21 +198,25 @@ FrustumPlanes ComputeSubsystem::computeFrustumPlanes(const Mat4& vp) {
 	return r;
 }
 
-void ComputeSubsystem::updateCullingCB(void* cullingCB, const FrustumPlanes& fp, UInt32 instanceCount, UInt32 indexCount, UInt32 firstIndex, UInt32 baseVertex) {
+void ComputeSubsystem::updateCullingCB(void* cullingCB, const FrustumPlanes& fp, UInt32 instanceCount, UInt32 indexCount, UInt32 firstIndex, UInt32 baseVertex, UInt32 meshCount) {
 	auto* ctx = m_impl->ctx(); if (!ctx || !cullingCB) return;
 	auto* buf = static_cast<D::IBuffer*>(cullingCB);
 	D::PVoid d = nullptr; ctx->MapBuffer(buf, D::MAP_WRITE, D::MAP_FLAG_DISCARD, d);
 	if (d) {
-		struct { float p[6][4]; UInt32 cnt, icnt, fidx, bvtx; } cb;
+		// Layout must match CullingCB in g_CullingCS: 6 planes, then the counts,
+		// then the mesh count, padded out to a 16-byte multiple.
+		struct { float p[6][4]; UInt32 cnt, icnt, fidx, bvtx, meshes, _pad[3]; } cb;
 		for (int i = 0; i < 6; i++)
 			for (int j = 0; j < 4; j++) cb.p[i][j] = fp.planes[i][j];
 		cb.cnt = instanceCount; cb.icnt = indexCount; cb.fidx = firstIndex; cb.bvtx = baseVertex;
+		cb.meshes = meshCount;
+		cb._pad[0] = cb._pad[1] = cb._pad[2] = 0;
 		memcpy(d, &cb, sizeof(cb)); ctx->UnmapBuffer(buf, D::MAP_WRITE);
 	}
 }
 
 void ComputeSubsystem::updateCullingCB(void* cullingCB, const FrustumPlanes& fp, UInt32 instanceCount) {
-	updateCullingCB(cullingCB, fp, instanceCount, 0, 0, 0);
+	updateCullingCB(cullingCB, fp, instanceCount, 0, 0, 0, 0);
 }
 
 Result<void, CoreError> ComputeSubsystem::initCullingPipeline() {
@@ -230,27 +257,21 @@ Result<void, CoreError> ComputeSubsystem::initCullingPipeline() {
 }
 
 void ComputeSubsystem::updateBuffer(void* buf, const void* data, UInt32 size) {
-	auto* ctx = m_impl->ctx(); if (!ctx || !buf || !data) return;
-	auto* b = static_cast<D::IBuffer*>(buf);
-	// Create temporary staging buffer for upload
-	D::BufferDesc sd; sd.Name = "CS_TempStaging"; sd.Usage = D::USAGE_STAGING;
-	sd.CPUAccessFlags = D::CPU_ACCESS_WRITE; sd.Size = size;
-	D::RefCntAutoPtr<D::IBuffer> stg;
-	m_impl->device()->CreateBuffer(sd, nullptr, &stg);
-	if (!stg) return;
-	D::PVoid d = nullptr; ctx->MapBuffer(stg, D::MAP_WRITE, D::MAP_FLAG_DISCARD, d);
-	if (d) { memcpy(d, data, size); ctx->UnmapBuffer(stg, D::MAP_WRITE); }
-	ctx->CopyBuffer(stg, 0, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
-	                b, 0, size, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	ctx->WaitForIdle();
-}
-
-void ComputeSubsystem::dispatchCulling(void* instanceBuf, void* cullingCB, void* visibleMask, UInt32 instanceCount) {
-	dispatchCullingCompact(instanceBuf, cullingCB, visibleMask, nullptr, nullptr, instanceCount);
+	auto* ctx = m_impl->ctx(); if (!ctx || !buf || !data || size == 0) return;
+	// Recorded as an ordinary copy in the current command list: Diligent services
+	// it from the frame's upload heap, so there is no per-call GPU allocation and
+	// no device stall. The write lands in command-list order, ahead of anything
+	// submitted after it.
+	//
+	// This used to create a staging buffer per call, copy through it, and then
+	// call WaitForIdle(): a full CPU/GPU serialisation point, several times per
+	// frame, plus a GPU buffer created and destroyed each time.
+	ctx->UpdateBuffer(static_cast<D::IBuffer*>(buf), 0, size, data,
+		D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 }
 
 void ComputeSubsystem::dispatchCullingCompact(void* instanceBuf, void* cullingCB, void* visibleMask,
-                                              void* indicesBuf, void* argsBuf, UInt32 instanceCount) {
+                                              void* indicesBuf, void* counterBuf, void* drawArgsBuf, UInt32 instanceCount) {
 	auto& p = *m_impl;
 	if (!p.ok || !p.cullingPSO || !instanceBuf || !cullingCB || !visibleMask) return;
 	auto* ctx = p.ctx();
@@ -264,7 +285,11 @@ void ComputeSubsystem::dispatchCullingCompact(void* instanceBuf, void* cullingCB
 	if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_Indices"))
 		v->Set(indicesBuf ? static_cast<D::IBuffer*>(indicesBuf)->GetDefaultView(D::BUFFER_VIEW_UNORDERED_ACCESS) : nullptr);
 	if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_Counter"))
-		v->Set(argsBuf ? static_cast<D::IBuffer*>(argsBuf)->GetDefaultView(D::BUFFER_VIEW_UNORDERED_ACCESS) : nullptr);
+		v->Set(counterBuf ? static_cast<D::IBuffer*>(counterBuf)->GetDefaultView(D::BUFFER_VIEW_UNORDERED_ACCESS) : nullptr);
+	// The shader publishes the visible count into these arguments, so the CPU no
+	// longer needs to read it back before submitting the draw.
+	if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_DrawArgs"))
+		v->Set(drawArgsBuf ? static_cast<D::IBuffer*>(drawArgsBuf)->GetDefaultView(D::BUFFER_VIEW_UNORDERED_ACCESS) : nullptr);
 	ctx->SetPipelineState(p.cullingPSO);
 	ctx->CommitShaderResources(srb, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	D::DispatchComputeAttribs da;

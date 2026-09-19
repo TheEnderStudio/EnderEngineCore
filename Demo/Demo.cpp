@@ -1,4 +1,4 @@
-﻿#include <Engine/Core/Core.hpp>
+#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -22,6 +22,7 @@
 #include <Engine/Rendering/RayTracingSubsystem.hpp>
 #include <Engine/Rendering/DenoisingSubsystem.hpp>
 #include <Engine/Rendering/MeshShaderSubsystem.hpp>
+#include <Engine/Rendering/RenderPipeline.hpp>
 
 #include <HelloWorld/HelloWorldExt.hpp>
 #include <EngineExt/AdaptiveMusic.hpp>
@@ -465,6 +466,33 @@ float4 main(PSIn i) : SV_TARGET {
 		}
 	}
 
+	// ---- Render pipeline ----
+	// Wraps the whole frame as an explicit pass graph. It is opt-in: the classic
+	// inline path below stays the default until this one has been validated on
+	// real hardware.
+	bool msRenderPipeline = false;
+	RenderPipelineContext rpContext;
+	JobExecutor rpExecutor{ jobs };
+	Uptr<RenderPipeline> renderPipeline;
+	{
+		rpContext.renderer = &renderer;
+		rpContext.shadow = &shadow;
+		rpContext.meshShader = &meshShader;
+		rpContext.rayTracing = &rayTracing;
+		rpContext.denoising = &denoising;
+		rpContext.postProcess = &postProcess;
+		rpContext.ui = &ui;
+		rpContext.debugUI = &debugUI;
+		renderPipeline = std::make_unique<RenderPipeline>(rpExecutor, rpContext, "DemoFrame");
+		if (!renderPipeline->isBuilt()) {
+			EError("RenderPipeline: the pass graph failed to build; the pipeline path is unavailable.");
+			renderPipeline.reset();
+		}
+		else {
+			EInfo("RenderPipeline ready:\n{}", renderPipeline->describe());
+		}
+	}
+
 	// ---- Emissive showcase: a self-illuminated cube that glows in the direct
 	// view and appears lit inside ray traced reflections. ----
 	MeshHandle emissiveCubeMesh;
@@ -518,7 +546,7 @@ float4 main(PSIn i) : SV_TARGET {
 	// GPU culling buffers
 	ComputeBuf cullInstBuf = compute.createStructuredBuffer(1000, sizeof(CullingInstance), true);
 	ComputeBuf cullVisBuf = compute.createStructuredBuffer(1000, sizeof(UInt32), true);
-	ComputeBuf cullCBBuf = compute.createConstantBuffer(sizeof(FrustumPlanes) + sizeof(UInt32) * 4, true);
+	ComputeBuf cullCBBuf = compute.createConstantBuffer(sizeof(FrustumPlanes) + sizeof(UInt32) * 8, true);
 	ComputeBuf cullStgBuf = compute.createStagingBuffer(1000 * sizeof(UInt32));
 	Vector<UInt32> visibleFlags(1000, 1);
 
@@ -924,6 +952,25 @@ HALT
 		if (hybridRT) {
 			debugUI.text("RT trace: {:.2f} ms", rayTracing.lastTraceMs());
 		}
+
+		// ---- Render pipeline: pass graph and per-pass timing ----
+		if (renderPipeline) {
+			if (debugUI.button(fmt::format("Render Pipeline: {}", msRenderPipeline ? "On" : "Off").c_str())) {
+				msRenderPipeline = !msRenderPipeline;
+				EInfo("Render pipeline: {}", msRenderPipeline ? "ON" : "OFF");
+			}
+			debugUI.text("  (needs MS Scene on; per-pass timings below)");
+			const auto& run = renderPipeline->lastRunStats();
+			if (msRenderPipeline) {
+				debugUI.text("  frame {:.2f} ms | run {} skip {} fail {} | {} lv, widest {}",
+					run.totalMs, run.tasksRun, run.tasksSkipped, run.tasksFailed,
+					run.levelCount, run.maxLevelWidth);
+				for (const auto& pass : renderPipeline->passStats()) {
+					debugUI.text("  {:<11} {:>7.2f} ms  (avg {:>6.2f}, max {:>6.2f})  {}",
+						pass.name, pass.lastMs, pass.averageMs, pass.maxMs, ToString(pass.status));
+				}
+			}
+		}
 		debugUI.text("Mode: {} (F9)", hybridRT ? "Hybrid RT" : "Raster");
 		if (hybridRT) {
 			static const char* rtModeNames[] = { "Shaded", "GBufferColor", "GBufferNormal", "Diffuse", "Reflections", "Fresnel", "RTAlpha" };
@@ -1258,8 +1305,18 @@ HALT
 		fly.update(input, dt, &physicsBodies);
 		renderer.updateCamera(camHandle.value(), fly.toDesc(ww, wh));
 
-		// Distribute shadow cascades + bind SRV
-		{
+		// Whether the render pipeline owns this frame. The mesh shader scene is
+		// required: its geometry is already a plain data description, so the frame
+		// can be described without the classic indirect path.
+		const bool useRenderPipeline = msRenderPipeline && renderPipeline != nullptr
+			&& msFurinaScene && msMeshesRegistered && meshShader.isReady();
+
+		// Shared by the inline and pipeline paths so the toggle survives switching.
+		static bool fogEnabled = true;
+
+		// Distribute shadow cascades + bind SRV. Owned by the render pipeline's
+		// shadow pass when it is active.
+		if (!useRenderPipeline) {
 			auto camDesc = fly.toDesc(ww, wh);
 			Vec3 sunDirNorm = glm::normalize(Vec3(cos(glm::radians(sunYaw)) * cos(glm::radians(sunPitch)),
 				-sin(glm::radians(sunPitch)), sin(glm::radians(sunYaw)) * cos(glm::radians(sunPitch))));
@@ -1319,10 +1376,264 @@ HALT
 
 		debugUI.beginFrame(ww, wh);
 
-		if (!hybridRT) {
+		// Furina instance + GPU-cull data. Used by the classic indirect draw, by
+		// the indirect shadow pass, and by the render pipeline's shadow pass, so
+		// it is refreshed once per frame from whichever path is active.
+		auto updateFurinaCull = [&](const Mat4& view, const Mat4& proj) {
+			auto fp = compute.computeFrustumPlanes(proj * view);
+			// Upload world matrices to GPU
+			{
+				Vector<Mat4> wm(1000);
+				for (size_t i = 0; i < 1000; i++) wm[i] = transv[i].computeWorldMatrix();
+				compute.updateBuffer(worldMatBuf, wm.data(), static_cast<UInt32>(1000 * sizeof(Mat4)));
+			}
+			// Upload culling instances
+			{
+				Vector<CullingInstance> insts(1000);
+				for (size_t i = 0; i < 1000; i++) {
+					insts[i].boundSphere = Vec4(transv[i].position, 0.8f);
+					insts[i].drawIndex = static_cast<UInt32>(i);
+				}
+				compute.updateBuffer(cullInstBuf, insts.data(), static_cast<UInt32>(insts.size() * sizeof(CullingInstance)));
+			}
+			// Indirect draw arguments per mesh. instanceCount stays 0 here: the
+			// culling shader accumulates it as it finds visible instances, so the
+			// arguments are complete when the dispatch returns and no GPU->CPU
+			// readback is needed to submit the draw.
+			IndirectDrawArgs argsTmpl[8] = {};
+			if (!model.empty()) {
+				const UInt32 meshCount = static_cast<UInt32>(std::min<size_t>(model.size(), 8));
+				for (UInt32 mi = 0; mi < meshCount; mi++) {
+					auto sub = renderer.getSubMesh(model[mi], 0);
+					argsTmpl[mi].indexCount = static_cast<UInt32>(sub.indexCount);
+					argsTmpl[mi].firstIndex = static_cast<UInt32>(sub.indexOffset);
+					argsTmpl[mi].baseVertex = static_cast<UInt32>(sub.vertexOffset);
+				}
+				compute.updateBuffer(argsBuf, argsTmpl, sizeof(argsTmpl));
+				compute.updateCullingCB(cullCBBuf, fp, 1000,
+					argsTmpl[0].indexCount, argsTmpl[0].firstIndex, argsTmpl[0].baseVertex, meshCount);
+				// Clear the compaction counter before dispatch
+				{ UInt32 zero = 0; compute.updateBuffer(counterBuf, &zero, sizeof(zero)); }
+				compute.dispatchCullingCompact(cullInstBuf, cullCBBuf, cullVisBuf, indicesBuf, counterBuf, argsBuf, 1000);
+				// The on-screen "GPU cull" counter still needs the value on the CPU.
+				// Reading it is a device synchronisation, so refresh it every so
+				// often instead of every frame; the draw itself does not wait.
+				static UInt32 cullStatFrame = 0;
+				if ((cullStatFrame++ % 30) == 0) {
+					UInt32 visCount = 0;
+					compute.readback(cullStgBuf, counterBuf, sizeof(UInt32), &visCount);
+					gpuVisCount = visCount;
+				}
+			}
+		};
+
+		// ---- Render pipeline path (opt-in, DebugUI switch) ----
+		if (useRenderPipeline) {
+			RenderFrame frame;
+			frame.deltaTime = dt;
+			frame.timeSec = (F32)gameTick * 0.02f;
+			frame.width = ww;
+			frame.height = wh;
+			renderer.getCameraMatrices(frame.view, frame.proj);
+			frame.cameraPos = fly.pos;
+			frame.hybrid = hybridRT;
+			frame.denoise = rtDenoise;
+			frame.denoiserSelection = rtDenoiserSel;
+			frame.denoiseStrength = rtDenoiseStrength;
+
+			// Shadow cascade fitting inputs (the pipeline runs the pass itself).
+			{
+				auto camDesc = fly.toDesc(ww, wh);
+				frame.shadowLightDir = glm::normalize(Vec3(cos(glm::radians(sunYaw)) * cos(glm::radians(sunPitch)),
+					-sin(glm::radians(sunPitch)), sin(glm::radians(sunYaw)) * cos(glm::radians(sunPitch))));
+				F32 yr = glm::radians(fly.yaw), pr = glm::radians(fly.pitch);
+				frame.shadowEye = fly.pos;
+				frame.shadowCenter = fly.pos + Vec3(cos(pr) * cos(yr), sin(pr), cos(pr) * sin(yr));
+				frame.shadowFov = glm::radians(camDesc.fov);
+				frame.shadowAspect = (F32)ww / (F32)wh;
+				frame.shadowNear = camDesc.nearP;
+				frame.shadowFar = camDesc.farP;
+			}
+
+			// Geometry: the mesh shader path draws everything in one DrawMesh...
+			frame.useMeshShaderScene = true;
+			msAddGroup(frame.meshGroups, msTerrIdx, msTerrCount, { Transform{}.computeWorldMatrix() });
+			msAddGroup(frame.meshGroups, msWallIdx, msWallCount, { Transform{ .position = Vec3(20, -19, 20) }.computeWorldMatrix() });
+			if (emissiveCubeMesh.isValid()) msAddGroup(frame.meshGroups, msCubeIdx, msCubeCount, { emissiveCubeTf.computeWorldMatrix() });
+			{
+				Vector<Mat4> wm(std::min<size_t>(1000, (size_t)msInstBudget));
+				for (size_t i = 0; i < wm.size(); i++) wm[i] = transv[i].computeWorldMatrix();
+				msAddGroup(frame.meshGroups, msFurinaIdx, msFurinaCount, wm);
+			}
+			if (!fly.boundToBody && fly.cameraBody != InvalidRigidBody && msFurinaCount > 0)
+				msAddGroup(frame.meshGroups, msFurinaIdx, msFurinaCount, { physicsBodies.getWorldTransform(fly.cameraBody).computeWorldMatrix() });
+
+			// Shadow geometry: terrain, wall and cube explicitly; the bodies
+			// through the GPU-cull buffers so the shadow cost stays bounded.
+			for (auto& terrMesh : terrian) {
+				SceneDraw d; d.kind = SceneDraw::Kind::Single; d.mesh = terrMesh; frame.sceneDraws.push_back(std::move(d));
+			}
+			for (auto& wallMesh : wall) {
+				SceneDraw d; d.kind = SceneDraw::Kind::Single; d.mesh = wallMesh;
+				d.transform.position = Vec3(20, -19, 20);
+				frame.sceneDraws.push_back(std::move(d));
+			}
+			if (emissiveCubeMesh.isValid()) {
+				SceneDraw d; d.kind = SceneDraw::Kind::Single; d.mesh = emissiveCubeMesh;
+				d.transform = emissiveCubeTf;
+				frame.sceneDraws.push_back(std::move(d));
+			}
+			if (!hybridRT && !model.empty()) {
+				// Only the raster shadow pass needs the cull results.
+				updateFurinaCull(frame.view, frame.proj);
+				for (size_t mi = 0; mi < model.size(); mi++) {
+					SceneDraw d; d.kind = SceneDraw::Kind::Indirect; d.mesh = model[mi];
+					d.worldMatricesSRV = wmSRV;
+					d.indicesSRV = idxSRV;
+					d.indirectArgs = argsBuf;
+					d.argsByteOffset = static_cast<UInt32>(mi * sizeof(IndirectDrawArgs));
+					frame.sceneDraws.push_back(std::move(d));
+				}
+			}
+
+			// Fog cloud around the camera.
+			{
+				if (st.wasKeyPressedThisFrame(KeyCode::Num1)) { fogEnabled = !fogEnabled; EInfo("Fog: {}", fogEnabled ? "ON" : "OFF"); }
+				if (fogEnabled && !hybridRT) {
+					static constexpr int N = 240;
+					static Vector<RenderSubsystem::BillboardDesc> fogs(N);
+					F32 t = (F32)(gameTick * 0.015);
+					for (int i = 0; i < N; i++) {
+						F32 phi = acosf(1.0f - 2.0f * ((F32)i + 0.5f) / N);
+						F32 theta = glm::two_pi<F32>() * (F32)i * 1.61803398875f;
+						F32 r = 3.0f + sinf(t * 0.7f + i * 0.5f) * 0.4f + sinf(i * 2.3f) * 0.6f;
+						fogs[i].position = fly.pos + Vec3(sinf(phi) * cosf(theta) * r,
+							cosf(phi) * r + sinf(t + i * 0.3f) * 0.2f, sinf(phi) * sinf(theta) * r);
+						fogs[i].size = Vec2(2.5f + sinf(i * 1.7f + t) * 0.5f);
+						fogs[i].color = Vec4(1, 1, 1, 0.3f + sinf(i * 2.6f + t) * 0.4f);
+					}
+					frame.billboards = fogs;
+				}
+			}
+
+			// The M1 diagnostic grid lives inside the scene pass.
+			if (msTestGrid && meshShader.isReady()) {
+				frame.sceneExtras = [&](RenderSubsystem&) -> Result<void, CoreError> {
+					Mat4 msView, msProj; renderer.getCameraMatrices(msView, msProj);
+					const auto mg = meshShader.drawGrid(msView, msProj, (F32)gameTick * 0.02f);
+					return mg.isErr() ? Result<void, CoreError>(CoreError::OperationFailed) : Result<void, CoreError>{};
+				};
+			}
+
+			// Hybrid: G-buffer targets, RT scene and trace constants.
+			frame.gBufferColor = gbufColor;
+			frame.gBufferNormal = gbufNormal;
+			frame.gBufferEmissive = gbufEmissive;
+			frame.gBufferDepth = gbufDepth;
+			frame.resolveColor = resColor;
+			frame.resolveNormal = resNormal;
+			frame.resolveEmissive = resEmissive;
+			frame.resolveDepth = resDepth;
+			frame.rtTex = rtTex;
+			frame.rtAlbedo = rtAlbedo;
+			frame.rtNormal = rtNormal;
+			frame.rtDrawMode = (UInt32)rtDrawMode;
+			frame.lightColor = Vec3(sunColorR, sunColorG, sunColorB);
+			if (hybridRT) {
+				rayTracing.setSkybox(s_skyMode == 3, skyCubeTexHandle, s_skyCorners);
+				frame.rtConstants.lightDir = Vec4(glm::normalize(-frame.shadowLightDir), 0.0f);
+				frame.rtConstants.maxRayLength = 100.0f;
+				frame.rtConstants.ambientLight = 0.1f;
+				frame.rtConstants.lightIntensity = sunIntensity;
+				frame.rtConstants.lightColor = Vec4(sunColorR, sunColorG, sunColorB, 0.0f);
+				frame.rtConstants.shadowPCF = rtShadowPCF;
+				frame.rtConstants.aoRadius = rtAoRadius;
+				frame.rtConstants.aoSamples = rtAoSamples;
+				frame.rtConstants.lightSize = rtLightSize;
+				frame.rtConstants.reflectionBlur = rtReflectionBlur;
+				frame.rtConstants.maxBounces = rtMaxBounces;
+				frame.rtConstants.bounceRoughness = rtBounceRoughness;
+				frame.rtConstants.reflectionSamples = rtReflectionSamples;
+				{
+					static Vec4 s_disc[8];
+					static bool s_discInit = false;
+					if (!s_discInit) {
+						memset(s_disc, 0, sizeof(s_disc));
+						for (int i = 1; i < 16; ++i) {
+							float r = std::sqrt((i + 0.5f) / 16.0f) * 0.8f;
+							float a = i * 2.399963f;
+							Vec2 p(cosf(a) * r, sinf(a) * r);
+							s_disc[i / 2][(i % 2) * 2] = p.x;
+							s_disc[i / 2][(i % 2) * 2 + 1] = p.y;
+						}
+						s_discInit = true;
+					}
+					memcpy(frame.rtConstants.discPoints, s_disc, sizeof(s_disc));
+				}
+				if (rtResAuto) {
+					float minDist = 1e9f;
+					for (const auto& t : transv) minDist = std::min(minDist, glm::length(t.position - fly.pos));
+					float targetScale = rtResScale;
+					if (rtResScale >= 1.0f && minDist > 28.0f) targetScale = 0.5f;
+					else if (rtResScale <= 0.5f && minDist < 22.0f) targetScale = 1.0f;
+					if (targetScale != rtResScale) { rtResScale = targetScale; createRTTex(ww, wh); }
+				}
+				frame.rtTex = rtTex;
+				frame.rtAlbedo = rtAlbedo;
+				frame.rtNormal = rtNormal;
+				frame.rtWidth = std::max<UInt32>(1, (UInt32)(ww * rtResScale));
+				frame.rtHeight = std::max<UInt32>(1, (UInt32)(wh * rtResScale));
+
+				if (!terrian.empty()) {
+					RayTracedObjectGroup g;
+					for (auto& terrMesh : terrian) {
+						RayTracedObject o; o.mesh = terrMesh;
+						o.material = renderer.getSubMesh(terrMesh, 0).material;
+						g.objects.push_back(o);
+					}
+					frame.rtGroups.push_back(std::move(g));
+				}
+				if (!wall.empty()) {
+					RayTracedObjectGroup g;
+					g.transform.position = Vec3(20, -19, 20);
+					for (auto& wallMesh : wall) {
+						RayTracedObject o; o.mesh = wallMesh;
+						o.material = renderer.getSubMesh(wallMesh, 0).material;
+						g.objects.push_back(o);
+					}
+					frame.rtGroups.push_back(std::move(g));
+				}
+				if (emissiveCubeMesh.isValid() && emissiveCubeMat.isValid()) {
+					RayTracedObjectGroup g;
+					g.transform = emissiveCubeTf;
+					RayTracedObject o; o.mesh = emissiveCubeMesh; o.material = emissiveCubeMat;
+					g.objects.push_back(o);
+					frame.rtGroups.push_back(std::move(g));
+				}
+				if (!model.empty() && modelLoadCompleted.load(std::memory_order_acquire)) {
+					for (size_t i = 0; i < physHandles.size(); ++i) {
+						RayTracedObjectGroup g;
+						g.transform = physicsBodies.getWorldTransform(physHandles[i]);
+						for (size_t mi = 0; mi < model.size(); ++mi) {
+							RayTracedObject o; o.mesh = model[mi];
+							o.material = renderer.getSubMesh(model[mi], 0).material;
+							g.objects.push_back(o);
+						}
+						frame.rtGroups.push_back(std::move(g));
+					}
+				}
+			}
+
+			const auto pr = renderPipeline->render(frame);
+			if (pr.isErr()) {
+				static bool rpWarned = false;
+				if (!rpWarned) { EError("RenderPipeline frame failed: {}", ToString(pr.error())); rpWarned = true; }
+			}
+		}
+		else if (!hybridRT) {
 			renderer.setRenderTarget(postProcess.getHDRRTV());
 			renderer.beginFrame();
-
+			
 			// Whole scene: mesh shader cluster-LOD path (all objects in one
 			// DrawMesh), or the classic per-object draws.
 			{
@@ -1352,50 +1663,7 @@ HALT
 				// Furina instance + GPU-cull data. This runs in *both* modes: the
 				// mesh shader path culls on its own, but the indirect shadow pass
 				// (issued earlier in the frame) reads these buffers.
-				{
-					auto fp = compute.computeFrustumPlanes(proj * view);
-					// Upload world matrices to GPU
-					{
-						Vector<Mat4> wm(1000);
-						for (size_t i = 0; i < 1000; i++) wm[i] = transv[i].computeWorldMatrix();
-						compute.updateBuffer(worldMatBuf, wm.data(), static_cast<UInt32>(1000 * sizeof(Mat4)));
-					}
-					// Upload culling instances
-					{
-						Vector<CullingInstance> insts(1000);
-						for (size_t i = 0; i < 1000; i++) {
-							insts[i].boundSphere = Vec4(transv[i].position, 0.8f);
-							insts[i].drawIndex = static_cast<UInt32>(i);
-						}
-						compute.updateBuffer(cullInstBuf, insts.data(), static_cast<UInt32>(insts.size() * sizeof(CullingInstance)));
-					}
-					// Pre-fill indirect args per mesh
-					IndirectDrawArgs argsTmpl[8] = {};
-					if (!model.empty()) {
-						for (size_t mi = 0; mi < model.size() && mi < 8; mi++) {
-							auto sub = renderer.getSubMesh(model[mi], 0);
-							argsTmpl[mi].indexCount = static_cast<UInt32>(sub.indexCount);
-							argsTmpl[mi].firstIndex = static_cast<UInt32>(sub.indexOffset);
-							argsTmpl[mi].baseVertex = static_cast<UInt32>(sub.vertexOffset);
-						}
-						compute.updateBuffer(argsBuf, argsTmpl, sizeof(argsTmpl));
-						compute.updateCullingCB(cullCBBuf, fp, 1000,
-							argsTmpl[0].indexCount, argsTmpl[0].firstIndex, argsTmpl[0].baseVertex);
-						// Clear counter before dispatch
-						{ UInt32 zero = 0; compute.updateBuffer(counterBuf, &zero, sizeof(zero)); }
-						compute.dispatchCullingCompact(cullInstBuf, cullCBBuf, cullVisBuf, indicesBuf, counterBuf, 1000);
-						// Copy instanceCount to all mesh entries
-						{
-							UInt32 visCount = 0;
-							compute.readback(cullStgBuf, counterBuf, sizeof(UInt32), &visCount);
-							gpuVisCount = visCount;
-							for (size_t mi = 0; mi < model.size() && mi < 8; mi++) {
-								argsTmpl[mi].instanceCount = visCount;
-							}
-							compute.updateBuffer(argsBuf, argsTmpl, sizeof(argsTmpl));
-						}
-					}
-				}
+				updateFurinaCull(view, proj);
 				if (!msSceneActive) {
 					for (size_t mi = 0; mi < model.size(); mi++)
 						renderer.drawMeshInstancedIndirect(model[mi], wmSRV, idxSRV, argsBuf, static_cast<UInt32>(mi * sizeof(IndirectDrawArgs)));
@@ -1438,7 +1706,6 @@ HALT
 
 			// Fog cloud around camera (toggle with '1')
 			{
-				static bool fogEnabled = true;
 				if (st.wasKeyPressedThisFrame(KeyCode::Num1)) { fogEnabled = !fogEnabled; EInfo("Fog: {}", fogEnabled ? "ON" : "OFF"); }
 				if (fogEnabled) {
 					static constexpr int N = 240;
@@ -1693,18 +1960,22 @@ HALT
 			renderer.setRenderTarget(nullptr);
 		}
 
-		// Render UI layers that receive post-processing (before execute)
-		ui.beginFrame(false);
-		ui.endFrame();
+		// Frame tail. Owned by the render pipeline's uiPost / postExecute /
+		// uiLate / debugUi / present passes when it is active.
+		if (!useRenderPipeline) {
+			// Render UI layers that receive post-processing (before execute)
+			ui.beginFrame(false);
+			ui.endFrame();
 
-		postProcess.execute();
+			postProcess.execute();
 
-		// Render UI layers that skip post-processing (after execute, before debug UI)
-		ui.beginFrame(true);
-		ui.endFrame();
+			// Render UI layers that skip post-processing (after execute, before debug UI)
+			ui.beginFrame(true);
+			ui.endFrame();
 
-		debugUI.endFrameAndRender();
-		postProcess.present();
+			debugUI.endFrameAndRender();
+			postProcess.present();
+		}
 
 		static F64 fpsTimer = 0; static UInt32 fpsCount = 0, lastFps = 0;
 		fpsTimer += dt; fpsCount++;

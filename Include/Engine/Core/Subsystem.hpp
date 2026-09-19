@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "Macros.h"
 #include "Types.hpp"

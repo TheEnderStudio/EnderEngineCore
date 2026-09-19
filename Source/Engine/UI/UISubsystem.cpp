@@ -76,7 +76,14 @@ struct UISubsystem::Impl {
 
 UISubsystem::UISubsystem():Subsystem("UI"),m_impl(std::make_unique<Impl>()){}
 UISubsystem::~UISubsystem()=default;
-void UISubsystem::initialize(Rendering::Render2DSubsystem*r,UInt32 w,UInt32 h){m_impl->r2d=r;m_impl->screenW=w;m_impl->screenH=h;}
+void UISubsystem::initialize(Rendering::Render2DSubsystem*r,UInt32 w,UInt32 h){
+	m_impl->r2d=r;m_impl->screenW=w;m_impl->screenH=h;
+	// Run the base initialize too: onInitialize() validates the 2D renderer that
+	// was just stored, and the Running state is what lets other subsystems (and
+	// the render pipeline) know this one is usable.
+	const Result<void,CoreError> result=Subsystem::initialize();
+	if(result.isErr()) EError("UI: initialization failed: {}",ToString(result.error()));
+}
 void UISubsystem::setScreenSize(UInt32 w,UInt32 h){m_impl->screenW=w;m_impl->screenH=h;if(m_impl->r2d)m_impl->r2d->setScreenSize(w,h);}
 void UISubsystem::setMousePos(float x,float y){m_impl->mouseX=x;m_impl->mouseY=y;}
 void UISubsystem::setMouseDown(bool d){m_impl->mouseDown=d;}

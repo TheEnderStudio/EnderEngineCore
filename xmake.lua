@@ -1,4 +1,4 @@
-﻿set_project("EnderEngine")
+set_project("EnderEngine")
 set_xmakever("2.8.0")
 add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate")
@@ -243,6 +243,9 @@ target("TestCore")
 	set_kind("binary")
 	add_deps("EnderEngineCore")
 	add_files("Tests/*.cpp")
+	-- Mirrors EnderEngineCore/Demo: some engine headers include each other as
+	-- <Core/...>, which resolves relative to Include/Engine.
+	add_includedirs("Include/Engine", { private = true })
 
 	if is_mode("debug") then
 		add_linkdirs("ThirdParty/gtest/lib")
