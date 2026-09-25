@@ -9,3 +9,4 @@ Tools/BuildHelper/BuildHelper.exe
 Tools/BuildHelper/go.sum
 vsxmake2026/
 compile_commands.json
+/Source/Engine/Core/Version.aps
