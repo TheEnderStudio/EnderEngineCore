@@ -1,4 +1,4 @@
-﻿#include <Engine/Core/Core.hpp>
+#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -467,10 +467,9 @@ float4 main(PSIn i) : SV_TARGET {
 	}
 
 	// ---- Render pipeline ----
-	// Wraps the whole frame as an explicit pass graph. It is opt-in: the classic
-	// inline path below stays the default until this one has been validated on
-	// real hardware.
-	bool msRenderPipeline = true;
+	// Owns the entire frame as an explicit pass graph: shadows, geometry
+	// submission and the frame tail. There is no inline fallback path any more,
+	// so a build failure means nothing gets drawn and is reported loudly.
 	RenderPipelineContext rpContext;
 	JobExecutor rpExecutor{ jobs };
 	Uptr<RenderPipeline> renderPipeline;
@@ -955,21 +954,17 @@ HALT
 
 		// ---- Render pipeline: pass graph and per-pass timing ----
 		if (renderPipeline) {
-			if (debugUI.button(fmt::format("Render Pipeline: {}", msRenderPipeline ? "On" : "Off").c_str())) {
-				msRenderPipeline = !msRenderPipeline;
-				EInfo("Render pipeline: {}", msRenderPipeline ? "ON" : "OFF");
-			}
-			debugUI.text("  (needs MS Scene on; per-pass timings below)");
 			const auto& run = renderPipeline->lastRunStats();
-			if (msRenderPipeline) {
-				debugUI.text("  frame {:.2f} ms | run {} skip {} fail {} | {} lv, widest {}",
-					run.totalMs, run.tasksRun, run.tasksSkipped, run.tasksFailed,
-					run.levelCount, run.maxLevelWidth);
-				for (const auto& pass : renderPipeline->passStats()) {
-					debugUI.text("  {:<11} {:>7.2f} ms  (avg {:>6.2f}, max {:>6.2f})  {}",
-						pass.name, pass.lastMs, pass.averageMs, pass.maxMs, ToString(pass.status));
-				}
+			debugUI.text("  frame {:.2f} ms | run {} skip {} fail {} | {} lv, widest {}",
+				run.totalMs, run.tasksRun, run.tasksSkipped, run.tasksFailed,
+				run.levelCount, run.maxLevelWidth);
+			for (const auto& pass : renderPipeline->passStats()) {
+				debugUI.text("  {:<11} {:>7.2f} ms  (avg {:>6.2f}, max {:>6.2f})  {}",
+					pass.name, pass.lastMs, pass.averageMs, pass.maxMs, ToString(pass.status));
 			}
+		}
+		else {
+			debugUI.text("Render pipeline: UNAVAILABLE (no frame is being drawn)");
 		}
 		debugUI.text("Mode: {} (F9)", hybridRT ? "Hybrid RT" : "Raster");
 		if (hybridRT) {
@@ -1305,44 +1300,16 @@ HALT
 		fly.update(input, dt, &physicsBodies);
 		renderer.updateCamera(camHandle.value(), fly.toDesc(ww, wh));
 
-		// Whether the render pipeline owns this frame. The mesh shader scene is
-		// required: its geometry is already a plain data description, so the frame
-		// can be described without the classic indirect path.
-		const bool useRenderPipeline = msRenderPipeline && renderPipeline != nullptr
-			&& msFurinaScene && msMeshesRegistered && meshShader.isReady();
-
-		// Shared by the inline and pipeline paths so the toggle survives switching.
-		static bool fogEnabled = true;
-
-		// Distribute shadow cascades + bind SRV. Owned by the render pipeline's
-		// shadow pass when it is active.
-		if (!useRenderPipeline) {
-			auto camDesc = fly.toDesc(ww, wh);
-			Vec3 sunDirNorm = glm::normalize(Vec3(cos(glm::radians(sunYaw)) * cos(glm::radians(sunPitch)),
-				-sin(glm::radians(sunPitch)), sin(glm::radians(sunYaw)) * cos(glm::radians(sunPitch))));
-			F32 yr = glm::radians(fly.yaw), pr = glm::radians(fly.pitch);
-			Vec3 fwd(cos(pr) * cos(yr), sin(pr), cos(pr) * sin(yr));
-			shadow.distribute(sunDirNorm, fly.pos, fly.pos + fwd, Vec3(0, 1, 0), glm::radians(camDesc.fov), (F32)ww / (F32)wh, camDesc.nearP, camDesc.farP);
-			renderer.clearShadowCascades(shadow);
-			for (auto& terrMesh : terrian)
-				renderer.renderShadowPass(shadow, terrMesh, Transform{}.computeWorldMatrix());
-			for (auto& wallMesh : wall)
-				renderer.renderShadowPass(shadow, wallMesh, Transform{ .position = Vec3(20, -19, 20) }.computeWorldMatrix());
-			if (emissiveCubeMesh.isValid())
-				renderer.renderShadowPass(shadow, emissiveCubeMesh, emissiveCubeTf.computeWorldMatrix());
-			// Indirect shadow for Furinas (all instances, GPU-culled)
-			for (size_t mi = 0; mi < model.size(); mi++)
-				renderer.renderShadowPassIndirect(shadow, model[mi], wmSRV, idxSRV, argsBuf, static_cast<UInt32>(mi * sizeof(IndirectDrawArgs)));
-			renderer.setShadowSRV(shadow.getSRV());
-			{
-				Mat4 uv[4];
-				for (UInt32 ci = 0; ci < 4; ci++) uv[ci] = shadow.getWorldToShadowMapUVDepth(ci);
-				renderer.setShadowData(uv, shadow.getCascadeSplitDistances());
-				// The mesh shader path shades with the forward model, which
-				// includes the cascaded shadow term, so it needs the same data.
-				meshShader.setShadowMap(renderer.getShadowSRV(), uv, shadow.getCascadeSplitDistances());
-			}
+		// The render pipeline owns every frame: shadow cascades, geometry
+		// submission and the frame tail. There is no inline fallback, so report a
+		// missing pipeline once instead of silently rendering nothing.
+		if (renderPipeline == nullptr) {
+			static bool rpMissingWarned = false;
+			if (!rpMissingWarned) { EError("RenderPipeline is unavailable: nothing will be drawn"); rpMissingWarned = true; }
 		}
+
+		// Toggled with '1'.
+		static bool fogEnabled = true;
 
 		// Update audio listener
 		{
@@ -1376,9 +1343,9 @@ HALT
 
 		debugUI.beginFrame(ww, wh);
 
-		// Furina instance + GPU-cull data. Used by the classic indirect draw, by
-		// the indirect shadow pass, and by the render pipeline's shadow pass, so
-		// it is refreshed once per frame from whichever path is active.
+		// Furina instance + GPU-cull data. It feeds the pipeline's indirect scene
+		// draws (raster mode) and its indirect shadow pass, so it is refreshed
+		// once per frame, before the geometry passes run.
 		auto updateFurinaCull = [&](const Mat4& view, const Mat4& proj) {
 			auto fp = compute.computeFrustumPlanes(proj * view);
 			// Upload world matrices to GPU
@@ -1427,8 +1394,8 @@ HALT
 			}
 		};
 
-		// ---- Render pipeline path (opt-in, DebugUI switch) ----
-		if (useRenderPipeline) {
+		// ---- Render pipeline path ----
+		if (renderPipeline) {
 			RenderFrame frame;
 			frame.deltaTime = dt;
 			frame.timeSec = (F32)gameTick * 0.02f;
@@ -1455,21 +1422,25 @@ HALT
 				frame.shadowFar = camDesc.farP;
 			}
 
-			// Geometry: the mesh shader path draws everything in one DrawMesh...
-			frame.useMeshShaderScene = true;
-			msAddGroup(frame.meshGroups, msTerrIdx, msTerrCount, { Transform{}.computeWorldMatrix() });
-			msAddGroup(frame.meshGroups, msWallIdx, msWallCount, { Transform{ .position = Vec3(20, -19, 20) }.computeWorldMatrix() });
-			if (emissiveCubeMesh.isValid()) msAddGroup(frame.meshGroups, msCubeIdx, msCubeCount, { emissiveCubeTf.computeWorldMatrix() });
-			{
-				Vector<Mat4> wm(std::min<size_t>(1000, (size_t)msInstBudget));
-				for (size_t i = 0; i < wm.size(); i++) wm[i] = transv[i].computeWorldMatrix();
-				msAddGroup(frame.meshGroups, msFurinaIdx, msFurinaCount, wm);
+			// Scene geometry. One description feeds the colour pass and the shadow
+			// pass, so a mesh can never be visible but unshadowed. The mesh shader
+			// path submits it as draw groups (one DrawMesh for the whole scene);
+			// everything else goes through the explicit list.
+			frame.useMeshShaderScene = msFurinaScene && msMeshesRegistered && meshShader.isReady();
+			if (frame.useMeshShaderScene) {
+				msAddGroup(frame.meshGroups, msTerrIdx, msTerrCount, { Transform{}.computeWorldMatrix() });
+				msAddGroup(frame.meshGroups, msWallIdx, msWallCount, { Transform{ .position = Vec3(20, -19, 20) }.computeWorldMatrix() });
+				if (emissiveCubeMesh.isValid()) msAddGroup(frame.meshGroups, msCubeIdx, msCubeCount, { emissiveCubeTf.computeWorldMatrix() });
+				{
+					Vector<Mat4> wm(std::min<size_t>(1000, (size_t)msInstBudget));
+					for (size_t i = 0; i < wm.size(); i++) wm[i] = transv[i].computeWorldMatrix();
+					msAddGroup(frame.meshGroups, msFurinaIdx, msFurinaCount, wm);
+				}
+				if (!fly.boundToBody && fly.cameraBody != InvalidRigidBody && msFurinaCount > 0)
+					msAddGroup(frame.meshGroups, msFurinaIdx, msFurinaCount, { physicsBodies.getWorldTransform(fly.cameraBody).computeWorldMatrix() });
 			}
-			if (!fly.boundToBody && fly.cameraBody != InvalidRigidBody && msFurinaCount > 0)
-				msAddGroup(frame.meshGroups, msFurinaIdx, msFurinaCount, { physicsBodies.getWorldTransform(fly.cameraBody).computeWorldMatrix() });
 
-			// Shadow geometry: terrain, wall and cube explicitly; the bodies
-			// through the GPU-cull buffers so the shadow cost stays bounded.
+			// Explicit geometry: static meshes first, then the bodies.
 			for (auto& terrMesh : terrian) {
 				SceneDraw d; d.kind = SceneDraw::Kind::Single; d.mesh = terrMesh; frame.sceneDraws.push_back(std::move(d));
 			}
@@ -1483,16 +1454,40 @@ HALT
 				d.transform = emissiveCubeTf;
 				frame.sceneDraws.push_back(std::move(d));
 			}
-			if (!hybridRT && !model.empty()) {
-				// Only the raster shadow pass needs the cull results.
-				updateFurinaCull(frame.view, frame.proj);
-				for (size_t mi = 0; mi < model.size(); mi++) {
-					SceneDraw d; d.kind = SceneDraw::Kind::Indirect; d.mesh = model[mi];
-					d.worldMatricesSRV = wmSRV;
-					d.indicesSRV = idxSRV;
-					d.indirectArgs = argsBuf;
-					d.argsByteOffset = static_cast<UInt32>(mi * sizeof(IndirectDrawArgs));
-					frame.sceneDraws.push_back(std::move(d));
+			if (!model.empty() && modelLoadCompleted.load(std::memory_order_acquire)) {
+				// The explicit submission path needs an entry per mesh. The raster
+				// pass draws through the GPU-cull buffers, the hybrid pass draws
+				// every body directly (its G-buffer pass does no culling of its
+				// own). The mesh shader path already covers this geometry above,
+				// but the shadow pass still walks this list.
+				if (!hybridRT) {
+					updateFurinaCull(frame.view, frame.proj);
+					for (size_t mi = 0; mi < model.size(); mi++) {
+						SceneDraw d; d.kind = SceneDraw::Kind::Indirect; d.mesh = model[mi];
+						d.worldMatricesSRV = wmSRV;
+						d.indicesSRV = idxSRV;
+						d.indirectArgs = argsBuf;
+						d.argsByteOffset = static_cast<UInt32>(mi * sizeof(IndirectDrawArgs));
+						frame.sceneDraws.push_back(std::move(d));
+					}
+				}
+				else if (!frame.useMeshShaderScene) {
+					Vector<Mat4> wmats(std::min<size_t>(1000, (size_t)msInstBudget));
+					for (size_t i = 0; i < wmats.size(); i++) wmats[i] = transv[i].computeWorldMatrix();
+					for (size_t mi = 0; mi < model.size(); mi++) {
+						SceneDraw d; d.kind = SceneDraw::Kind::Instanced; d.mesh = model[mi];
+						d.matrices = wmats;
+						frame.sceneDraws.push_back(std::move(d));
+					}
+				}
+				// Free-fly camera body, when the explicit path is drawing the model.
+				if (!frame.useMeshShaderScene && !fly.boundToBody && fly.cameraBody != InvalidRigidBody) {
+					Vector<Mat4> camMat = { physicsBodies.getWorldTransform(fly.cameraBody).computeWorldMatrix() };
+					for (size_t mi = 0; mi < model.size(); mi++) {
+						SceneDraw d; d.kind = SceneDraw::Kind::Instanced; d.mesh = model[mi];
+						d.matrices = camMat;
+						frame.sceneDraws.push_back(std::move(d));
+					}
 				}
 			}
 
@@ -1630,352 +1625,9 @@ HALT
 				if (!rpWarned) { EError("RenderPipeline frame failed: {}", ToString(pr.error())); rpWarned = true; }
 			}
 		}
-		else if (!hybridRT) {
-			renderer.setRenderTarget(postProcess.getHDRRTV());
-			renderer.beginFrame();
-			
-			// Whole scene: mesh shader cluster-LOD path (all objects in one
-			// DrawMesh), or the classic per-object draws.
-			{
-				Mat4 view, proj; renderer.getCameraMatrices(view, proj);
-				const bool msSceneActive = msFurinaScene && msMeshesRegistered;
-				if (msSceneActive) {
-					// One draw group per scene object type; all of them are culled
-					// and LOD-selected by a single amplification dispatch.
-					Vector<MeshShaderSubsystem::MeshDrawGroup> groups;
-					msAddGroup(groups, msTerrIdx, msTerrCount, { Transform{}.computeWorldMatrix() });
-					msAddGroup(groups, msWallIdx, msWallCount, { Transform{ .position = Vec3(20, -19, 20) }.computeWorldMatrix() });
-					if (emissiveCubeMesh.isValid()) msAddGroup(groups, msCubeIdx, msCubeCount, { emissiveCubeTf.computeWorldMatrix() });
-					{
-						Vector<Mat4> wm(std::min<size_t>(1000, (size_t)msInstBudget));
-						for (size_t i = 0; i < wm.size(); i++) wm[i] = transv[i].computeWorldMatrix();
-						msAddGroup(groups, msFurinaIdx, msFurinaCount, wm);
-					}
-					if (!fly.boundToBody && fly.cameraBody != InvalidRigidBody && msFurinaCount > 0)
-						msAddGroup(groups, msFurinaIdx, msFurinaCount, { physicsBodies.getWorldTransform(fly.cameraBody).computeWorldMatrix() });
-
-					auto mr = meshShader.drawScene(groups, view, proj, (F32)gameTick * 0.02f);
-					if (mr.isErr()) {
-						static bool msSceneWarned = false;
-						if (!msSceneWarned) { EError("MeshShader scene failed: {}", ToString(mr.error())); msSceneWarned = true; }
-					}
-				}
-				// Furina instance + GPU-cull data. This runs in *both* modes: the
-				// mesh shader path culls on its own, but the indirect shadow pass
-				// (issued earlier in the frame) reads these buffers.
-				updateFurinaCull(view, proj);
-				if (!msSceneActive) {
-					for (size_t mi = 0; mi < model.size(); mi++)
-						renderer.drawMeshInstancedIndirect(model[mi], wmSRV, idxSRV, argsBuf, static_cast<UInt32>(mi * sizeof(IndirectDrawArgs)));
-				}
-			}
-
-			// Classic per-object draws (skipped while the mesh shader path owns
-			// the whole scene).
-			if (!msFurinaScene || !msMeshesRegistered) {
-				for (auto& terrMesh : terrian) {
-					static const Transform trans{ .position = Vec3(0, 0, 0) };
-					renderer.drawMesh(terrMesh, trans);
-				}
-				for (auto& wallMesh : wall) {
-					static const Transform trans{ .position = Vec3(20, -19, 20) };
-					renderer.drawMesh(wallMesh, trans);
-				}
-				if (emissiveCubeMesh.isValid()) renderer.drawMesh(emissiveCubeMesh, emissiveCubeTf);
-			}
-
-			// M1: mesh shader test grid (amplification culling + mesh shader draws).
-			if (msTestGrid && meshShader.isReady()) {
-				Mat4 msView, msProj; renderer.getCameraMatrices(msView, msProj);
-				auto mg = meshShader.drawGrid(msView, msProj, (F32)gameTick * 0.02f);
-				if (mg.isErr()) {
-					static bool msWarned = false;
-					if (!msWarned) { EError("MeshShader grid failed: {}", ToString(mg.error())); msWarned = true; }
-				}
-			}
-
-			// Draw camera body model when free-fly (F5 detached)
-			if (!msFurinaScene && !fly.boundToBody && fly.cameraBody != InvalidRigidBody && !model.empty()) {
-				Transform ct = physicsBodies.getWorldTransform(fly.cameraBody);
-				Mat4 cameraWorld = ct.computeWorldMatrix();
-				Vector<Mat4> camMats = { cameraWorld };
-				for (auto& meh : model) {
-					renderer.drawMeshInstanced(meh, camMats);
-				}
-			}
-
-			// Fog cloud around camera (toggle with '1')
-			{
-				if (st.wasKeyPressedThisFrame(KeyCode::Num1)) { fogEnabled = !fogEnabled; EInfo("Fog: {}", fogEnabled ? "ON" : "OFF"); }
-				if (fogEnabled) {
-					static constexpr int N = 240;
-					static Vector<RenderSubsystem::BillboardDesc> fogs(N);
-					F32 t = (F32)(gameTick * 0.015);
-					for (int i = 0; i < N; i++) {
-						F32 phi = acosf(1.0f - 2.0f * ((F32)i + 0.5f) / N);
-						F32 theta = glm::two_pi<F32>() * (F32)i * 1.61803398875f;
-						F32 r = 3.0f + sinf(t * 0.7f + i * 0.5f) * 0.4f + sinf(i * 2.3f) * 0.6f;
-						fogs[i].position = fly.pos + Vec3(
-							sinf(phi) * cosf(theta) * r,
-							cosf(phi) * r + sinf(t + i * 0.3f) * 0.2f,
-							sinf(phi) * sinf(theta) * r);
-						fogs[i].size = Vec2(2.5f + sinf(i * 1.7f + t * 0.5f) * 1.0f);
-						fogs[i].color = Vec4(1, 1, 1, 0.3f + sinf(i * 2.6f + t) * 0.4f);
-					}
-					renderer.drawBillboards(fogs);
-				}
-			}
-
-			renderer.endFrame();
-			renderer.setRenderTarget(nullptr);
-		}
-		else {
-			// ---- Hybrid ray tracing path (M3) ----
-			// G-buffer pass (albedo + world normal + depth). Note: the Furina model
-			// consists of 5 separate meshes, so every mesh must be drawn.
-			renderer.beginGBuffer(renderer.getTextureRTV(gbufColor), renderer.getTextureRTV(gbufNormal), renderer.getTextureRTV(gbufEmissive), renderer.getTextureDSV(gbufDepth));
-			const bool msHybrid = msFurinaScene && msMeshesRegistered;
-			if (msHybrid) {
-				// The mesh shader cluster-LOD path writes the whole G-buffer (all
-				// objects, one DrawMesh); the RT compose pass does the shading.
-				Mat4 msView, msProj; renderer.getCameraMatrices(msView, msProj);
-				Vector<MeshShaderSubsystem::MeshDrawGroup> groups;
-				msAddGroup(groups, msTerrIdx, msTerrCount, { Transform{}.computeWorldMatrix() });
-				msAddGroup(groups, msWallIdx, msWallCount, { Transform{ .position = Vec3(20, -19, 20) }.computeWorldMatrix() });
-				if (emissiveCubeMesh.isValid()) msAddGroup(groups, msCubeIdx, msCubeCount, { emissiveCubeTf.computeWorldMatrix() });
-				{
-					Vector<Mat4> wm(std::min<size_t>(1000, (size_t)msInstBudget));
-					for (size_t i = 0; i < wm.size(); i++) wm[i] = transv[i].computeWorldMatrix();
-					msAddGroup(groups, msFurinaIdx, msFurinaCount, wm);
-				}
-				if (!fly.boundToBody && fly.cameraBody != InvalidRigidBody && msFurinaCount > 0)
-					msAddGroup(groups, msFurinaIdx, msFurinaCount, { physicsBodies.getWorldTransform(fly.cameraBody).computeWorldMatrix() });
-
-				auto mr = meshShader.drawSceneGBuffer(groups, msView, msProj, (F32)gameTick * 0.02f);
-				if (mr.isErr()) {
-					static bool msGbufWarned = false;
-					if (!msGbufWarned) { EError("MeshShader G-buffer scene failed: {}", ToString(mr.error())); msGbufWarned = true; }
-				}
-			}
-			else {
-				for (auto& terrMesh : terrian) renderer.drawMesh(terrMesh, Transform{});
-				for (auto& wallMesh : wall) renderer.drawMesh(wallMesh, Transform{ .position = Vec3(20, -19, 20) });
-				if (emissiveCubeMesh.isValid()) renderer.drawMesh(emissiveCubeMesh, emissiveCubeTf);
-				if (!model.empty() && modelLoadCompleted.load(std::memory_order_acquire)) {
-					Vector<Mat4> wmats(1000);
-					for (size_t i = 0; i < 1000; ++i) wmats[i] = transv[i].computeWorldMatrix();
-					for (size_t mi = 0; mi < model.size(); ++mi)
-						renderer.drawMeshInstanced(model[mi], wmats);
-				}
-			}
-			renderer.endGBuffer();
-
-			// Resolve the MSAA G-buffer to single-sample targets for the RT trace
-			// and compose passes (the compute shaders read with Load/1x sampling).
-			TextureHandle rtColorSrc = gbufColor, rtNormalSrc = gbufNormal;
-			TextureHandle rtEmissiveSrc = gbufEmissive, rtDepthSrc = gbufDepth;
-			if (renderer.msaaSamples() > 1) {
-				auto rr = renderer.resolveGBufferMSAA(renderer.getTextureSRV(gbufColor), renderer.getTextureSRV(gbufNormal),
-					renderer.getTextureSRV(gbufEmissive), renderer.getTextureSRV(gbufDepth),
-					renderer.getTextureUAV(resColor), renderer.getTextureUAV(resNormal),
-					renderer.getTextureUAV(resEmissive), renderer.getTextureUAV(resDepth), ww, wh);
-				if (rr.isErr()) {
-					static bool resolveWarned = false;
-					if (!resolveWarned) { EError("G-buffer MSAA resolve failed: {}", ToString(rr.error())); resolveWarned = true; }
-				}
-				else {
-					rtColorSrc = resColor; rtNormalSrc = resNormal;
-					rtEmissiveSrc = resEmissive; rtDepthSrc = resDepth;
-				}
-			}
-
-			// RT scene groups: terrain/wall (meshes merged per model) + physics
-			// bodies (all Furina meshes share one BLAS per body).
-			Vector<RayTracedObjectGroup> rtGroups;
-			{
-				if (!terrian.empty()) {
-					RayTracedObjectGroup g;
-					for (auto& terrMesh : terrian) {
-						RayTracedObject o; o.mesh = terrMesh;
-						auto sub = renderer.getSubMesh(terrMesh, 0); o.material = sub.material;
-						g.objects.push_back(o);
-					}
-					rtGroups.push_back(std::move(g));
-				}
-				if (!wall.empty()) {
-					RayTracedObjectGroup g;
-					g.transform.position = Vec3(20, -19, 20);
-					for (auto& wallMesh : wall) {
-						RayTracedObject o; o.mesh = wallMesh;
-						auto sub = renderer.getSubMesh(wallMesh, 0); o.material = sub.material;
-						g.objects.push_back(o);
-					}
-					rtGroups.push_back(std::move(g));
-				}
-				// Emissive showcase cube: also present in the RT scene so it glows
-				// inside reflections.
-				if (emissiveCubeMesh.isValid() && emissiveCubeMat.isValid()) {
-					RayTracedObjectGroup g;
-					g.transform = emissiveCubeTf;
-					RayTracedObject o; o.mesh = emissiveCubeMesh; o.material = emissiveCubeMat;
-					g.objects.push_back(o);
-					rtGroups.push_back(std::move(g));
-				}
-				if (!model.empty() && modelLoadCompleted.load(std::memory_order_acquire)) {
-					for (size_t i = 0; i < physHandles.size(); ++i) {
-						RayTracedObjectGroup g;
-						g.transform = physicsBodies.getWorldTransform(physHandles[i]);
-						for (size_t mi = 0; mi < model.size(); ++mi) {
-							RayTracedObject o; o.mesh = model[mi];
-							auto sub = renderer.getSubMesh(model[mi], 0); o.material = sub.material;
-							g.objects.push_back(o);
-						}
-						rtGroups.push_back(std::move(g));
-					}
-				}
-			}
-			if (!rtGroups.empty()) {
-				auto sr = rayTracing.updateScene(rtGroups);
-				if (sr.isErr()) {
-					static bool rtSceneWarned = false;
-					if (!rtSceneWarned) { EError("RT updateScene failed: {}", ToString(sr.error())); rtSceneWarned = true; }
-				}
-			}
-
-			Mat4 view, proj; renderer.getCameraMatrices(view, proj);
-			Mat4 vp = proj * view;
-			Mat4 vpInv = glm::inverse(vp);
-			Vec3 sunDir = glm::normalize(Vec3(cos(glm::radians(sunYaw)) * cos(glm::radians(sunPitch)),
-				-sin(glm::radians(sunPitch)), sin(glm::radians(sunYaw)) * cos(glm::radians(sunPitch))));
-			rayTracing.setSkybox(s_skyMode == 3, skyCubeTexHandle, s_skyCorners);
-			RayTraceConstants rc;
-			rc.viewProjInv = vpInv;
-			// The raster PBR shader uses Ldir = -light.dir (toward the light), so the
-			// ray tracer must receive the same "toward the light" direction.
-			rc.lightDir = Vec4(glm::normalize(-sunDir), 0.0f);
-			rc.cameraPos = Vec4(fly.pos, 1.0f);
-			rc.maxRayLength = 100.0f;
-			rc.ambientLight = 0.1f;
-			rc.lightIntensity = sunIntensity;
-			rc.lightColor = Vec4(sunColorR, sunColorG, sunColorB, 0.0f); // matches the sun color in updateLight
-			rc.shadowPCF = rtShadowPCF;
-			rc.aoRadius = rtAoRadius;
-			rc.aoSamples = rtAoSamples;
-			rc.lightSize = rtLightSize;
-			rc.reflectionBlur = rtReflectionBlur;
-			rc.maxBounces = rtMaxBounces;
-			rc.bounceRoughness = rtBounceRoughness;
-			rc.reflectionSamples = rtReflectionSamples;
-			// Packed disc samples for soft shadows (16 points, xy/zw pairs).
-			// The first sample is the center (no perturbation) so PCF=1 behaves
-			// like a plain single shadow ray.
-			{
-				static Vec4 s_disc[8];
-				static bool s_discInit = false;
-				if (!s_discInit) {
-					memset(s_disc, 0, sizeof(s_disc));
-					for (int i = 1; i < 16; ++i) {
-						float r = std::sqrt((i + 0.5f) / 16.0f) * 0.8f;
-						float a = i * 2.399963f;
-						Vec2 p(cosf(a) * r, sinf(a) * r);
-						s_disc[i / 2][(i % 2) * 2] = p.x;
-						s_disc[i / 2][(i % 2) * 2 + 1] = p.y;
-					}
-					s_discInit = true;
-				}
-				memcpy(rc.discPoints, s_disc, sizeof(s_disc));
-			}
-			// Auto resolution: pick the scale from the distance to the nearest object.
-			// Hysteresis band (22..28) prevents flicker when objects hover near the threshold.
-			if (rtResAuto) {
-				float minDist = 1e9f;
-				for (const auto& t : transv) {
-					float d = glm::length(t.position - fly.pos);
-					if (d < minDist) minDist = d;
-				}
-				float targetScale = rtResScale;
-				if (rtResScale >= 1.0f && minDist > 28.0f) targetScale = 0.5f;  // move away -> half
-				else if (rtResScale <= 0.5f && minDist < 22.0f) targetScale = 1.0f; // approach -> full
-				if (targetScale != rtResScale) {
-					rtResScale = targetScale;
-					createRTTex(ww, wh); // recreate only the RT texture - no blank frame
-				}
-			}
-			UInt32 rtw = std::max<UInt32>(1, (UInt32)(ww * rtResScale));
-			UInt32 rth = std::max<UInt32>(1, (UInt32)(wh * rtResScale));
-			{
-				auto tr = rayTracing.trace(rc, renderer.getTextureSRV(rtNormalSrc), renderer.getTextureSRV(rtDepthSrc),
-					renderer.getTextureSRV(rtColorSrc),
-					renderer.getTextureUAV(rtTex), renderer.getTextureUAV(rtAlbedo), renderer.getTextureUAV(rtNormal), rtw, rth);
-				if (tr.isErr()) {
-					static bool traceWarned = false;
-					if (!traceWarned) { EError("RT trace failed: {}", ToString(tr.error())); traceWarned = true; }
-				}
-			}
-
-			// Denoise: NRD (REBLUR) -> OIDN GPU -> temporal+spatial, switchable
-			// from the DebugUI ("Denoiser" button: Auto / NRD / OIDN / Temporal).
-			void* rtComposeSRV = renderer.getTextureSRV(rtTex);
-			if (rtDenoise) {
-				bool nrdUsed = false;
-				const bool wantNRD = (rtDenoiserSel == 0 || rtDenoiserSel == 1) && denoising.isReady();
-				if (wantNRD) {
-					denoising.setStrength(rtDenoiseStrength);
-					auto dr = denoising.denoise(renderer.getTextureSRV(rtTex), renderer.getTextureSRV(rtNormal),
-						renderer.getTextureSRV(rtDepthSrc), view, proj, rtw, rth);
-					if (dr.isErr()) {
-						static bool nrdWarned = false;
-						if (!nrdWarned) { EError("NRD denoise failed: {}", ToString(dr.error())); nrdWarned = true; }
-					}
-					if (auto* ds = denoising.getDenoisedSRV()) { rtComposeSRV = ds; nrdUsed = true; }
-				}
-				if (!nrdUsed) {
-					rayTracing.setForceTemporal(rtDenoiserSel == 3);
-					rayTracing.setDenoiseStrength(rtDenoiseStrength);
-					auto dr = rayTracing.denoise(renderer.getTextureSRV(rtTex), renderer.getTextureSRV(rtAlbedo),
-						renderer.getTextureSRV(rtNormal),
-						renderer.getTextureSRV(rtDepthSrc), vpInv, vp, rtw, rth);
-					if (dr.isErr()) {
-						static bool denoiseWarned = false;
-						if (!denoiseWarned) { EError("RT denoise failed: {}", ToString(dr.error())); denoiseWarned = true; }
-					}
-					if (auto* ds = rayTracing.getDenoisedSRV()) rtComposeSRV = ds;
-				}
-			}
-
-			// HDR pass: skybox + compose.
-			renderer.setRenderTarget(postProcess.getHDRRTV());
-			renderer.beginFrame();
-			{
-				auto cr = rayTracing.compose(renderer.getTextureSRV(rtColorSrc), renderer.getTextureSRV(rtNormalSrc),
-					renderer.getTextureSRV(rtDepthSrc), renderer.getTextureSRV(rtEmissiveSrc), rtComposeSRV,
-					postProcess.getHDRRTV(), renderer.getDepthStencil(), rtDrawMode,
-					vpInv, fly.pos, Vec3(sunColorR, sunColorG, sunColorB), ww, wh);
-				if (cr.isErr()) {
-					static bool composeWarned = false;
-					if (!composeWarned) { EError("RT compose failed: {}", ToString(cr.error())); composeWarned = true; }
-				}
-			}
-			renderer.endFrame();
-			renderer.setRenderTarget(nullptr);
-		}
-
-		// Frame tail. Owned by the render pipeline's uiPost / postExecute /
-		// uiLate / debugUi / present passes when it is active.
-		if (!useRenderPipeline) {
-			// Render UI layers that receive post-processing (before execute)
-			ui.beginFrame(false);
-			ui.endFrame();
-
-			postProcess.execute();
-
-			// Render UI layers that skip post-processing (after execute, before debug UI)
-			ui.beginFrame(true);
-			ui.endFrame();
-
-			debugUI.endFrameAndRender();
-			postProcess.present();
-		}
+		// The frame tail (UI layers, post-process execute, debug UI, present) is
+		// owned by the render pipeline's uiPost / postExecute / uiLate / debugUi /
+		// present passes.
 
 		static F64 fpsTimer = 0; static UInt32 fpsCount = 0, lastFps = 0;
 		fpsTimer += dt; fpsCount++;
