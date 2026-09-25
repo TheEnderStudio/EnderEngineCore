@@ -1,4 +1,4 @@
-#include <Rendering/RenderSubsystem.hpp>
+﻿#include <Rendering/RenderSubsystem.hpp>
 #include <Core/Log.hpp>
 #include <Core/Crash.h>
 #include <Rendering/Errors.hpp>
@@ -509,21 +509,33 @@ static D::TEXTURE_ADDRESS_MODE toDAddr(AddressMode m) {
 // ===================================================================
 
 static void DILIGENT_CALL_TYPE DiligentDebugMsgCallback(enum D::DEBUG_MESSAGE_SEVERITY severity, const D::Char* message, const D::Char* function, const D::Char* file, int line) {
+	static bool initialized = false;
+	static const char* diligentName = "DiligentEngine";
+
+	if (!initialized) [[unlikely]] {
+		if (!Log::isInitialized() || !Log::getLogger()) {
+			ECrash("Logger is unavailable");
+		}
+		auto logger = Log::getLogger()->clone(diligentName);
+		spdlog::register_logger(logger);
+		initialized = true;
+	}
+
 	switch (severity)
 	{
 	default:
 		EDebug("Unknown message severity from Diligent Engine: {}", static_cast<UInt32>(severity));
 	case D::DEBUG_MESSAGE_SEVERITY_INFO:
 #ifdef EE_DEBUG
-		Log::info(file, line, function, "[DiligentEngine] {}", message);
+		spdlog::get(diligentName)->log(spdlog::source_loc{ file, line, function }, spdlog::level::info, message);
 #endif
 		break;
 	case D::DEBUG_MESSAGE_SEVERITY_WARNING:
-		Log::warn(file, line, function, "[DiligentEngine] {}", message); break;
+		spdlog::get(diligentName)->log(spdlog::source_loc{ file, line, function }, spdlog::level::warn, message); break;
 	case D::DEBUG_MESSAGE_SEVERITY_ERROR:
-		Log::error(file, line, function, "[DiligentEngine] {}", message); break;
+		spdlog::get(diligentName)->log(spdlog::source_loc{ file, line, function }, spdlog::level::err, message); break;
 	case D::DEBUG_MESSAGE_SEVERITY_FATAL_ERROR:
-		Log::critical(file, line, function, "[DiligentEngine] {}", message); break;
+		spdlog::get(diligentName)->log(spdlog::source_loc{ file, line, function }, spdlog::level::critical, message); break;
 	}
 }
 
@@ -2214,7 +2226,11 @@ Result<void, CoreError> RenderSubsystem::onInitialize() {
 	}
 	return {};
 }
-void RenderSubsystem::onShutdown() { m_backend->ok = false; m_backend->device.Release(); m_backend->ctx.Release(); m_backend->sc.Release(); m_backend->factory.Release(); EInfo("Rendering shut down"); }
+void RenderSubsystem::onShutdown() { m_backend->ok = false;
+	m_backend->device.Release(); m_backend->ctx.Release();
+	m_backend->sc.Release(); m_backend->factory.Release();
+	D::SetDebugMessageCallback(nullptr);
+	EInfo("Rendering shut down"); }
 
 void RenderSubsystem::onUpdate(F64) {}
 

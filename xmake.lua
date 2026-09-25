@@ -1,4 +1,4 @@
-set_project("EnderEngine")
+﻿set_project("EnderEngine")
 set_xmakever("2.8.0")
 add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate")
@@ -42,6 +42,8 @@ add_includedirs("ThirdParty/oidn/include")
 add_includedirs("ThirdParty/nrd/Include")
 add_includedirs("ThirdParty/nrd/NRDShaders")
 add_includedirs("ThirdParty/meshopt/include")
+add_includedirs("ThirdParty/OpenSSL/include")
+add_includedirs("ThirdParty/zlib/include")
 add_includedirs("Backends/SteamAudio/include")
 add_includedirs("Backends/DiligentEngine/include")
 add_includedirs("Backends/DiligentEngine/include/DiligentTools/Imgui/interface")
@@ -64,7 +66,7 @@ else
 	set_optimize("fastest")
 	if is_plat("windows") then
 		-- Release: disable RTTI and exceptions
-		add_cxflags("/GR-", "/EHs-c-", "/MD", {force = true})
+		add_cxflags("/GR-", "/EHs-c-", "/MD", "/arch:AVX2", {force = true})
 	elseif is_plat("linux") then
 		add_cxflags("-fno-rtti", "-fno-exceptions", {force = true})
 	end
@@ -75,7 +77,7 @@ end
 -- ---------------------------------------------------------------------------
 if is_plat("windows") then
 	add_syslinks("user32", "dbghelp", "kernel32", "gdi32", "shell32", "comdlg32", "d3d11", "d3d12", "dxgi", "dxguid", "d3dcompiler")
-	add_cxflags("/W4", "/utf-8", {force = true})
+	add_cxflags("/W4", "/utf-8", "/permissive", {force = true})
 elseif is_plat("linux") then
 	add_syslinks("pthread", "dl")
 	add_cxflags("-Wall", "-Wextra", {force = true})
@@ -101,6 +103,8 @@ if is_mode("debug") then
 	add_linkdirs("ThirdParty/oidn/lib")
 	add_linkdirs("ThirdParty/nrd/Lib/Debug")
 	add_linkdirs("ThirdParty/meshopt/lib/Debug")
+	add_linkdirs("ThirdParty/OpenSSL/lib")
+	add_linkdirs("ThirdParty/zlib/lib")
 else
 	add_linkdirs("ThirdParty/spdlog/lib")
 	add_linkdirs("ThirdParty/glfw/lib-vc2022")
@@ -118,6 +122,8 @@ else
 	add_linkdirs("ThirdParty/oidn/lib")
 	add_linkdirs("ThirdParty/nrd/Lib/Release")
 	add_linkdirs("ThirdParty/meshopt/lib/Release")
+	add_linkdirs("ThirdParty/OpenSSL/lib")
+	add_linkdirs("ThirdParty/zlib/lib")
 end
 
 -- ---------------------------------------------------------------------------
@@ -191,6 +197,8 @@ target("EnderEngineCore")
 		add_links("OpenImageDenoise_core")
 		add_links("NRD")
 		add_links("meshoptimizer")
+		add_links("libcrypto")
+		add_links("zd")
 	else
 		add_links("spdlog")
 		add_links("glfw3dll")
@@ -233,6 +241,8 @@ target("EnderEngineCore")
 		add_links("OpenImageDenoise_core")
 		add_links("NRD")
 		add_links("meshoptimizer")
+		add_links("libcrypto")
+		add_links("z")
 	end
 target_end()
 
@@ -330,7 +340,7 @@ target("Demo")
 					os.cp(meshoptBin .. "/meshoptimizer.pdb", target:targetdir())
 				end
 			else
-				local meshoptBin = "ThirdParty/meshopt/bin/Debug"
+				local meshoptBin = "ThirdParty/meshopt/bin/Release"
 				if os.isdir(meshoptBin) then
 					os.cp(meshoptBin .. "/meshoptimizer.dll", target:targetdir())
 				end
@@ -409,3 +419,8 @@ target("dxcreflect")
 	end
 
 target_end()
+
+-- ---------------------------------------------------------------------------
+-- Libraries
+-- ---------------------------------------------------------------------------
+includes("Libraries/EnderVFiles2") -- EnderVFiles2

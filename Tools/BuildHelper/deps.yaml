@@ -294,3 +294,36 @@ dependencies:
       - {configs: ["Debug"], from: "lib/meshoptimizer.lib", to: "lib/Debug/meshoptimizer.lib"}
       - {configs: ["Release"], from: "bin", to: "bin/Release"}
       - {configs: ["Release"], from: "lib/meshoptimizer.lib", to: "lib/Release/meshoptimizer.lib"}
+
+  - name: OpenSSL
+    kind: archive
+    url: https://github.com/TaurusTLS-Developers/OpenSSL-Distribution/releases/download/v3.5.8/openssl-3.5.8-Windows-x64.zip
+    archiveFile: openssl-3.5.8-Windows-x64.zip
+    build: none
+    target: ThirdParty/OpenSSL
+    layout:
+      - {configs: ["*"], from: "include", to: "include", source: stage}
+      - {configs: ["*"], from: "lib/import/libcrypto.lib", to: "lib/libcrypto.lib", source: stage}
+      - {configs: ["*"], from: "LICENSE.txt", to: "LICENSE", source: stage}
+      - {configs: ["*"], from: "version.txt", to: "include/openssl/version.inc", source: stage}
+      - {configs: ["*"], from: "libcrypto-3-x64.dll", to: "bin/libcrypto-3-x64.dll", source: stage}
+
+  - name: zlib
+    kind: git
+    url: https://github.com/madler/zlib.git
+    ref: master
+    build: cmake
+    target: ThirdParty/zlib
+    cmakeOptions:
+      - -DZLIB_BUILD_TESTING=OFF
+      - -DZLIB_BUILD_SHARED=ON
+      - -DZLIB_BUILD_STATIC=OFF
+    layout:
+      - {configs: ["*"], from: "README", to: "README", source: repo}
+      - {configs: ["*"], from: "LICENSE", to: "LICENSE", source: repo}
+      - {configs: ["*"], from: "include", to: "include", source: stage}
+      - {configs: ["Debug"], from: "bin/zd.dll", to: "bin/zd.dll", source: stage}
+      - {configs: ["Debug"], from: "bin/zd.pdb", to: "bin/zd.pdb", source: stage}
+      - {configs: ["Release"], from: "bin/z.dll", to: "bin/z.dll", source: stage}
+      - {configs: ["Debug"], from: "lib/zd.lib", to: "lib/zd.lib", source: stage}
+      - {configs: ["Release"], from: "lib/z.lib", to: "lib/z.lib", source: stage}

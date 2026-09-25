@@ -1,4 +1,4 @@
-#include <Engine/Core/Core.hpp>
+﻿#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -358,7 +358,7 @@ float4 main(PSIn i) : SV_TARGET {
 	int  rtDenoiserSel = 0;      // 0 = Auto, 1 = NRD, 2 = OIDN, 3 = Temporal
 	bool msTestGrid = false;     // M1 mesh shader test grid (GPU-driven AS/MS pipeline)
 	bool msFrustumCull = true;   // toggle frustum culling in the test amplification shader
-	bool msFurinaScene = false;  // M2: draw the 1000 Furina bodies through the mesh shader path
+	bool msFurinaScene = true;  // M2: draw the 1000 Furina bodies through the mesh shader path
 	bool msMeshesRegistered = false;
 	// Index ranges into the registered mesh list, one per scene object type.
 	UInt32 msTerrIdx = 0, msTerrCount = 0, msWallIdx = 0, msWallCount = 0;
@@ -374,9 +374,9 @@ float4 main(PSIn i) : SV_TARGET {
 		g.instanceMatrices = std::move(instances);
 		groups.push_back(std::move(g));
 	};
-	F32  msLodScale = 4.0f;      // M3: LOD selection threshold, in pixels of projected error
-	F32  msInstBudget = 16.0f;   // debug: instance cap for the mesh shader scene (start small - opening at 1000 TDRs the GPU)
-	F32  msClusterBudget = 16384.0f; // hard cap on cluster mesh groups dispatched per frame
+	F32  msLodScale = 0.25f;      // M3: LOD selection threshold, in pixels of projected error
+	F32  msInstBudget = 1000.0f;   // debug: instance cap for the mesh shader scene (start small - opening at 1000 TDRs the GPU)
+	F32  msClusterBudget = 262144.0f; // hard cap on cluster mesh groups dispatched per frame
 	int  msDebugTri = 0;         // MS diagnostic: 0 = off, 1 = fixed triangle, 2 = albedo only
 	int  msMeshFilter = 5;       // MS diagnostic: 0..4 = only that mesh, >4 = all
 	UInt32 rtReflectionSamples = 4; // GGX reflection rays per pixel (1..8)
@@ -470,7 +470,7 @@ float4 main(PSIn i) : SV_TARGET {
 	// Wraps the whole frame as an explicit pass graph. It is opt-in: the classic
 	// inline path below stays the default until this one has been validated on
 	// real hardware.
-	bool msRenderPipeline = false;
+	bool msRenderPipeline = true;
 	RenderPipelineContext rpContext;
 	JobExecutor rpExecutor{ jobs };
 	Uptr<RenderPipeline> renderPipeline;

@@ -1,5 +1,6 @@
 ﻿#include "PhysXWorldBackend.hpp"
 #include <Core/Log.hpp>
+#include <Core/Crash.h>
 
 #ifdef EE_PHYSICS_BACKEND_PHYSX5
 
@@ -19,17 +20,29 @@ namespace PhysX5 {
 class EngineErrorCallback : public physx::PxErrorCallback {
 public:
 	void reportError(physx::PxErrorCode::Enum code, const char* message, const char* file, int line) override {
+		if (!m_initialized) [[unlikely]] {
+			if (!Log::isInitialized() || !Log::getLogger()) {
+				ECrash("Logger is unavailable");
+			}
+			m_logger = Log::getLogger()->clone("PhysX");
+			m_logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%n] [%t] [%^%l%$] [%s:%#] %v");
+			m_initialized = true;
+		}
 		switch (code) {
-		case physx::PxErrorCode::eDEBUG_INFO:   Log::debug(file, line, "???", "[PhysX] {}", message); break;
-		case physx::PxErrorCode::eDEBUG_WARNING:Log::warn(file, line, "???", "[PhysX] [DEBUG ONLY] {}", message); break;
-		case physx::PxErrorCode::ePERF_WARNING: Log::warn(file, line, "???", "[PhysX] [PERF WARN] {}", message); break;
+		case physx::PxErrorCode::eDEBUG_INFO:    m_logger->log(spdlog::source_loc{ file, line, "" }, spdlog::level::info, message); break;
+		case physx::PxErrorCode::eDEBUG_WARNING: m_logger->log(spdlog::source_loc{ file, line, "" }, spdlog::level::warn, message); break;
+		case physx::PxErrorCode::ePERF_WARNING:  m_logger->log(spdlog::source_loc{ file, line, "" }, spdlog::level::warn, "[PERF] {}", message); break;
 		case physx::PxErrorCode::eINVALID_PARAMETER:
 		case physx::PxErrorCode::eINVALID_OPERATION:
-		case physx::PxErrorCode::eINTERNAL_ERROR: Log::error(file, line, "???", "[PhysX] {}", message); break;
-		case physx::PxErrorCode::eOUT_OF_MEMORY: Log::critical(file, line, "???", "[PhysX] [OUT OF MEM] {}", message); break;
-		default: Log::warn(file, line, "???", "[PhysX] {}", message); break;
+		case physx::PxErrorCode::eINTERNAL_ERROR:m_logger->log(spdlog::source_loc{ file, line, "" }, spdlog::level::err, message); break;
+		case physx::PxErrorCode::eOUT_OF_MEMORY: m_logger->log(spdlog::source_loc{ file, line, "" }, spdlog::level::critical, "[OUT OF MEM] {}", message); break;
+		default: m_logger->log(spdlog::source_loc{ file, line, "" }, spdlog::level::warn, message); break;
 		}
 	}
+
+private:
+	bool m_initialized = false;
+	Sptr<spdlog::logger> m_logger;
 };
 
 // ===================================================================
