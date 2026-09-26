@@ -405,6 +405,13 @@ struct MeshShaderSubsystem::Impl {
 	D::RefCntAutoPtr<D::ITextureView> whiteTexSRV;
 	D::RefCntAutoPtr<D::ITexture>     flatNormalTex, flatMRTex;
 	D::RefCntAutoPtr<D::ITextureView> flatNormalSRV, flatMRSRV;
+	// Specular IBL: the prefiltered sky cube bound per frame (see setSkyEnv), plus a
+	// black 1x1x6 fallback and a sampler so the mutable variables are never unbound.
+	D::RefCntAutoPtr<D::ISampler>     skyEnvSampler;
+	D::RefCntAutoPtr<D::ITexture>     skyEnvDummyTex;
+	D::RefCntAutoPtr<D::ITextureView> skyEnvDummySRV;
+	D::RefCntAutoPtr<D::ITextureView> skyEnvSRV;
+
 	D::RefCntAutoPtr<D::ISampler>     materialSampler;
 	std::vector<D::IDeviceObject*>    materialSRVs;      // albedo   (baseColorTexture)
 	std::vector<D::IDeviceObject*>    normalSRVs;        // normal   (normalTexture)
@@ -461,6 +468,22 @@ void MeshShaderSubsystem::setShadowMap(TextureSRV shadowMap, const Mat4 worldToS
 	}
 }
 
+void MeshShaderSubsystem::setSkyEnv(TextureSRV envCube) {
+	auto& p = *m_impl;
+	p.skyEnvSRV = envCube ? static_cast<D::ITextureView*>(envCube) : nullptr;
+	// Refresh the bindings that already exist, exactly like setShadowMap: the
+	// environment cube is owned by the renderer and only becomes non-empty once the
+	// sky has been built, which can happen after the pipeline was created.
+	D::ITextureView* srv = p.skyEnvSRV ? p.skyEnvSRV.RawPtr() : (p.skyEnvDummySRV ? p.skyEnvDummySRV.RawPtr() : nullptr);
+	if (!srv) return;
+	D::IShaderResourceBinding* srbs[2] = { p.clusterSrb.RawPtr(), p.clusterGBufferSrb.RawPtr() };
+	for (D::IShaderResourceBinding* srb : srbs) {
+		if (!srb) continue;
+		if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_SkyEnv"))
+			v->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	}
+}
+
 Result<void, CoreError> MeshShaderSubsystem::onInitialize() {
 	auto& p = *m_impl;
 	if (!p.renderer) { EError("MeshShader: no renderer attached"); return CoreError::OperationFailed; }
@@ -490,6 +513,7 @@ void MeshShaderSubsystem::onShutdown() {
 	p.flatNormalTex.Release(); p.flatNormalSRV.Release();
 	p.flatMRTex.Release(); p.flatMRSRV.Release();
 	p.shadowSampler.Release(); p.shadowDummyTex.Release(); p.shadowDummySRV.Release(); p.shadowMapSRV.Release();
+	p.skyEnvSampler.Release(); p.skyEnvDummyTex.Release(); p.skyEnvDummySRV.Release(); p.skyEnvSRV.Release();
 	p.materialSRVs.clear(); p.normalSRVs.clear(); p.mrSRVs.clear(); p.emissiveSRVs.clear();
 	p.materialCount = 0;
 	p.sceneMeshList.clear();
@@ -741,8 +765,9 @@ struct SceneConstants { // 264 B payload (buffer 320 B; layout matches the HLSL 
 	Vec4   cascadeSplits = Vec4(0);       // 608: camera-space far distance of cascades 0..2
 	Vec4   skyCorners[8] = {};            // 624: skybox corner colours (bit0=x+, bit1=y+, bit2=z+)
 	                                      //      -> the ambient term is derived from them, see SkyIrradiance
-}; // 752 B (buffer 1024 B)
-static_assert(sizeof(SceneConstants) == 752, "SceneConstants must match the HLSL cbuffer layout");
+	Vec4   envParams = Vec4(0, 1, 0, 1);  // 752: x = sky IBL on, y = mip scale, z = debug, w = intensity
+}; // 768 B (buffer 1024 B)
+static_assert(sizeof(SceneConstants) == 768, "SceneConstants must match the HLSL cbuffer layout");
 
 struct SceneMeshInfo { // 96 B (16-byte aligned; layout must match the HLSL struct)
 	Vec4   center;           // 0  mesh-local LOD0 bounding-sphere center
@@ -1701,6 +1726,7 @@ cbuffer cbSceneConstants : register(b0) {
     float4x4 g_ShadowMapUVDepth[4];
     float4   g_CascadeSplits;
     float4   g_SkyCorners[8];   // 8 skybox corner colours, see SkyIrradiance below
+    float4   g_EnvParams;       // x = sky IBL on, y = mip scale, z = debug, w = intensity
 };
 
 // Diffuse irradiance of the analytic sky.
@@ -1731,6 +1757,7 @@ float3 SkyIrradiance(float3 n)
     for (int i = 0; i < 3; ++i) B[i] -= A;
     return max(A + (2.0 / 3.0) * (B[0] * n.x + B[1] * n.y + B[2] * n.z), 0.0);
 }
+
 struct MaterialGPU {
     float4 baseColor;
     float4 emissive;
@@ -1746,7 +1773,44 @@ Texture2D    g_EmissiveMap[MAX_MATERIALS] : register(t96);
 Texture2DArray g_ShadowMap : register(t128);
 SamplerComparisonState g_ShadowMapSampler : register(s1);
 SamplerState g_AlbedoSampler : register(s0);
+// Prefiltered sky environment for the specular ambient (see RenderSubsystem::
+// prepareEnvironment and SkySpecular below). Bound per frame from the renderer, so
+// it is a mutable variable like everything else in this layout.
+TextureCube  g_SkyEnv : register(t129);
+SamplerState g_SkyEnvSampler : register(s2);
 StructuredBuffer<MaterialGPU> Materials;
+
+// Specular IBL: the same split-sum as the forward PBR shader (see the note on
+// SkySpecular in g_PS). Karis' analytic fit of the BRDF integral against a white
+// environment, applied to the radiance read from the sky cube; the mip is chosen by
+// matching the GGX lobe's solid angle (alpha = roughness^2) against a texel's.
+// Declared after the cube because HLSL wants the resource in scope first.
+float2 EnvBRDFApprox(float NdotV, float roughness)
+{
+    const float4 c0 = float4(-1.0, -0.0275, -0.572, 0.022);
+    const float4 c1 = float4( 1.0,  0.0425,  1.04, -0.04);
+    float4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NdotV)) * r.x + r.y;
+    return float2(-1.04, 1.04) * a004 + r.zw;
+}
+
+float3 SkySpecular(float3 N, float3 V, float3 F0, float roughness)
+{
+    if (g_EnvParams.x < 0.5)
+        return 0.0;
+    // TextureCube has no 3-output GetDimensions: the four-argument form is
+    // (MipLevel, Width, Height, NumberOfLevels), so the level to query comes first.
+    uint w = 1, h = 1, levels = 1;
+    g_SkyEnv.GetDimensions(0, w, h, levels);
+    const float alpha = max(roughness * roughness, 1e-3);
+    const float texelSolid = 2.0 / max((float)w * (float)w, 1.0);
+    const float lobeSolid = 3.14159265358979 * alpha * alpha;
+    float lod = 0.5 * log2(max(lobeSolid / texelSolid, 1.0));
+    lod = clamp(lod * g_EnvParams.y, 0.0, max((float)levels - 1.0, 0.0));
+    const float3 pre = g_SkyEnv.SampleLevel(g_SkyEnvSampler, reflect(-V, N), lod).rgb;
+    const float2 ab = EnvBRDFApprox(saturate(dot(N, V)), max(roughness, 0.002));
+    return pre * (F0 * ab.x + ab.y) * g_EnvParams.w;
+}
 
 struct PSInput {
     float4 Pos      : SV_POSITION;
@@ -1821,8 +1885,11 @@ float4 main(in PSInput i) : SV_TARGET {
     // Same shading model as the forward PBR shader: ambient + one directional
     // light with half-Lambert diffuse and a Blinn specular lobe, attenuated by
     // the cascaded shadow map. The ambient is the sky's irradiance, so it carries
-    // the sky's colour and direction (g_Ambient.a still scales it).
-    float3 col = SkyIrradiance(N) * g_Ambient.a * bc;
+    // the sky's colour and direction (g_Ambient.a still scales it), plus the
+    // specular lobe's share of the prefiltered environment - without that a metal
+    // has no ambient specular at all.
+    float3 F0 = lerp(float3(0.04, 0.04, 0.04), bc, m);
+    float3 col = SkyIrradiance(N) * g_Ambient.a * bc + SkySpecular(N, V, F0, r) * g_Ambient.a;
     {
         float3 Ldir = normalize(-g_LightDir.xyz);
         float  NdotL = dot(N, Ldir) * 0.5 + 0.5;
@@ -1830,7 +1897,7 @@ float4 main(in PSInput i) : SV_TARGET {
         float  specExp = max(1.0, (1.0 - r) * 256.0);
         float  spec = pow(max(dot(N, H), 0.001), specExp);
         float3 diff = bc * (1.0 - m);
-        float3 specC = lerp(float3(0.04, 0.04, 0.04), bc, m);
+        float3 specC = F0;
 
         // Cascade selection + PCF comparison, matching g_PS_Forward's DoLight.
         // Without this every object drawn through the mesh shader path would be
@@ -1857,6 +1924,9 @@ float4 main(in PSInput i) : SV_TARGET {
 
     // Albedo-only diagnostic (MS Debug: Albedo).
     if (g_DebugMode == 2) col = bc;
+    // Environment diagnostic: the prefiltered sky cube itself (a mirror ball), which
+    // is how its orientation can be checked against the visible skybox.
+    if (g_EnvParams.z > 0.5) col = g_SkyEnv.SampleLevel(g_SkyEnvSampler, reflect(-V, N), 0).rgb;
 
     return float4(col, a);
 }
@@ -2253,6 +2323,18 @@ Result<void, RenderError> MeshShaderSubsystem::ensureClusterPipeline(Impl& p, UI
 				v->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 			if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMapSampler"))
 				if (p.shadowSampler) v->Set(p.shadowSampler);
+		}
+
+		// Specular IBL: the prefiltered sky environment cube and its sampler. Both are
+		// mutable, so they have to be set here even when the renderer has not produced
+		// a cube yet - the black dummy keeps the variables bound in that case.
+		{
+			D::ITextureView* env = p.skyEnvSRV ? p.skyEnvSRV.RawPtr()
+			                                   : (p.skyEnvDummySRV ? p.skyEnvDummySRV.RawPtr() : nullptr);
+			if (env) if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_SkyEnv"))
+				v->Set(env, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+			if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_SkyEnvSampler"))
+				if (p.skyEnvSampler) v->Set(p.skyEnvSampler);
 		}
 	};
 
@@ -2839,6 +2921,29 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 			dev->CreateSampler(sd, &p.shadowSampler);
 			if (!p.shadowSampler) { EError("MeshShader: failed to create the shadow sampler"); return RenderError::SamplerCreationFailed; }
 		}
+		// Sky environment (specular IBL): sampler + a black 1x1x6 cube so the mutable
+		// variables are bound even before the renderer has built the real one.
+		if (!p.skyEnvSampler) {
+			D::SamplerDesc sd;
+			sd.MinFilter = D::FILTER_TYPE_LINEAR; sd.MagFilter = D::FILTER_TYPE_LINEAR; sd.MipFilter = D::FILTER_TYPE_LINEAR;
+			sd.AddressU = D::TEXTURE_ADDRESS_CLAMP; sd.AddressV = D::TEXTURE_ADDRESS_CLAMP; sd.AddressW = D::TEXTURE_ADDRESS_CLAMP;
+			dev->CreateSampler(sd, &p.skyEnvSampler);
+			if (!p.skyEnvSampler) { EError("MeshShader: failed to create the sky environment sampler"); return RenderError::SamplerCreationFailed; }
+		}
+		if (!p.skyEnvDummyTex) {
+			const UInt16 black[4] = { 0, 0, 0, 0 }; // RGBA16_FLOAT zero = no environment
+			D::TextureSubResData sub[6];
+			for (int f = 0; f < 6; ++f) { sub[f].pData = black; sub[f].Stride = 8; }
+			D::TextureData td2; td2.pSubResources = sub; td2.NumSubresources = 6;
+			D::TextureDesc td;
+			td.Name = "MS SkyEnvDummy"; td.Type = D::RESOURCE_DIM_TEX_CUBE;
+			td.Width = 1; td.Height = 1; td.ArraySize = 6; td.MipLevels = 1;
+			td.Format = D::TEX_FORMAT_RGBA16_FLOAT; td.BindFlags = D::BIND_SHADER_RESOURCE;
+			td.Usage = D::USAGE_IMMUTABLE;
+			dev->CreateTexture(td, &td2, &p.skyEnvDummyTex);
+			if (!p.skyEnvDummyTex) { EError("MeshShader: failed to create the sky environment fallback cube"); return RenderError::TextureCreationFailed; }
+			p.skyEnvDummySRV = p.skyEnvDummyTex->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
+		}
 		if (!p.shadowDummyTex) {
 			// Depth 1.0 in every slice => every comparison passes => fully lit.
 			// (nb: not named `far`, which windef.h defines as an empty macro.)
@@ -3088,6 +3193,9 @@ Result<void, RenderError> MeshShaderSubsystem::drawSceneImpl(const Vector<MeshDr
 			const bool haveSky = p.renderer->getSkyboxCorners(skyCorners);
 			for (int i = 0; i < 8; ++i) cb.skyCorners[i] = haveSky ? skyCorners[i] : cb.ambient;
 		}
+		// Specular IBL parameters (enable / mip scale / debug / intensity) come from
+		// the renderer so this path and the forward one are lit identically.
+		cb.envParams = p.renderer->skyEnvParams();
 		Vec3 sunDir(0); Vec4 sunColor(1, 1, 1, 1);
 		if (p.renderer->getPrimaryDirectionalLight(sunDir, sunColor)) {
 			cb.lightDir = Vec4(glm::normalize(sunDir), 0.0f);

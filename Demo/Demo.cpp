@@ -1,4 +1,4 @@
-#include <Engine/Core/Core.hpp>
+﻿#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -209,6 +209,7 @@ int WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int)
 			return 1;
 		}
 	}
+	renderer.setSkyEnvFlip(false, true, false); // Flip V is correct
 
 	// --- Ray tracing capability report ---
 	{
@@ -358,6 +359,10 @@ float4 main(PSIn i) : SV_TARGET {
 	int  rtDenoiserSel = 0;      // 0 = Auto, 1 = NRD, 2 = OIDN, 3 = Temporal
 	bool msTestGrid = false;     // M1 mesh shader test grid (GPU-driven AS/MS pipeline)
 	bool msFrustumCull = true;   // toggle frustum culling in the test amplification shader
+	// Sign applied to the classic path's tangent-space normal map (see
+	// RenderSubsystem::setNormalMapSign). Defaults to glTF's +Y-up / +V-down.
+	bool nmFlipX = false;
+	bool nmFlipY = true;
 	bool msFurinaScene = true;  // M2: draw the 1000 Furina bodies through the mesh shader path
 	bool msMeshesRegistered = false;
 	// Index ranges into the registered mesh list, one per scene object type.
@@ -941,6 +946,47 @@ HALT
 			}
 			if (debugUI.button(fmt::format("MS Test Grid: {}", msTestGrid ? "On" : "Off").c_str())) {
 				msTestGrid = !msTestGrid;
+			}
+			// Diagnostic for the classic path's normal map: shades with the raw sampled
+			// texel (no tangent frame, no lighting). Flat blue = neutral fallback,
+			// a recognisable normal map = the binding is right, noise = it is not.
+			if (debugUI.button(fmt::format("Classic NM Debug: {}", renderer.normalMapDebug() ? "On" : "Off").c_str())) {
+				renderer.setNormalMapDebug(!renderer.normalMapDebug());
+			}
+			// The classic path's tangent frame comes from screen-space derivatives, so
+			// which sign maps an asset's tangent-space normal into it is a convention.
+			// Flip these live while looking at the Wall's normal map: the relief must be
+			// lit on the side that faces the light, not on the side away from it.
+			{
+				bool flip = false;
+				flip |= debugUI.checkbox("NM Flip X", &nmFlipX);
+				flip |= debugUI.checkbox("NM Flip Y", &nmFlipY);
+				if (flip) {
+					renderer.setNormalMapSign(Vec2(nmFlipX ? -1.0f : 1.0f, nmFlipY ? -1.0f : 1.0f));
+				}
+			}
+			// Specular IBL: the prefiltered sky environment. Off falls back to the
+			// diffuse-only ambient, which is the quickest way to see what it adds
+			// (metals and polished dielectrics are the obvious ones).
+			{
+				bool env = renderer.skyIBLEnabled();
+				if (debugUI.checkbox("Sky IBL", &env)) renderer.setSkyIBLEnabled(env);
+				F32 mipScale = renderer.skyIBLMipScale();
+				if (debugUI.sliderFloat("Sky IBL Mips", &mipScale, 0.0f, 3.0f)) renderer.setSkyIBLMipScale(mipScale);
+				bool envDebug = renderer.skyIBLDebug();
+				if (debugUI.checkbox("Sky IBL Debug", &envDebug)) renderer.setSkyIBLDebug(envDebug);
+				// Cube orientation. The reflection direction itself is standard, so a
+				// mirrored sky can only come from the face convention: try these three
+				// (the Debug mirror ball shows the result immediately) and keep the
+				// combination that matches the skybox above the horizon.
+				{
+					bool flipU = renderer.skyEnvFlipU(), flipV = renderer.skyEnvFlipV(), mirrorY = renderer.skyEnvMirrorY();
+					bool changed = false;
+					changed |= debugUI.checkbox("Sky Env Flip U", &flipU);
+					changed |= debugUI.checkbox("Sky Env Flip V", &flipV);
+					changed |= debugUI.checkbox("Sky Env Mirror Y", &mirrorY);
+					if (changed) renderer.setSkyEnvFlip(flipU, flipV, mirrorY);
+				}
 			}
 			if (msTestGrid) {
 				if (debugUI.button(fmt::format("MS Frustum Cull: {}", msFrustumCull ? "On" : "Off").c_str())) {

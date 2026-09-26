@@ -464,6 +464,103 @@ public:
 	 */
 	EE_NODISCARD bool getSkyboxCorners(Vec4 outCorners[8]) const;
 
+	/**
+	 * @brief Debug: shade with the raw normal-map sample of the classic path.
+	 *
+	 * With this on, the classic forward / G-buffer pixel shaders output the texel
+	 * they sampled from the material's normal map directly - no tangent frame, no
+	 * lighting - so it shows whether that path resolves and binds the right texture
+	 * at all. A flat (128,128,255) blue is the neutral fallback, a recognisable
+	 * normal map means the binding is correct, noise means it is not.
+	 */
+	void setNormalMapDebug(bool enable);
+	EE_NODISCARD bool normalMapDebug() const;
+
+	/**
+	 * @brief Sign applied to the classic path's decoded tangent-space normal map.
+	 *
+	 * The classic (raster) path builds its tangent frame from screen-space
+	 * derivatives instead of the mesh's TANGENT attribute, so which sign turns an
+	 * asset's tangent-space normal into that frame is a convention rather than
+	 * something the asset can tell us. Exposed at run time so the DebugUI can flip
+	 * the two axes live while looking at a directional normal map, instead of
+	 * requiring a rebuild per guess. Defaults to (1,-1), the glTF (+Y up / +V down)
+	 * convention.
+	 *
+	 * @param sign x = tangent axis sign, y = bitangent axis sign.
+	 */
+	void setNormalMapSign(Vec2 sign);
+	EE_NODISCARD Vec2 normalMapSign() const;
+
+	/**
+	 * @brief Specular image-based lighting from the sky (prefiltered environment).
+	 *
+	 * The sky is rendered once into a cubemap and filtered per roughness level into
+	 * a mip chain (RenderSubsystem::prepareEnvironment), so a surface can look up the
+	 * radiance its GGX lobe gathers along the reflection vector and combine it with
+	 * the analytic split-sum BRDF (EnvBRDFApprox). Without it a metal or a polished
+	 * dielectric has no ambient specular at all and reads as flat and dark, because
+	 * the flat `ambient * albedo` term only ever fed the diffuse lobe.
+	 *
+	 * @param enable   false falls back to the diffuse-only ambient of before.
+	 */
+	void setSkyIBLEnabled(bool enable);
+	EE_NODISCARD bool skyIBLEnabled() const;
+	/**
+	 * @brief Scales the roughness -> mip level used when sampling the environment.
+	 *
+	 * The level is picked by matching the GGX lobe's solid angle (half-angle about
+	 * roughness^2) against a texel's, so 1 is the physically-motivated mapping; lower
+	 * values keep reflections sharper, higher ones blur them. It is a look knob that
+	 * compensates for the mip chain being a plain box blur rather than a true GGX
+	 * prefilter.
+	 */
+	void setSkyIBLMipScale(F32 scale);
+	EE_NODISCARD F32 skyIBLMipScale() const;
+	/**
+	 * @brief Debug: shade every surface with the raw environment sample.
+	 *
+	 * Shows the environment cube itself (a mirror ball), which is how the face
+	 * orientation and the sky's up direction can be checked against the visible
+	 * skybox without any lighting in the way.
+	 */
+	void setSkyIBLDebug(bool enable);
+	EE_NODISCARD bool skyIBLDebug() const;
+	/**
+	 * @brief Mirrors applied while building the environment cube.
+	 *
+	 * The cube faces are filled by projecting the skybox geometry with a hand-written
+	 * face matrix, because the cube addressing convention fixes the sign of the two
+	 * screen axes per face. If a sign is wrong there, the environment comes out
+	 * mirrored - which is visible as a sky reflected upside down or back to front and
+	 * cannot be corrected anywhere downstream - so the three plausible mirrors are
+	 * exposed rather than guessed at:
+	 *
+	 * - @p flipU   mirrors every face horizontally,
+	 * - @p flipV   mirrors every face vertically,
+	 * - @p mirrorY mirrors the whole sky about the world's up axis (swaps sky and
+	 *              ground for the four side faces).
+	 *
+	 * Changing any of them rebuilds the cube (a few milliseconds), so they can be
+	 * toggled live while looking at the "Sky IBL Debug" mirror ball.
+	 */
+	void setSkyEnvFlip(bool flipU, bool flipV, bool mirrorY);
+	EE_NODISCARD bool skyEnvFlipU() const;
+	EE_NODISCARD bool skyEnvFlipV() const;
+	EE_NODISCARD bool skyEnvMirrorY() const;
+	/// @brief Shader parameters of the specular IBL (mirrors FrameConstants::envParams).
+	EE_NODISCARD Vec4 skyEnvParams() const;
+	/// @brief Cubemap SRV of the prefiltered environment (never null after initialize).
+	EE_NODISCARD TextureSRV getSkyEnvSRV() const;
+	/**
+	 * @brief Rebuilds the prefiltered environment cube when the sky changed.
+	 *
+	 * Recording-side work (6 sky draws + one prefilter dispatch per roughness level),
+	 * so it has to be called from inside a frame, before anything samples the cube.
+	 * Cheap and idempotent otherwise: it only does anything after setSkybox().
+	 */
+	void prepareEnvironment();
+
 	/// @brief Remove skybox.
 	void clearSkybox();
 

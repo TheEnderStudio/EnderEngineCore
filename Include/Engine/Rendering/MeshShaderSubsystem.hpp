@@ -149,6 +149,19 @@ public:
 	void setShadowMap(TextureSRV shadowMap, const Mat4 worldToShadowUV[4], const Vec4& cascadeSplits);
 
 	/**
+	 * @brief Bind the prefiltered sky environment cube (specular IBL) for the shading.
+	 *
+	 * The pixel shader reads it for the specular ambient (see
+	 * RenderSubsystem::setSkyIBLEnabled), so it is set once per frame together with
+	 * the shadow map. A null SRV falls back to an internal black cube, which leaves
+	 * the specular term at zero while keeping the mutable variable bound - an unbound
+	 * one would sample whatever the descriptor heap holds.
+	 *
+	 * @param envCube Cubemap SRV (RenderSubsystem::getSkyEnvSRV), or nullptr.
+	 */
+	void setSkyEnv(TextureSRV envCube);
+
+	/**
 	 * @brief Draw the M1 test grid (animated cubes with amplification/mesh shaders).
 	 *
 	 * Renders into the currently bound render target + depth buffer of the

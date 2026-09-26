@@ -512,6 +512,15 @@ Result<void, CoreError> RenderPipeline::render(RenderFrame& frame) {
 	if (frame.rtWidth == 0) frame.rtWidth = frame.width;
 	if (frame.rtHeight == 0) frame.rtHeight = frame.height;
 
+	// Rebuild the prefiltered sky environment if it changed, before any pass can
+	// sample it (it is recording-side work, so it has to happen inside the frame),
+	// and hand the cube to the mesh shader path, which reads it for the specular
+	// ambient in the passes that shade. Doing it here rather than in one of the
+	// passes keeps it out of their enable/disable logic (the shadow pass, which
+	// carries the other per-frame bindings, is off in the hybrid mode).
+	m_impl->context.renderer->prepareEnvironment();
+	m_impl->context.meshShader->setSkyEnv(m_impl->context.renderer->getSkyEnvSRV());
+
 	// Keep the trace constants consistent with the camera the other passes use;
 	// the remaining quality knobs are the caller's.
 	const Mat4 viewProj = frame.proj * frame.view;

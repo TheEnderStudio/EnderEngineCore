@@ -228,6 +228,10 @@ Texture2D    t_EmissiveMap: register(t3);
 SamplerState t_BC_sampler : register(s0);
 Texture2DArray g_ShadowMap        : register(t4);
 SamplerComparisonState g_ShadowMap_sampler : register(s4);
+// Prefiltered sky environment (see RenderSubsystem::prepareEnvironment): one mip per
+// roughness level, built by the GGX prefilter compute shader.
+TextureCube  g_SkyEnv     : register(t5);
+SamplerState g_SkyEnv_sampler : register(s5);
 
 
 cbuffer Frame : register(b0)
@@ -241,6 +245,7 @@ cbuffer Frame : register(b0)
     float    _p2;
     float4x4 g_ShadowMapUVDepth[4]; float4 g_CascadeSplits;
     float4   g_SkyCorners[8];   // skybox corners -> ambient irradiance, see SkyIrradiance
+    float4   g_EnvParams;       // x = sky IBL on, y = mip scale, z = debug, w = intensity
 };
 
 // Diffuse irradiance of the analytic sky (the same closed form the mesh shader and
@@ -267,6 +272,50 @@ float3 SkyIrradiance(float3 n)
     return max(A + (2.0 / 3.0) * (B[0] * n.x + B[1] * n.y + B[2] * n.z), 0.0);
 }
 
+// ---------------------------------------------------------------------------
+// Specular IBL (split-sum)
+// ---------------------------------------------------------------------------
+// Karis' analytic fit of the second half of the split-sum approximation: the BRDF
+// integral against a white environment, as a (scale, bias) pair applied to F0. It
+// replaces a precomputed BRDF LUT with a handful of multiply-adds.
+float2 EnvBRDFApprox(float NdotV, float roughness)
+{
+    const float4 c0 = float4(-1.0, -0.0275, -0.572, 0.022);
+    const float4 c1 = float4( 1.0,  0.0425,  1.04, -0.04);
+    float4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NdotV)) * r.x + r.y;
+    return float2(-1.04, 1.04) * a004 + r.zw;
+}
+
+// Radiance the specular lobe gathers from the environment around the reflection
+// vector.
+//
+// The cube's mip chain is a plain box blur, so there is no per-roughness level to
+// look up: the level is chosen by matching the lobe's solid angle against a texel's,
+// which is the same rule the ray tracing path uses for its sky hits
+// (SkyLodForLobe). The GGX lobe's half-angle is about alpha = roughness^2.
+// The first half of the split-sum (that prefiltered radiance) times the second half
+// (EnvBRDFApprox) is the whole approximation. g_EnvParams.y scales the mip (a look
+// knob), .w the intensity, .x the enable.
+float3 SkySpecular(float3 N, float3 V, float3 F0, float roughness)
+{
+    if (g_EnvParams.x < 0.5)
+        return 0.0;
+    // TextureCube has no 3-output GetDimensions: the four-argument form is
+    // (MipLevel, Width, Height, NumberOfLevels), so the level to query comes first.
+    uint w = 1, h = 1, levels = 1;
+    g_SkyEnv.GetDimensions(0, w, h, levels);
+    const float alpha = max(roughness * roughness, 1e-3);
+    const float texelSolid = 2.0 / max((float)w * (float)w, 1.0); // ~4*pi/6 / (w*w)
+    const float lobeSolid = 3.14159265358979 * alpha * alpha;
+    float lod = 0.5 * log2(max(lobeSolid / texelSolid, 1.0));
+    lod = clamp(lod * g_EnvParams.y, 0.0, max((float)levels - 1.0, 0.0));
+    const float3 R = reflect(-V, N);
+    const float3 pre = g_SkyEnv.SampleLevel(g_SkyEnv_sampler, R, lod).rgb;
+    const float2 ab = EnvBRDFApprox(saturate(dot(N, V)), max(roughness, 0.002));
+    return pre * (F0 * ab.x + ab.y) * g_EnvParams.w;
+}
+
 struct Light
 {
     float4 CI;
@@ -287,7 +336,13 @@ cbuffer Object : register(b2)
     float4   g_BaseColor;
     float4   g_MetallicRough;
     float4   g_Emissive;
-    float4   g_MapFlags;      // x = has normal map, y = has MR map, z = has emissive map
+    float4   g_MapFlags;      // x = has normal map, y = has MR map, z = has emissive map, w = raw-sample debug
+    // Per-channel sign applied to the decoded tangent-space normal map (xyz used,
+    // z stays 1). A run-time value rather than a compile-time constant so the
+    // convention can be dialled in live (DebugUI "NM Flip X/Y") instead of by
+    // rebuilding - the tangent frame here is built from screen-space derivatives,
+    // so the sign is a property of that frame, not of the asset.
+    float4   g_NMSign;
 };
 
 struct PSIn
@@ -300,9 +355,15 @@ struct PSIn
 
 float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r)
 {
+    // F0 of the dielectric/metal mix, used by the direct specular lobe and by the
+    // environment below.
+    float3 F0 = lerp(float3(0.04, 0.04, 0.04), bc, m);
     // Ambient: the sky's irradiance along the normal (environment lighting instead
-    // of a flat colour). g_Ambient.a still scales it.
-    float3 col = SkyIrradiance(N) * g_Ambient.a * bc;
+    // of a flat colour), plus the specular lobe's share of the environment. g_Ambient.a
+    // still scales both. The specular term is what lights a metal: the irradiance
+    // term above only ever fed the diffuse lobe, so metals and polished dielectrics
+    // had no ambient specular at all.
+    float3 col = SkyIrradiance(N) * g_Ambient.a * bc + SkySpecular(N, V, F0, r) * g_Ambient.a;
     for (uint i = 0; i < g_LightCount && i < 8; i++)
     {
         Light L = g_Lights[i];
@@ -340,7 +401,7 @@ float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r)
 		float specExp = max(1.0, (1.0 - r) * 256.0);
 		float spec = pow(max(dot(N, H), 0.001), specExp);
         float3 diff = bc * (1.0 - m);
-        float3 specC = lerp(float3(0.04, 0.04, 0.04), bc, m);
+        float3 specC = F0;
         float shadow = 1.0;
         if (lt < 0.5) {
             float camZ = abs(mul(g_ViewProj, float4(wp, 1.0)).w);
@@ -364,13 +425,9 @@ float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r)
 //
 // The tangent frame is built from screen-space derivatives (a cotangent frame)
 // rather than from the mesh's TANGENT attribute, so the sign that converts the
-// asset's tangent-space convention into this frame has to be verified once,
-// visually: put a directional normal map (bricks, rock, tiles) on a surface, light
-// it from the side, and check that the relief is lit on the side facing the light.
-// Flip x below if it comes out inverted left/right, y if inverted up/down. The
-// mesh shader path (MeshShaderSubsystem) carries the same note.
-static const float2 kNormalMapSign = float2(1.0, -1.0);
-
+// asset's tangent-space convention into this frame is not derivable from the asset
+// alone: it comes from g_NMSign, which the DebugUI exposes live ("NM Flip X/Y").
+// The mesh shader path (MeshShaderSubsystem) carries the same note.
 float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
     float3 dp1 = ddx(wp);
     float3 dp2 = ddy(wp);
@@ -383,7 +440,7 @@ float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
     // Epsilon: degenerate UVs give a zero frame and rsqrt(0) would make the normal
     // NaN, which renders as black.
     float invmax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
-    float3 n = sampledNormal * float3(kNormalMapSign, 1.0);
+    float3 n = sampledNormal * g_NMSign.xyz;
     return normalize(mul(n, float3x3(T * invmax, B * invmax, N)));
 }
 
@@ -393,20 +450,29 @@ float4 main(PSIn i) : SV_TARGET
     float3 bc = tex.rgb * g_BaseColor.rgb;
     float  a  = tex.a * g_BaseColor.a;
 
-    // Normal mapping, only for materials that actually carry a normal map
-    // (g_MapFlags.x). Sampling a 1x1 fallback for everything else is what broke
-    // this path the first time: the tangent frame below is built from screen-space
-    // derivatives, so a garbage texel becomes a garbage normal over the whole face.
-    // The mesh shader path gates on the same kind of flag for the same reason.
-    // None of the current assets ship TANGENT_0, so the frame has to come from the
-    // derivatives (see kNormalMapSign for the sign convention).
+    // Diagnostic (toggled by RenderSubsystem::setNormalMapDebug): output the raw
+    // normal-map sample and nothing else. No tangent frame, no lighting - so this
+    // alone answers whether the classic path samples the right texture. A flat
+    // (128,128,255) blue is the neutral fallback, a recognisable normal map means
+    // the binding is correct, noise means it is not.
+    if (g_MapFlags.w > 0.5) {
+        return float4(t_NormalMap.Sample(t_BC_sampler, i.UV).xyz, 1.0);
+    }
+
     float3 N = normalize(i.N);
     if (g_MapFlags.x > 0.5) {
+        // Decode the texel to tangent space, then rotate it into the frame the
+        // derivative-built tangent/bitangent spans.
         float3 sn = t_NormalMap.Sample(t_BC_sampler, i.UV).xyz * 2.0 - 1.0;
         N = NormalMapped(N, i.WP, i.UV, sn);
     }
 
     float3 V = normalize(g_CameraPos.xyz - i.WP);
+    // Debug: the environment cube itself (a mirror ball), so its orientation can be
+    // compared against the skybox on screen without any lighting in the way.
+    if (g_EnvParams.z > 0.5) {
+        return float4(g_SkyEnv.SampleLevel(g_SkyEnv_sampler, reflect(-V, N), 0).rgb, 1.0);
+    }
     float m = g_MetallicRough.x;
     float r = g_MetallicRough.y;
     float3 lit = DoLight(i.WP, N, V, bc, m, r);
@@ -445,7 +511,13 @@ cbuffer Object : register(b2)
     float4   g_BaseColor;
     float4   g_MetallicRough;
     float4   g_Emissive;
-    float4   g_MapFlags;      // x = has normal map, y = has MR map, z = has emissive map
+    float4   g_MapFlags;      // x = has normal map, y = has MR map, z = has emissive map, w = raw-sample debug
+    // Per-channel sign applied to the decoded tangent-space normal map (xyz used,
+    // z stays 1). A run-time value rather than a compile-time constant so the
+    // convention can be dialled in live (DebugUI "NM Flip X/Y") instead of by
+    // rebuilding - the tangent frame here is built from screen-space derivatives,
+    // so the sign is a property of that frame, not of the asset.
+    float4   g_NMSign;
 };
 
 struct PSIn
@@ -464,9 +536,7 @@ struct PSOut
 };
 
 // Same note as in the forward shader: the sign belongs to the derivative-built
-// tangent frame, not to the asset, and is verified visually once.
-static const float2 kNormalMapSign = float2(1.0, -1.0);
-
+// tangent frame, not to the asset, and comes from g_NMSign at run time.
 float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
     float3 dp1 = ddx(wp);
     float3 dp2 = ddy(wp);
@@ -477,7 +547,7 @@ float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
     float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
     float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
     float invmax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
-    float3 n = sampledNormal * float3(kNormalMapSign, 1.0);
+    float3 n = sampledNormal * g_NMSign.xyz;
     return normalize(mul(n, float3x3(T * invmax, B * invmax, N)));
 }
 
@@ -485,9 +555,17 @@ PSOut main(PSIn i)
 {
     PSOut o;
     o.Color = t_BC.Sample(t_BC_sampler, i.UV) * g_BaseColor;
-    // Same gating as the forward shader: only materials that carry a normal map are
-    // sampled, so the unmapped majority never touches the fallback texture - which
-    // is what corrupted every object's G-buffer normal the first time round.
+    // Diagnostic (RenderSubsystem::setNormalMapDebug): write the raw normal-map
+    // sample into the normal and emissive targets. The normal target is linear
+    // RGBA16F, and the hybrid compose adds the emissive on top, so both the G-buffer
+    // debug view and the final image show it unmodified. No tangent frame is
+    // involved, which is the point: this isolates the sampling from the TBN.
+    if (g_MapFlags.w > 0.5) {
+        float4 raw = float4(t_NormalMap.Sample(t_BC_sampler, i.UV).xyz, 1.0);
+        o.Norm = raw;
+        o.Emis = raw;
+        return o;
+    }
     float3 N = normalize(i.N);
     if (g_MapFlags.x > 0.5) {
         float3 sn = t_NormalMap.Sample(t_BC_sampler, i.UV).xyz * 2.0 - 1.0;
@@ -744,9 +822,98 @@ struct RenderSubsystem::RenderBackend {
 	/// The shaders derive the ambient light from them (SkyIrradiance); when no
 	/// skybox is set they are filled with the ambient colour, which degenerates the
 	/// irradiance back to the previous flat ambient instead of turning it black.
-	void applySkyCorners(FrameConstants& fc) const {
+
+	/// @brief Debug: shade with the raw normal-map sample of the classic path.
+	///
+	/// Written into the per-object mapFlags.w so g_PS / g_PS_GBuffer can output the
+	/// sampled texel directly, with no tangent frame involved. That answers "does
+	/// this path sample the right texture at all" without the TBN in the way: a flat
+	/// (128,128,255) blue is the neutral fallback, a recognisable normal map means
+	/// the binding is right, noise means it is not.
+	bool normalMapDebug = false;
+	/// @brief Sign applied to the classic path's decoded tangent-space normal map.
+	///
+	/// The tangent frame there is built from screen-space derivatives, so the sign
+	/// that maps an asset's tangent-space normal into that frame is a convention
+	/// (glTF's +Y-up / +V-down textures give (1,-1)) rather than something derivable
+	/// from the asset. Kept as data so it can be dialled in live.
+	Vec4 nmSign = Vec4(1.0f, -1.0f, 1.0f, 0.0f);
+
+	// ---- Sky environment (specular IBL) --------------------------------
+	//
+	// The sky is drawn into the faces of envCube - through the ordinary sky shaders,
+	// so it is the same sky the visible skybox shows - and its mip chain is generated
+	// from there. The render targets have to be around from createDefaults() on, before
+	// any shading PSO exists, because those bind the cube as a static variable at
+	// creation time; an unbound resource would be sampled as whatever the descriptor
+	// heap holds (see the note in mkPSO). Only the *content* is rebuilt, and until the
+	// first build the cube is zero, so the specular term simply contributes nothing.
+	static constexpr UInt32 kEnvCubeSize = 128;
+	static constexpr UInt32 kEnvCubeMips = 8; // 128 -> 1
+	D::RefCntAutoPtr<D::ITexture>     envCube;
+	D::RefCntAutoPtr<D::ITextureView> envCubeSRV;
+	D::RefCntAutoPtr<D::ITextureView> envCubeRTV[6];
+	PSOHandle envCornerPSO, envCubeSkyPSO;
+	bool envViewsOk = true;     ///< False when a cube face view could not be created.
+	bool envBuildWarned = false;///< One-shot warning when the environment cannot be built yet.
+	bool envDirty = true;       ///< Sky changed: rebuild the environment cube before the next frame.
+	bool envEnabled = true;     ///< Specular IBL on/off (FrameConstants::envParams.x).
+	F32  envMipScale = 1.0f;    ///< Roughness -> mip scale (envParams.y).
+	bool envDebug = false;      ///< Shade with the raw environment sample (envParams.z).
+	F32  envIntensity = 1.0f;   ///< Specular IBL intensity (envParams.w).
+	/// Cube-map orientation fixes (see envFaceMatrix): which mirrors the built
+	/// environment needs so that it matches the visible sky. Kept as data rather than
+	/// as a baked-in correction until the right combination is confirmed on screen.
+	bool envFlipU = false;      ///< Mirror every face horizontally.
+	bool envFlipV = false;      ///< Mirror every face vertically.
+	bool envMirrorY = false;    ///< Mirror the sky about the world's up axis.
+
+	/// @brief Fill the frame constants the shaders derive lighting from.
+	///
+	/// The skybox corners drive the ambient irradiance (SkyIrradiance); when no skybox
+	/// is set they are filled with the ambient colour, which degenerates the irradiance
+	/// back to the previous flat ambient instead of turning it black. The same call
+	/// carries the specular IBL parameters, because every site that builds a
+	/// FrameConstants for shading needs both.
+	void applyEnvironment(FrameConstants& fc) const {
 		for (int i = 0; i < 8; ++i) fc.skyCorners[i] = skyDesc.has_value() ? skyDesc->corners[i] : fc.ambient;
+		fc.envParams = Vec4(envEnabled ? 1.0f : 0.0f, envMipScale, envDebug ? 1.0f : 0.0f, envIntensity);
 	}
+
+	/// @brief View-projection that maps a direction onto cube face @p face.
+	///
+	/// Written out by hand instead of built from a look-at plus a projection: the
+	/// cube addressing convention fixes the sign of the two screen axes per face
+	/// (for +X: u = -z and v = -y), and the skybox vertex shader only uses x, y and w
+	/// of the result (it forces z = w), so there is nothing a camera matrix would add
+	/// except room for a handedness mistake. The faces are (D3D/GL order) +X, -X, +Y,
+	/// -Y, +Z, -Z: the addressing convention fixed by the cube map.
+	///
+	/// The three optional mirrors are the escape hatch for exactly that convention:
+	/// getting a sign wrong there produces an environment that is mirrored, which no
+	/// amount of shader-side care can fix, and it is far cheaper to dial in live (the
+	/// DebugUI toggles) than to reason about. They compose as F_u * F_v * M * S, i.e.
+	/// the world mirror first, then the two face-space mirrors.
+	static Mat4 envFaceMatrix(UInt32 face, bool flipU, bool flipV, bool mirrorY) {
+		Mat4 m(0.0f);
+		// Clip x = u_cube * |major|, clip y = v_cube * |major|, clip w = major, so w
+		// stays positive in front of the face and the back half is clipped away.
+		switch (face) {
+		case 0: m[2][0] = -1.0f; m[1][1] = -1.0f; m[0][3] = 1.0f; break;  // +X: u=-z, v=-y
+		case 1: m[2][0] = 1.0f;  m[1][1] = -1.0f; m[0][3] = -1.0f; break; // -X: u= z, v=-y
+		case 2: m[0][0] = 1.0f;  m[2][1] = 1.0f;  m[1][3] = 1.0f; break;  // +Y: u= x, v= z
+		case 3: m[0][0] = 1.0f;  m[2][1] = -1.0f; m[1][3] = -1.0f; break; // -Y: u= x, v=-z
+		case 4: m[0][0] = 1.0f;  m[1][1] = -1.0f; m[2][3] = 1.0f; break;  // +Z: u= x, v=-y
+		default: m[0][0] = -1.0f; m[1][1] = -1.0f; m[2][3] = -1.0f; break; // -Z: u=-x, v=-y
+		}
+		if (mirrorY) { Mat4 s(1.0f); s[1][1] = -1.0f; m = m * s; } // mirror the sky about the world's up axis
+		if (flipU) { Mat4 f(1.0f); f[0][0] = -1.0f; m = f * m; }   // mirror every face horizontally
+		if (flipV) { Mat4 f(1.0f); f[1][1] = -1.0f; m = f * m; }   // mirror every face vertically
+		return m;
+	}
+
+	/// @brief GGX sample count for a prefilter level: few samples where the lobe is
+	/// huge and the target is tiny, many where the level is still sharp.
 
 	CamData cam; CameraHandle camHandle;
 	Vec4 ambient = Vec4(0.30f, 0.30f, 0.35f, 1.0f);
@@ -917,6 +1084,57 @@ struct RenderSubsystem::RenderBackend {
 	}
 
 	Result<void, RenderError> createDefaults() {
+		// ---- Sky environment cube (specular IBL) -------------------------
+		//
+		// One cube, drawn face by face through the ordinary sky shaders and then
+		// mip-mapped. Created before any shading PSO, which binds it as a static
+		// variable at creation time (and it cannot be created lazily: a resource that
+		// was never bound is sampled as whatever the descriptor heap holds).
+		//
+		// The blur of the rougher levels is a plain box mip chain. For this sky - a
+		// smooth gradient between eight corner colours - that is a good stand-in for
+		// the GGX prefilter, and the consumer's level selection accounts for it by
+		// matching the lobe's solid angle (see SkySpecular in g_PS). A true GGX
+		// importance-sampled prefilter would only differ for a high-frequency sky
+		// (a sun disk, clouds) and can replace this without touching the shaders.
+		{
+			D::TextureDesc td;
+			td.Name = "EnvCube";
+			td.Type = D::RESOURCE_DIM_TEX_CUBE;
+			td.Width = kEnvCubeSize; td.Height = kEnvCubeSize;
+			td.Format = D::TEX_FORMAT_RGBA16_FLOAT;
+			td.ArraySize = 6;
+			td.MipLevels = kEnvCubeMips;
+			td.BindFlags = D::BIND_RENDER_TARGET | D::BIND_SHADER_RESOURCE;
+			td.MiscFlags = D::MISC_TEXTURE_FLAG_GENERATE_MIPS;
+			td.Usage = D::USAGE_DEFAULT;
+			device->CreateTexture(td, nullptr, &envCube);
+			if (!envCube) return RenderError::TextureCreationFailed;
+			envCubeSRV = envCube->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
+			for (UInt32 f = 0; f < 6; ++f) {
+				// One render target per face. A cube face is a 2D-array slice, which is
+				// what a render target view of it has to describe.
+				D::TextureViewDesc vd;
+				vd.Name = "EnvFace";
+				vd.TextureDim = D::RESOURCE_DIM_TEX_2D_ARRAY;
+				vd.ViewType = D::TEXTURE_VIEW_RENDER_TARGET;
+				vd.Format = D::TEX_FORMAT_RGBA16_FLOAT;
+				vd.MostDetailedMip = 0; vd.NumMipLevels = 1;
+				vd.FirstArraySlice = f; vd.NumArraySlices = 1;
+				envCube->CreateView(vd, &envCubeRTV[f]);
+				if (!envCubeRTV[f]) envViewsOk = false;
+			}
+			// The per-face render targets are the only part of this that depends on how
+			// a backend exposes the subresources of a cube. If one cannot be created,
+			// fall back to "no specular IBL" (an unwritten cube is zero) instead of
+			// failing the whole renderer - the cube and its SRV exist, so the PSO
+			// bindings stay valid either way.
+			if (!envViewsOk) {
+				EWarn("RenderSubsystem: the sky environment cube face views could not be created; specular IBL is disabled.");
+				envEnabled = false;
+			}
+		}
+
 		ShaderDesc sd; sd.entryPoint = "main";
 		{ sd.stage = ShaderStage::Vertex; sd.source = g_VS; auto r = mkShader(sd); if (r.isErr()) return r.error(); defVS = r.value(); }
 		{ sd.stage = ShaderStage::Vertex; sd.source = g_VS_Inst; auto r = mkShader(sd); if (r.isErr()) return r.error(); defVS_Inst = r.value(); }
@@ -988,6 +1206,9 @@ struct RenderSubsystem::RenderBackend {
 					{D::SHADER_TYPE_PIXEL, "t_EmissiveMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					{D::SHADER_TYPE_VERTEX | D::SHADER_TYPE_PIXEL, "Object", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					{D::SHADER_TYPE_PIXEL, "g_ShadowMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+					// Pinned to the pixel stage so it matches its immutable sampler (see
+					// the same note in mkPSO).
+					{D::SHADER_TYPE_PIXEL, "g_SkyEnv", D::SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 					{D::SHADER_TYPE_VERTEX, "g_WorldMatrices", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					{D::SHADER_TYPE_VERTEX, "g_Indices", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 				};
@@ -996,10 +1217,12 @@ struct RenderSubsystem::RenderBackend {
 				D::ImmutableSamplerDesc ImtblSamps[] = {
 					{D::SHADER_TYPE_PIXEL, "t_BC", D::SamplerDesc{}},
 					{D::SHADER_TYPE_PIXEL, "g_ShadowMap", cmpSamp},
+					{D::SHADER_TYPE_PIXEL, "g_SkyEnv", D::SamplerDesc{}},
 				};
 				ci.PSODesc.ResourceLayout.ImmutableSamplers = ImtblSamps; ci.PSODesc.ResourceLayout.NumImmutableSamplers = EE_ARRAY_SIZE(ImtblSamps);
 				D::RefCntAutoPtr<D::IPipelineState> p; device->CreateGraphicsPipelineState(ci, &p);
 				if (p) {
+					if (envCubeSRV) { auto* v = p->GetStaticVariableByName(D::SHADER_TYPE_PIXEL, "g_SkyEnv"); if (v) v->Set(envCubeSRV); }
 					if (frameCB) { auto* v = p->GetStaticVariableByName(D::SHADER_TYPE_VERTEX, "Frame"); if (v) v->Set(frameCB); }
 					if (frameCB) { auto* v = p->GetStaticVariableByName(D::SHADER_TYPE_PIXEL, "Frame"); if (v) v->Set(frameCB); }
 					if (lightCB) { auto* v = p->GetStaticVariableByName(D::SHADER_TYPE_PIXEL, "Lights"); if (v) v->Set(lightCB); }
@@ -1276,6 +1499,45 @@ struct RenderSubsystem::RenderBackend {
 				}
 			}
 		}
+
+		// PSOs that draw the sky into the environment cube: the sky shaders again, but
+		// at one sample and without a depth buffer (the cube has neither), which is why
+		// the sky PSOs of the visible pass cannot be reused.
+		{
+			auto* vs = shaders.get(skyVS.index, skyVS.generation);
+			auto makeEnvPso = [&](const char* name, ShaderHandle psH, bool cubeSky, PSOHandle& out) -> Result<void, RenderError> {
+				auto* ps = shaders.get(psH.index, psH.generation);
+				if (!vs || !ps) return RenderError::InvalidHandle;
+				D::GraphicsPipelineStateCreateInfo ci;
+				ci.PSODesc.Name = name; ci.PSODesc.PipelineType = D::PIPELINE_TYPE_GRAPHICS;
+				ci.pVS = vs->shader; ci.pPS = ps->shader;
+				ci.GraphicsPipeline.NumRenderTargets = 1;
+				ci.GraphicsPipeline.RTVFormats[0] = D::TEX_FORMAT_RGBA16_FLOAT;
+				ci.GraphicsPipeline.DSVFormat = D::TEX_FORMAT_UNKNOWN;
+				ci.GraphicsPipeline.PrimitiveTopology = D::PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+				ci.GraphicsPipeline.RasterizerDesc.CullMode = D::CULL_MODE_NONE;
+				ci.GraphicsPipeline.DepthStencilDesc.DepthEnable = false;
+				ci.GraphicsPipeline.SmplDesc.Count = 1;
+				D::LayoutElement le[] = { {0,0,3,D::VT_FLOAT32,false,0,12,D::INPUT_ELEMENT_FREQUENCY_PER_VERTEX} };
+				ci.GraphicsPipeline.InputLayout.NumElements = 1; ci.GraphicsPipeline.InputLayout.LayoutElements = le;
+				ci.PSODesc.ResourceLayout.DefaultVariableType = D::SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
+				D::ShaderResourceVariableDesc vv[] = {
+					{D::SHADER_TYPE_PIXEL,"g_SkyTex",D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+					{D::SHADER_TYPE_PIXEL,"g_SkySamp",D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+				};
+				if (cubeSky) { ci.PSODesc.ResourceLayout.Variables = vv; ci.PSODesc.ResourceLayout.NumVariables = EE_ARRAY_SIZE(vv); }
+				D::RefCntAutoPtr<D::IPipelineState> pso; device->CreateGraphicsPipelineState(ci, &pso);
+				if (!pso) return RenderError::PipelineStateCreationFailed;
+				if (frameCB) { auto* v = pso->GetStaticVariableByName(D::SHADER_TYPE_VERTEX, "Frame"); if (v) v->Set(frameCB); }
+				if (skyCB) { auto* v = pso->GetStaticVariableByName(D::SHADER_TYPE_VERTEX, "SkyColors"); if (v) v->Set(skyCB); }
+				auto a = psos.allocate(); auto* pd = psos.getUnchecked(a.index); pd->pso = pso;
+				pso->CreateShaderResourceBinding(&pd->srb, true);
+				out = PSOHandle{ a.index, a.generation };
+				return {};
+			};
+			auto r1 = makeEnvPso("EnvCornerPSO", skyPS, false, envCornerPSO); if (r1.isErr()) return r1.error();
+			auto r2 = makeEnvPso("EnvCubeSkyPSO", skyCubePS, true, envCubeSkyPSO); if (r2.isErr()) return r2.error();
+		}
 		return {};
 	}
 
@@ -1334,22 +1596,53 @@ struct RenderSubsystem::RenderBackend {
 		ci.PSODesc.ResourceLayout.DefaultVariableType = D::SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
 		ci.PSODesc.ResourceLayout.DefaultVariableMergeStages = D::SHADER_TYPE_VERTEX | D::SHADER_TYPE_PIXEL;
 
+		// Every per-material texture has to be declared MUTABLE here: anything left
+		// to DefaultVariableType (STATIC) is owned by the PSO, and
+		// IShaderResourceBinding::GetVariableByName() does not return it, so the
+		// per-material Set() in mkMat() silently did nothing and the shader sampled
+		// whatever descriptor happened to sit in that heap slot - which is why all
+		// objects used to show one and the same (and flickering) normal map. The
+		// mesh shader path never had this problem because it drives its maps through
+		// a mutable texture array.
 		D::ShaderResourceVariableDesc Vars[] = {
-			{D::SHADER_TYPE_PIXEL, "t_BC",   D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+			{D::SHADER_TYPE_PIXEL, "t_BC",          D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+			{D::SHADER_TYPE_PIXEL, "t_NormalMap",   D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+			{D::SHADER_TYPE_PIXEL, "t_MR",          D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+			{D::SHADER_TYPE_PIXEL, "t_EmissiveMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 			{D::SHADER_TYPE_VERTEX | D::SHADER_TYPE_PIXEL, "Object", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 			{D::SHADER_TYPE_PIXEL, "g_ShadowMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+			// Explicit, and deliberately not left to DefaultVariableMergeStages: an
+			// automatically detected resource is merged across the default stages
+			// (VERTEX|PIXEL here), and Diligent then rejects the PIXEL-only immutable
+			// sampler below - "a resource present in multiple shader stages cannot be
+			// combined with different immutable samplers in different stages". The
+			// stage list of a resource has to match its immutable sampler's.
+			{D::SHADER_TYPE_PIXEL, "g_SkyEnv", D::SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 		};
-		ci.PSODesc.ResourceLayout.Variables = Vars; ci.PSODesc.ResourceLayout.NumVariables = EE_ARRAY_SIZE(Vars);
+		// Only the shaded pixel shader declares the environment cube - the G-buffer
+		// variant leaves the lighting to the RT compose pass - so its entry (and its
+		// immutable sampler, which must be the last one) is only part of the layout
+		// when the shader actually has the resource.
+		const D::Uint32 numVars = gbuffer ? EE_ARRAY_SIZE(Vars) - 1u : EE_ARRAY_SIZE(Vars);
+		ci.PSODesc.ResourceLayout.Variables = Vars; ci.PSODesc.ResourceLayout.NumVariables = numVars;
 
 		D::SamplerDesc cmpSamp; cmpSamp.MinFilter = D::FILTER_TYPE_COMPARISON_LINEAR; cmpSamp.MagFilter = D::FILTER_TYPE_COMPARISON_LINEAR; cmpSamp.MipFilter = D::FILTER_TYPE_COMPARISON_LINEAR; cmpSamp.ComparisonFunc = D::COMPARISON_FUNC_LESS; cmpSamp.AddressU = D::TEXTURE_ADDRESS_CLAMP; cmpSamp.AddressV = D::TEXTURE_ADDRESS_CLAMP; cmpSamp.AddressW = D::TEXTURE_ADDRESS_CLAMP;
 		D::ImmutableSamplerDesc ImtblSamps[] = {
 			{D::SHADER_TYPE_PIXEL, "t_BC", D::SamplerDesc{}},
 			{D::SHADER_TYPE_PIXEL, "g_ShadowMap", cmpSamp},
+			{D::SHADER_TYPE_PIXEL, "g_SkyEnv", D::SamplerDesc{}},
 		};
-		ci.PSODesc.ResourceLayout.ImmutableSamplers = ImtblSamps; ci.PSODesc.ResourceLayout.NumImmutableSamplers = EE_ARRAY_SIZE(ImtblSamps);
+		ci.PSODesc.ResourceLayout.ImmutableSamplers = ImtblSamps;
+		ci.PSODesc.ResourceLayout.NumImmutableSamplers = gbuffer ? EE_ARRAY_SIZE(ImtblSamps) - 1u : EE_ARRAY_SIZE(ImtblSamps);
 
 		D::RefCntAutoPtr<D::IPipelineState> p; device->CreateGraphicsPipelineState(ci, &p);
 		if (!p) return RenderError::PipelineStateCreationFailed;
+
+		// The environment cube is shared by every object (it is the sky, not a
+		// material), so it is a static variable bound once here. The texture exists
+		// from createDefaults() on, even before the first build, so this never leaves
+		// the variable unbound - see the note on the mutable map variables above.
+		if (envCubeSRV) { auto* v = p->GetStaticVariableByName(D::SHADER_TYPE_PIXEL, "g_SkyEnv"); if (v) v->Set(envCubeSRV); }
 
 		if (frameCB) {
 			{ auto* v = p->GetStaticVariableByName(D::SHADER_TYPE_VERTEX, "Frame"); if (v) v->Set(frameCB); }
@@ -1520,7 +1813,7 @@ struct RenderSubsystem::RenderBackend {
 		if (!pd) return;
 		ctx->SetPipelineState(pd->pso);
 		// Update frame CB: ViewProj = Proj * View (column-major, for mul(g_ViewProj, worldPos))
-		{ FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; applySkyCorners(fc); fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits; void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); } }
+		{ FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; applyEnvironment(fc); fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits; void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); } }
 		{ void* m = nullptr; ctx->MapBuffer(lightCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &lcBuf, sizeof(lcBuf)); ctx->UnmapBuffer(lightCB, D::MAP_WRITE); } }
 		D::Uint64 vo = 0; D::IBuffer* vbs[] = { md->vb.RawPtr() };
 		ctx->SetVertexBuffers(0, 1, vbs, &vo, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION, D::SET_VERTEX_BUFFERS_FLAG_RESET);
@@ -1531,7 +1824,7 @@ struct RenderSubsystem::RenderBackend {
 		for (UInt32 si = 0; si < (UInt32)md->sub.size(); si++) {
 			auto& s = md->sub[si];
 			auto* mt = materials.get(s.material.index, s.material.generation);
-			if (mt && mt->objCB) { ObjectConstants oc; oc.world = wm; oc.normalMat = nm; oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
+			if (mt && mt->objCB) { ObjectConstants oc; oc.world = wm; oc.normalMat = nm; oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.nmSign = nmSign; oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
 			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
 			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
 			if (mt && srb) {
@@ -1574,7 +1867,7 @@ struct RenderSubsystem::RenderBackend {
 
 		ctx->SetPipelineState(pd->pso);
 		{
-			FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(camPos, 1.0f); fc.ambient = ambient; applySkyCorners(fc); fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits;
+			FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(camPos, 1.0f); fc.ambient = ambient; applyEnvironment(fc); fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits;
 			void* m2 = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m2); if (m2) { memcpy(m2, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); }
 			D::IShaderResourceVariable* fv = pd->srb->GetVariableByName(D::SHADER_TYPE_VERTEX, "Frame");
 			if (fv) fv->Set(frameCB, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
@@ -1605,7 +1898,7 @@ struct RenderSubsystem::RenderBackend {
 		ctx->UpdateBuffer(instanceCB, 0, count * (D::Uint32)sizeof(Mat4), worldMatrices.data(), D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
 		ctx->SetPipelineState(pd->pso);
-		{ FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; applySkyCorners(fc); fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits; void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); } }
+		{ FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; applyEnvironment(fc); fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits; void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); } }
 		{ void* m = nullptr; ctx->MapBuffer(lightCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &lcBuf, sizeof(lcBuf)); ctx->UnmapBuffer(lightCB, D::MAP_WRITE); } }
 		D::Uint64 offsets[] = { 0, 0 };
 		D::IBuffer* pBuffs[] = { md->vb.RawPtr(), instanceCB.RawPtr() };
@@ -1614,7 +1907,7 @@ struct RenderSubsystem::RenderBackend {
 
 		for (auto& s : md->sub) {
 			auto* mt = materials.get(s.material.index, s.material.generation);
-			if (mt && mt->objCB) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
+			if (mt && mt->objCB) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.nmSign = nmSign; oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
 			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
 			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
 			if (mt && srb) {
@@ -1634,7 +1927,7 @@ struct RenderSubsystem::RenderBackend {
 		auto* pd = psos.get(defPSO_Indirect.index, defPSO_Indirect.generation); if (!pd) return;
 
 		ctx->SetPipelineState(pd->pso);
-		{ FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; applySkyCorners(fc); fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits; void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); } }
+		{ FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; applyEnvironment(fc); fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits; void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); } }
 		{ void* m = nullptr; ctx->MapBuffer(lightCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &lcBuf, sizeof(lcBuf)); ctx->UnmapBuffer(lightCB, D::MAP_WRITE); } }
 		D::Uint64 vo = 0; D::IBuffer* vbs[] = { md->vb.RawPtr() };
 		ctx->SetVertexBuffers(0, 1, vbs, &vo, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION, D::SET_VERTEX_BUFFERS_FLAG_RESET);
@@ -1648,23 +1941,32 @@ struct RenderSubsystem::RenderBackend {
 
 			if (worldMatSRV) { auto* v = srb->GetVariableByName(D::SHADER_TYPE_VERTEX, "g_WorldMatrices"); if (v) v->Set(static_cast<D::IDeviceObject*>(worldMatSRV)); }
 			if (indicesSRV) { auto* v = srb->GetVariableByName(D::SHADER_TYPE_VERTEX, "g_Indices"); if (v) v->Set(static_cast<D::IDeviceObject*>(indicesSRV)); }
-			// Mutable variables must be explicitly bound on fresh SRB
+			// Mutable variables have to be bound explicitly on a fresh SRB, and an
+			// unbound one does not fail loudly - it samples whatever descriptor sits in
+			// that heap slot. Copy *every* map binding from the material's SRB, with the
+			// same neutral fallbacks mkMat() uses, so this path shades the same textures
+			// as the regular draw() path.
 			{
-				// Try to get material's texture, fall back to white
-				D::IDeviceObject* texObj = whiteSRV.RawPtr();
-				if (mt && mt->srb) {
-					auto* src = mt->srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "t_BC");
-					if (src) { auto* obj = src->Get(); if (obj) texObj = obj; }
+				const char* mapNames[4] = { "t_BC", "t_NormalMap", "t_MR", "t_EmissiveMap" };
+				D::IDeviceObject* fallbacks[4] = { whiteSRV.RawPtr(), flatNormalSRV.RawPtr(), whiteSRV.RawPtr(), whiteSRV.RawPtr() };
+				for (int mi = 0; mi < 4; ++mi) {
+					auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, mapNames[mi]);
+					if (!v) continue;
+					D::IDeviceObject* obj = fallbacks[mi];
+					if (mt && mt->srb) {
+						if (auto* src = mt->srb->GetVariableByName(D::SHADER_TYPE_PIXEL, mapNames[mi])) {
+							if (auto* bound = src->Get()) obj = bound;
+						}
+					}
+					v->Set(obj, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 				}
-				if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "t_BC"))
-					v->Set(texObj, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 			}
 			if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap"))
 				v->Set(shadowSRV ? shadowSRV : shadowDummy, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 
 			if (mt) {
 				void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
-				if (m) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, 0.0f); memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); }
+				if (m) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.nmSign = nmSign; oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); }
 				if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_VERTEX, "Object"))
 					v->Set(mt->objCB, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 			}
@@ -1717,7 +2019,7 @@ struct RenderSubsystem::RenderBackend {
 
 		ctx->SetPipelineState(pd->pso);
 		{
-			FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; applySkyCorners(fc); fc.lightCount = 0; for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits;
+			FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; applyEnvironment(fc); fc.lightCount = 0; for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits;
 			void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); }
 		}
 		{
@@ -1744,6 +2046,85 @@ struct RenderSubsystem::RenderBackend {
 		ctx->CommitShaderResources(pd->srb, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		D::DrawIndexedAttribs da; da.IndexType = D::VT_UINT32; da.NumIndices = 36; da.Flags = D::DRAW_FLAG_VERIFY_ALL;
 		ctx->DrawIndexed(da); dc++;
+	}
+
+	/// @brief Draw the sky into the six faces of envCube and build its mip chain.
+	///
+	/// Recording-side, so the caller has to be inside a frame; runs once per sky
+	/// change (see envDirty). Six small draws plus one mip generation - a couple of
+	/// milliseconds at worst, and only when the sky or its colours change.
+	void buildEnvCube() {
+		if (!ok || !skyMesh.vb || !envCornerPSO.isValid()) {
+			if (!envBuildWarned) {
+				envBuildWarned = true;
+				EWarn("RenderSubsystem: the sky environment cannot be built yet (ok={}, skyMesh={}, cornerPSO={}); specular IBL stays black.",
+					ok, skyMesh.vb != nullptr, envCornerPSO.isValid());
+			}
+			return;
+		}
+
+		const bool useCubemap = skyDesc.has_value() && skyDesc->skyCubeTex.isValid() && envCubeSkyPSO.isValid();
+		PSOHandle srcPso = useCubemap ? envCubeSkyPSO : envCornerPSO;
+		auto* pd = psos.get(srcPso.index, srcPso.generation);
+		if (!pd) return;
+
+		// The colours the visible skybox uses, with the same fallback to the ambient
+		// colour that applyEnvironment() gives the shading paths.
+		{
+			Vec4 corners[8];
+			for (int i = 0; i < 8; ++i) corners[i] = skyDesc.has_value() ? skyDesc->corners[i] : ambient;
+			void* m = nullptr;
+			ctx->MapBuffer(skyCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
+			if (m) { memcpy(m, corners, sizeof(corners)); ctx->UnmapBuffer(skyCB, D::MAP_WRITE); }
+		}
+		if (useCubemap) {
+			if (auto* td = textures.get(skyDesc->skyCubeTex.index, skyDesc->skyCubeTex.generation)) {
+				if (auto* v = pd->srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_SkyTex")) v->Set(td->srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+			}
+			if (auto* sd = samplers.get(defSamp.index, defSamp.generation)) {
+				if (auto* v = pd->srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_SkySamp")) v->Set(sd->sampler);
+			}
+		}
+
+		ctx->SetPipelineState(pd->pso);
+		D::Viewport vp; vp.Width = (F32)kEnvCubeSize; vp.Height = (F32)kEnvCubeSize; vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
+		ctx->SetViewports(1, &vp, kEnvCubeSize, kEnvCubeSize);
+		D::Uint64 vo = 0; D::IBuffer* vbs[] = { skyMesh.vb.RawPtr() };
+		ctx->SetVertexBuffers(0, 1, vbs, &vo, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION, D::SET_VERTEX_BUFFERS_FLAG_RESET);
+		ctx->SetIndexBuffer(skyMesh.ib, 0, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		for (UInt32 f = 0; f < 6; ++f) {
+			if (!envCubeRTV[f]) continue;
+			D::ITextureView* rtv = envCubeRTV[f];
+			ctx->SetRenderTargets(1, &rtv, nullptr, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			// The sky vertex shader strips translation and forces z = w, so the face
+			// matrix is all the frame constants have to carry.
+			FrameConstants fc{};
+			fc.viewProj = envFaceMatrix(f, envFlipU, envFlipV, envMirrorY);
+			fc.cameraPos = Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+			fc.ambient = ambient;
+			applyEnvironment(fc);
+			void* m = nullptr;
+			ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
+			if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); }
+			ctx->CommitShaderResources(pd->srb, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			D::DrawIndexedAttribs da; da.IndexType = D::VT_UINT32; da.NumIndices = 36; da.Flags = D::DRAW_FLAG_VERIFY_ALL;
+			ctx->DrawIndexed(da); dc++;
+		}
+
+		// Mip chain: the levels the shading paths pick from by roughness. The texture
+		// carries MISC_TEXTURE_FLAG_GENERATE_MIPS, so the view has to be an SRV that
+		// covers them all - which the default view does.
+		ctx->GenerateMips(envCubeSRV);
+
+		// The graphics passes that follow expect the full-window viewport back.
+		ctx->SetRenderTargets(0, nullptr, nullptr, D::RESOURCE_STATE_TRANSITION_MODE_NONE);
+		D::Viewport full; full.Width = (F32)w; full.Height = (F32)h; full.MinDepth = 0.0f; full.MaxDepth = 1.0f;
+		ctx->SetViewports(1, &full, w, h);
+
+		envDirty = false;
+		EInfo("RenderSubsystem: sky environment rebuilt ({}x{}, {} mip levels, {}{}).",
+			kEnvCubeSize, kEnvCubeSize, kEnvCubeMips, useCubemap ? "cubemap sky" : "corner sky",
+			envEnabled ? "" : ", specular IBL off");
 	}
 
 	// --------------------------------------------------------------
@@ -1942,6 +2323,17 @@ struct RenderSubsystem::RenderBackend {
 			ETrace("Material[{}] '{}': baseColor=({:.2f},{:.2f},{:.2f},{:.2f}) metal={:.2f} rough={:.2f} tex={}",
 				i, md.name, md.baseColorFactor.x, md.baseColorFactor.y, md.baseColorFactor.z, md.baseColorFactor.w,
 				md.metallicFactor, md.roughnessFactor, hasTex ? "yes" : "no");
+			// Diagnostic for the classic path's PBR maps: the mesh shader path renders
+			// every one of these correctly, so if a material's map resolves to a
+			// handle that looks wrong here, that is the bug to chase (see the notes in
+			// g_PS / g_PS_GBuffer about why the sampling is not enabled yet).
+			EInfo("Material[{}] '{}': maps base={} normal={} mr={} emissive={} ao={}",
+				i, md.name,
+				md.baseColorTexture.isValid() ? md.baseColorTexture.index : ~0u,
+				md.normalTexture.isValid() ? md.normalTexture.index : ~0u,
+				md.metallicRoughnessTexture.isValid() ? md.metallicRoughnessTexture.index : ~0u,
+				md.emissiveTexture.isValid() ? md.emissiveTexture.index : ~0u,
+				md.aoTexture.isValid() ? md.aoTexture.index : ~0u);
 			auto mr = mkMat(md, defPSO); if (mr.isOk()) { matMap[(UInt32)i] = mr.value(); result.materials.push_back(mr.value()); }
 		}
 
@@ -2077,7 +2469,15 @@ Result<void, RenderError> RenderSubsystem::updateLight(LightHandle h, const Ligh
 	ld->desc = d; for (size_t i = 0; i < m_backend->activeLights.size(); ++i) { if (m_backend->activeLights[i] == h) { auto& lc = m_backend->lcBuf.lights[i]; lc.CI = Vec4(d.color, d.intensity); lc.DT = Vec4(d.dir, (F32)(UInt8)d.type); lc.PR = Vec4(d.pos, d.range); lc.CA = Vec4(d.innerCone, d.outerCone, 0, 0); break; } }
 	return {};
 }
-void RenderSubsystem::setAmbientLight(const Vec3& c, F32 i) { m_backend->ambient = Vec4(c, i); }
+void RenderSubsystem::setAmbientLight(const Vec3& c, F32 i) {
+	const Vec4 next(c, i);
+	if (next == m_backend->ambient) return;
+	m_backend->ambient = next;
+	// Without a skybox the environment cube is filled with the ambient colour, so a
+	// change to it has to rebuild the cube too (with a skybox the corners drive it
+	// and this is a no-op).
+	if (!m_backend->skyDesc.has_value()) m_backend->envDirty = true;
+}
 
 Vec4 RenderSubsystem::getAmbientLight() const { return m_backend->ambient; }
 
@@ -2268,8 +2668,36 @@ void RenderSubsystem::clearShadowCascades(ShadowSubsystem& sh) {
 }
 
 void RenderSubsystem::getCameraMatrices(Mat4& view, Mat4& proj) const { view = m_backend->cam.view; proj = m_backend->cam.proj; }
-void RenderSubsystem::setSkybox(const SkyboxDesc& d) { m_backend->skyDesc = d; }
-void RenderSubsystem::clearSkybox() { m_backend->skyDesc.reset(); }
+void RenderSubsystem::setSkybox(const SkyboxDesc& d) { m_backend->skyDesc = d; m_backend->envDirty = true; }
+void RenderSubsystem::clearSkybox() { m_backend->skyDesc.reset(); m_backend->envDirty = true; }
+void RenderSubsystem::setNormalMapDebug(bool enable) { m_backend->normalMapDebug = enable; }
+bool RenderSubsystem::normalMapDebug() const { return m_backend->normalMapDebug; }
+void RenderSubsystem::setNormalMapSign(Vec2 sign) { m_backend->nmSign = Vec4(sign.x, sign.y, 1.0f, 0.0f); }
+Vec2 RenderSubsystem::normalMapSign() const { return Vec2(m_backend->nmSign.x, m_backend->nmSign.y); }
+void RenderSubsystem::setSkyIBLEnabled(bool enable) { m_backend->envEnabled = enable; }
+bool RenderSubsystem::skyIBLEnabled() const { return m_backend->envEnabled; }
+void RenderSubsystem::setSkyIBLMipScale(F32 scale) { m_backend->envMipScale = std::clamp(scale, 0.0f, 4.0f); }
+F32 RenderSubsystem::skyIBLMipScale() const { return m_backend->envMipScale; }
+void RenderSubsystem::setSkyIBLDebug(bool enable) { m_backend->envDebug = enable; }
+bool RenderSubsystem::skyIBLDebug() const { return m_backend->envDebug; }
+void RenderSubsystem::setSkyEnvFlip(bool flipU, bool flipV, bool mirrorY) {
+	auto& b = *m_backend;
+	if (b.envFlipU == flipU && b.envFlipV == flipV && b.envMirrorY == mirrorY) return;
+	b.envFlipU = flipU; b.envFlipV = flipV; b.envMirrorY = mirrorY;
+	// The mirrors are baked into the faces as they are drawn, so the cube has to be
+	// rebuilt. That is six small draws plus a mip chain - cheap enough to do while a
+	// checkbox is being clicked.
+	b.envDirty = true;
+}
+bool RenderSubsystem::skyEnvFlipU() const { return m_backend->envFlipU; }
+bool RenderSubsystem::skyEnvFlipV() const { return m_backend->envFlipV; }
+bool RenderSubsystem::skyEnvMirrorY() const { return m_backend->envMirrorY; }
+Vec4 RenderSubsystem::skyEnvParams() const {
+	return Vec4(m_backend->envEnabled ? 1.0f : 0.0f, m_backend->envMipScale,
+	            m_backend->envDebug ? 1.0f : 0.0f, m_backend->envIntensity);
+}
+TextureSRV RenderSubsystem::getSkyEnvSRV() const { return m_backend->envCubeSRV.RawPtr(); }
+void RenderSubsystem::prepareEnvironment() { if (m_backend->envDirty) m_backend->buildEnvCube(); }
 bool RenderSubsystem::getSkyboxCorners(Vec4 outCorners[8]) const {
 	if (!m_backend->skyDesc.has_value()) return false;
 	for (int i = 0; i < 8; ++i) outCorners[i] = m_backend->skyDesc->corners[i];

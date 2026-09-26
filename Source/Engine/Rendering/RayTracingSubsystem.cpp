@@ -398,8 +398,12 @@ float RayConeTextureLod(float coneWidth, float cosAtHit, float3 ConeDir,
 // lobe's solid angle against the solid angle of one cube texel.
 float SkyLodForLobe(float lobeAngle)
 {
-    uint cw = 1, ch = 1, levels = 1, elems = 1;
-    g_SkyCube.GetDimensions(cw, ch, levels, elems);
+    // TextureCube has no 3-output GetDimensions: the four-argument form is
+    // (MipLevel, Width, Height, NumberOfLevels). Passing the outputs without the
+    // level first left `cw` at its initialiser (1), which made texelSolid 2 and the
+    // level come out 0 for every lobe - i.e. sky reflections were never blurred.
+    uint cw = 1, ch = 1, levels = 1;
+    g_SkyCube.GetDimensions(0, cw, ch, levels);
     float texelSolid = 2.0 / max((float)cw * (float)cw, 1.0); // ~4*pi/6 / (cw*cw)
     float lobeSolid = 3.14159265358979 * lobeAngle * lobeAngle;
     float lod = 0.5 * log2(max(lobeSolid / texelSolid, 1.0));

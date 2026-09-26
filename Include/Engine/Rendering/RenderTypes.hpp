@@ -240,6 +240,11 @@ struct alignas(16) FrameConstants {
 	/// sky's irradiance, which is derived from them in the shaders; appended at the
 	/// end so shaders that do not read them keep working unchanged.
 	Vec4 skyCorners[8];
+	/// Specular image-based lighting parameters: x = enabled, y = roughness -> mip
+	/// scale of the prefiltered environment cube, z = debug (shade with the raw
+	/// environment sample), w = intensity. Appended at the end like the corners, so
+	/// shaders that do not read them keep working unchanged.
+	Vec4 envParams = Vec4(0.0f, 1.0f, 0.0f, 1.0f);
 };
 
 /// @brief Single light data in the light constant buffer.
@@ -257,9 +262,16 @@ struct alignas(16) ObjectConstants {
 	Vec4 emissive; ///< Emissive color (rgb) + intensity (w).
 	/// Which PBR maps this material actually has, so the shaders only sample what
 	/// exists instead of relying on a fallback texture: x = normal map, y = MR map,
-	/// z = emissive map, w unused. (The mesh shader path carries the same flags in
-	/// its material constant, which is why it never had this problem.)
+	/// z = emissive map, w = raw-sample debug (RenderSubsystem::setNormalMapDebug).
+	/// (The mesh shader path carries the same flags in its material constant, which
+	/// is why it never had this problem.)
 	Vec4 mapFlags = Vec4(0.0f);
+	/// Sign applied to the decoded tangent-space normal map (xyz used, z = 1). The
+	/// classic path builds its tangent frame from screen-space derivatives, so which
+	/// sign turns an asset's tangent-space normal into that frame is a convention
+	/// rather than something derivable from the asset; it lives here so it can be
+	/// dialled in at run time (RenderSubsystem::setNormalMapSign).
+	Vec4 nmSign = Vec4(1.0f, -1.0f, 1.0f, 0.0f);
 };
 
 // ---------------------------------------------------------------------------
