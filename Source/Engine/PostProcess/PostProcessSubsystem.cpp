@@ -1,4 +1,4 @@
-#include <PostProcess/PostProcessSubsystem.hpp>
+﻿#include <PostProcess/PostProcessSubsystem.hpp>
 #include <Core/Log.hpp>
 
 #include <DiligentCore/Graphics/GraphicsEngine/interface/RenderDevice.h>

@@ -307,6 +307,7 @@ dependencies:
       - {configs: ["*"], from: "LICENSE.txt", to: "LICENSE", source: stage}
       - {configs: ["*"], from: "version.txt", to: "include/openssl/version.inc", source: stage}
       - {configs: ["*"], from: "libcrypto-3-x64.dll", to: "bin/libcrypto-3-x64.dll", source: stage}
+      - {configs: ["*"], from: "openssl.exe", to: "bin/openssl.exe", source: stage}
 
   - name: zlib
     kind: git

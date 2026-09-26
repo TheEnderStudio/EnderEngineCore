@@ -1,4 +1,4 @@
-﻿#include <Rendering/RenderSubsystem.hpp>
+#include <Rendering/RenderSubsystem.hpp>
 #include <Core/Log.hpp>
 #include <Core/Crash.h>
 #include <Rendering/Errors.hpp>
@@ -36,6 +36,7 @@
 #include <fastgltf/tools.hpp>
 
 #include <stb_image.h>
+#include <algorithm>
 #include <Jobs/JobSubsystem.hpp>
 #include <Jobs/JobTypes.hpp>
 #include <Utilities/ImageLoader.hpp>
@@ -221,6 +222,9 @@ float4 main(PSIn i) : SV_TARGET { return g_SkyTex.Sample(g_SkySamp, i.TexCoord);
 
 static const char* g_PS = R"(
 Texture2D    t_BC         : register(t0);
+Texture2D    t_NormalMap  : register(t1);
+Texture2D    t_MR         : register(t2);
+Texture2D    t_EmissiveMap: register(t3);
 SamplerState t_BC_sampler : register(s0);
 Texture2DArray g_ShadowMap        : register(t4);
 SamplerComparisonState g_ShadowMap_sampler : register(s4);
@@ -328,18 +332,56 @@ float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r)
     return col;
 }
 
+// Normal mapping from the sampled tangent-space normal.
+//
+// The tangent frame is built from screen-space derivatives (a cotangent frame)
+// rather than from the mesh's TANGENT attribute, so the sign that converts the
+// asset's tangent-space convention into this frame has to be verified once,
+// visually: put a directional normal map (bricks, rock, tiles) on a surface, light
+// it from the side, and check that the relief is lit on the side facing the light.
+// Flip x below if it comes out inverted left/right, y if inverted up/down. The
+// mesh shader path (MeshShaderSubsystem) carries the same note.
+static const float2 kNormalMapSign = float2(1.0, -1.0);
+
+float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
+    float3 dp1 = ddx(wp);
+    float3 dp2 = ddy(wp);
+    float2 duv1 = ddx(uv);
+    float2 duv2 = ddy(uv);
+    float3 dp2perp = cross(dp2, N);
+    float3 dp1perp = cross(N, dp1);
+    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    // Epsilon: degenerate UVs give a zero frame and rsqrt(0) would make the normal
+    // NaN, which renders as black.
+    float invmax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
+    float3 n = sampledNormal * float3(kNormalMapSign, 1.0);
+    return normalize(mul(n, float3x3(T * invmax, B * invmax, N)));
+}
+
 float4 main(PSIn i) : SV_TARGET
 {
     float4 tex = t_BC.Sample(t_BC_sampler, i.UV);
     float3 bc = tex.rgb * g_BaseColor.rgb;
     float  a  = tex.a * g_BaseColor.a;
+    // glTF packs metallic in the blue channel and roughness in the green one. The
+    // fallbacks are 1x1 white textures, so materials without the maps keep using
+    // the plain factors through the same code path.
+    float4 orm = t_MR.Sample(t_BC_sampler, i.UV);
+    float3 emissive = t_EmissiveMap.Sample(t_BC_sampler, i.UV).rgb * g_Emissive.rgb * g_Emissive.w;
+
     float3 N = normalize(i.N);
+    // Flat fallback (128,128,255) maps to (0,0,1), so an unmapped material keeps
+    // the interpolated vertex normal.
+    float3 sn = t_NormalMap.Sample(t_BC_sampler, i.UV).xyz * 2.0 - 1.0;
+    N = NormalMapped(N, i.WP, i.UV, sn);
+
     float3 V = normalize(g_CameraPos.xyz - i.WP);
-    float m = g_MetallicRough.x;
-    float r = g_MetallicRough.y;
+    float m = g_MetallicRough.x * orm.b;
+    float r = g_MetallicRough.y * orm.g;
     float3 lit = DoLight(i.WP, N, V, bc, m, r);
     // Emissive is self-emission: added after lighting (not tinted by the light).
-    return float4(lit + g_Emissive.rgb * g_Emissive.w, a);
+    return float4(lit + emissive, a);
 }
 )";
 
@@ -347,6 +389,9 @@ float4 main(PSIn i) : SV_TARGET
 // g_ShadowMap is declared (but unused) so the resource layout matches the PBR PSOs.
 static const char* g_PS_GBuffer = R"(
 Texture2D    t_BC         : register(t0);
+Texture2D    t_NormalMap  : register(t1);
+Texture2D    t_MR         : register(t2);
+Texture2D    t_EmissiveMap: register(t3);
 SamplerState t_BC_sampler : register(s0);
 Texture2DArray g_ShadowMap        : register(t4);
 SamplerComparisonState g_ShadowMap_sampler : register(s4);
@@ -387,12 +432,36 @@ struct PSOut
     float4 Emis  : SV_Target2; ///< Emissive color * intensity (RGBA16_FLOAT, rgb used).
 };
 
+// Same note as in the forward shader: the sign belongs to the derivative-built
+// tangent frame, not to the asset, and is verified visually once.
+static const float2 kNormalMapSign = float2(1.0, -1.0);
+
+float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
+    float3 dp1 = ddx(wp);
+    float3 dp2 = ddy(wp);
+    float2 duv1 = ddx(uv);
+    float2 duv2 = ddy(uv);
+    float3 dp2perp = cross(dp2, N);
+    float3 dp1perp = cross(N, dp1);
+    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    float invmax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
+    float3 n = sampledNormal * float3(kNormalMapSign, 1.0);
+    return normalize(mul(n, float3x3(T * invmax, B * invmax, N)));
+}
+
 PSOut main(PSIn i)
 {
     PSOut o;
+    float4 orm = t_MR.Sample(t_BC_sampler, i.UV);
     o.Color = t_BC.Sample(t_BC_sampler, i.UV) * g_BaseColor;
-    o.Norm  = float4(normalize(i.N), g_MetallicRough.y);
-    o.Emis  = float4(g_Emissive.rgb * g_Emissive.w, 1.0);
+    // Flat fallback maps to (0,0,1), so an unmapped material keeps the vertex normal.
+    float3 sn = t_NormalMap.Sample(t_BC_sampler, i.UV).xyz * 2.0 - 1.0;
+    float3 N = NormalMapped(normalize(i.N), i.WP, i.UV, sn);
+    // The ray tracer reads roughness from here, so the map (not just the factor)
+    // now drives the reflection lobe width as well.
+    o.Norm  = float4(N, saturate(orm.g * g_MetallicRough.y));
+    o.Emis  = float4(t_EmissiveMap.Sample(t_BC_sampler, i.UV).rgb * g_Emissive.rgb * g_Emissive.w, 1.0);
     return o;
 }
 )";
@@ -434,21 +503,36 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
     float4 nSum = float4(0, 0, 0, 0);
     float4 eSum = float4(0, 0, 0, 0);
     float  dMin = 1.0;
+    float  covered = 0.0;
     [loop]
     for (uint s = 0; s < min(Samples, 16u); ++s)
     {
+        // Coverage matters: samples the geometry did not touch still hold the
+        // clear value - black for every colour target - so averaging them in
+        // darkened each silhouette pixel by the uncovered fraction (at 8x MSAA a
+        // half covered edge pixel lost half of its albedo). That is the dark seam
+        // that showed up around every object in the hybrid path, since only there
+        // is the resolved G-buffer actually shaded. Only samples that carry
+        // geometry contribute to the resolve.
+        const float d = g_MSAADepth.Load(tc, s);
+        dMin = min(dMin, d);
+        if (d >= 1.0)
+            continue; // background sample
+
         float4 c = g_MSAAColor.Load(tc, s);
         cSum.rgb += SRGBToLinear(c.rgb); // MSAA storage is sRGB-encoded; average in linear
         cSum.a   += c.a;
         nSum += g_MSAANormal.Load(tc, s);
         eSum += g_MSAAEmissive.Load(tc, s);
-        dMin  = min(dMin, g_MSAADepth.Load(tc, s));
+        covered += 1.0;
     }
-    float inv = 1.0 / (float)Samples;
+    // No covered sample at all: the pixel is background, and reporting depth 1
+    // lets the compose pass leave the skybox untouched.
+    const float inv = (covered > 0.0) ? (1.0 / covered) : 0.0;
     g_OutColor[DTid]    = cSum * inv;
     g_OutNormal[DTid]   = nSum * inv;
     g_OutEmissive[DTid] = eSum * inv;
-    g_OutDepth[DTid]    = dMin;
+    g_OutDepth[DTid]    = (covered > 0.0) ? dMin : 1.0;
 }
 )";
 
@@ -554,6 +638,38 @@ struct RenderLightData { LightDesc desc; };
 struct ModelData { ModelLoadResult result; };
 
 // ===================================================================
+// Mesh preprocessing
+// ===================================================================
+
+UInt32 RenderSubsystem::orientNormalsToWinding(Vector<Vertex>& vertices, const Vector<UInt32>& indices) {
+	const Size vertexCount = vertices.size();
+	if (vertexCount == 0 || indices.size() < 3) return 0;
+
+	// Area-weighted (unnormalized cross product) so large triangles dominate and
+	// slivers cannot outvote them.
+	Vector<Vec3> winding(vertexCount, Vec3(0.0f));
+	for (Size i = 0; i + 2 < indices.size(); i += 3) {
+		const UInt32 i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
+		if (i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) continue;
+		const Vec3 n = glm::cross(vertices[i1].position - vertices[i0].position,
+		                          vertices[i2].position - vertices[i0].position);
+		winding[i0] += n; winding[i1] += n; winding[i2] += n;
+	}
+
+	UInt32 flipped = 0;
+	for (Size v = 0; v < vertexCount; ++v) {
+		// Incident triangles that cancel out (a folded fan, a degenerate vertex)
+		// carry no orientation information: leave the normal untouched.
+		if (glm::dot(winding[v], winding[v]) < 1e-12f) continue;
+		if (glm::dot(vertices[v].normal, winding[v]) < 0.0f) {
+			vertices[v].normal = -vertices[v].normal;
+			++flipped;
+		}
+	}
+	return flipped;
+}
+
+// ===================================================================
 // RenderBackend
 // ===================================================================
 
@@ -581,9 +697,9 @@ struct RenderSubsystem::RenderBackend {
 	ShaderHandle  defVS, defPS, defVS_Inst, defVS_Indirect, defVS_ShadowIndirect, bboardVS, bboardPS, skyVS, skyPS, skyCubePS, gbufPS;
 	PSOHandle     defPSO, defPSO_wire, defPSO_Inst, defPSO_Inst_wire, defPSO_Indirect, defPSO_ShadowIndirect, bboardPSO, skyPSO, skyCubePSO, shadowPSO, gbufPSO, gbufPSO_Inst;
 	SamplerHandle defSamp, bboardSamp;
-	TextureHandle defTex, fogTex;
+	TextureHandle defTex, fogTex, flatNormalTex;
 	MeshHandle    bboardMesh;
-	D::RefCntAutoPtr<D::ITextureView> whiteSRV, fogSRV;
+	D::RefCntAutoPtr<D::ITextureView> whiteSRV, fogSRV, flatNormalSRV;
 	MeshData      skyMesh;
 	D::RefCntAutoPtr<D::IBuffer> skyCB;
 	D::RefCntAutoPtr<D::ITexture> skyCubeTex;
@@ -770,6 +886,15 @@ struct RenderSubsystem::RenderBackend {
 			TextureDesc tdd; tdd.w = 1; tdd.h = 1; tdd.fmt = TextureFormat::RGBA8_UNorm; UInt32 wh = 0xFFFFFFFF; tdd.data = &wh; tdd.dataSize = 4; auto r = mkTex(tdd); if (r.isErr()) return r.error(); defTex = r.value();
 			auto* td2 = textures.get(defTex.index, defTex.generation); if (td2) whiteSRV = td2->srv;
 		}
+		{
+			// Flat tangent-space normal (128,128,255) -> (0,0,1): the fallback for
+			// materials without a normal map, so the forward/G-buffer shaders can
+			// always sample one and keep the interpolated vertex normal.
+			// Packed little-endian as R | G<<8 | B<<16 | A<<24.
+			TextureDesc tdd; tdd.w = 1; tdd.h = 1; tdd.fmt = TextureFormat::RGBA8_UNorm; UInt32 flat = 0xFFFF8080u; tdd.data = &flat; tdd.dataSize = 4;
+			auto r = mkTex(tdd); if (r.isErr()) return r.error(); flatNormalTex = r.value();
+			auto* td2 = textures.get(flatNormalTex.index, flatNormalTex.generation); if (td2) flatNormalSRV = td2->srv;
+		}
 		{ D::BufferDesc bd; bd.Name = "FrameCB"; bd.Size = sizeof(FrameConstants); bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DYNAMIC; bd.CPUAccessFlags = D::CPU_ACCESS_WRITE; device->CreateBuffer(bd, nullptr, &frameCB); }
 		{ D::BufferDesc bd; bd.Name = "LightCB"; bd.Size = sizeof(LightConstants); bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DYNAMIC; bd.CPUAccessFlags = D::CPU_ACCESS_WRITE; device->CreateBuffer(bd, nullptr, &lightCB); memset(&lcBuf, 0, sizeof(lcBuf)); }
 		{ D::BufferDesc bd; bd.Name = "InstCB"; bd.Size = sizeof(Mat4) * MaxInstances; bd.BindFlags = D::BIND_VERTEX_BUFFER; bd.Usage = D::USAGE_DEFAULT; device->CreateBuffer(bd, nullptr, &instanceCB); }
@@ -816,6 +941,9 @@ struct RenderSubsystem::RenderBackend {
 				ci.PSODesc.ResourceLayout.DefaultVariableMergeStages = D::SHADER_TYPE_VERTEX | D::SHADER_TYPE_PIXEL;
 				D::ShaderResourceVariableDesc Vars[] = {
 					{D::SHADER_TYPE_PIXEL, "t_BC", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+					{D::SHADER_TYPE_PIXEL, "t_NormalMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+					{D::SHADER_TYPE_PIXEL, "t_MR", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+					{D::SHADER_TYPE_PIXEL, "t_EmissiveMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					{D::SHADER_TYPE_VERTEX | D::SHADER_TYPE_PIXEL, "Object", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					{D::SHADER_TYPE_PIXEL, "g_ShadowMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					{D::SHADER_TYPE_VERTEX, "g_WorldMatrices", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
@@ -1199,27 +1327,73 @@ struct RenderSubsystem::RenderBackend {
 
 	Result<MeshHandle, RenderError> mkMesh(const MeshDesc& d) {
 		if (d.vertices.empty() || d.indices.empty()) return RenderError::InvalidArgument;
+
+		// Correct normals that disagree with the winding before anything reads them
+		// (see orientNormalsToWinding). This is deliberately an engine-side safety
+		// net: the source asset should be fixed too, which is why the warning names
+		// the numbers.
+		Vector<Vertex> verts = d.vertices;
+		if (const UInt32 flipped = orientNormalsToWinding(verts, d.indices); flipped > 0) {
+			EWarn("Mesh '{}' ({} vertices): {} normals disagreed with the triangle winding and were flipped. "
+				"The asset has inverted normals - reflections, AO and the G-buffer would otherwise shade the wrong side.",
+				d.name.empty() ? "<unnamed>" : d.name.c_str(), (UInt32)verts.size(), flipped);
+		}
+
 		auto a = meshes.allocate(); auto* dd = meshes.getUnchecked(a.index);
-		dd->vc = (UInt32)d.vertices.size(); dd->ic = (UInt32)d.indices.size(); dd->sub = d.subMeshes;
-		dd->cpuVertices = d.vertices; dd->cpuIndices = d.indices;
+		dd->vc = (UInt32)verts.size(); dd->ic = (UInt32)d.indices.size(); dd->sub = d.subMeshes;
+		dd->cpuVertices = verts; dd->cpuIndices = d.indices;
 		// BIND_RAY_TRACING allows the buffers to be read during BLAS build operations,
 		// but is only valid when the ray tracing device feature is enabled.
-		{ D::BufferDesc bd; bd.Name = "VB"; bd.Size = d.vertices.size() * sizeof(Vertex); bd.BindFlags = D::BIND_VERTEX_BUFFER; if (rtFeatureEnabled) bd.BindFlags |= D::BIND_RAY_TRACING; bd.Usage = D::USAGE_IMMUTABLE; D::BufferData bdata; bdata.pData = d.vertices.data(); bdata.DataSize = bd.Size; D::RefCntAutoPtr<D::IBuffer> b; device->CreateBuffer(bd, &bdata, &b); if (!b) return RenderError::BufferCreationFailed; dd->vb = std::move(b); }
+		{ D::BufferDesc bd; bd.Name = "VB"; bd.Size = verts.size() * sizeof(Vertex); bd.BindFlags = D::BIND_VERTEX_BUFFER; if (rtFeatureEnabled) bd.BindFlags |= D::BIND_RAY_TRACING; bd.Usage = D::USAGE_IMMUTABLE; D::BufferData bdata; bdata.pData = verts.data(); bdata.DataSize = bd.Size; D::RefCntAutoPtr<D::IBuffer> b; device->CreateBuffer(bd, &bdata, &b); if (!b) return RenderError::BufferCreationFailed; dd->vb = std::move(b); }
 		{ D::BufferDesc bd; bd.Name = "IB"; bd.Size = d.indices.size() * sizeof(UInt32); bd.BindFlags = D::BIND_INDEX_BUFFER; if (rtFeatureEnabled) bd.BindFlags |= D::BIND_RAY_TRACING; bd.Usage = D::USAGE_IMMUTABLE; D::BufferData bdata; bdata.pData = d.indices.data(); bdata.DataSize = bd.Size; D::RefCntAutoPtr<D::IBuffer> b; device->CreateBuffer(bd, &bdata, &b); if (!b) return RenderError::BufferCreationFailed; dd->ib = std::move(b); }
 		return MeshHandle{ a.index, a.generation };
 	}
 
 	Result<TextureHandle, RenderError> mkTex(const TextureDesc& d) {
 		const bool renderTargetLike = d.asRenderTarget || d.asUAV || d.asDepthStencil;
-		D::TextureDesc td; td.Name = "Tex"; td.Type = D::RESOURCE_DIM_TEX_2D; td.Width = d.w; td.Height = d.h; td.Format = toDFmt(d.fmt); td.MipLevels = d.mipLevels;
+
+		// Optional CPU mip chain: filtered in linear light (sRGB formats) and
+		// uploaded as extra subresources of the same immutable texture. Immutable
+		// + prebuilt levels keeps texture creation thread safe (the async model
+		// loader creates textures off the render thread, where recording a
+		// GenerateMips command would race with the main context).
+		Utilities::MipChain chain;
+		if (d.mipChain && d.data && !renderTargetLike && d.w > 0 && d.h > 0 && d.dataSize >= (Size)d.w * d.h * 4) {
+			Utilities::DecodedImage base;
+			base.width = d.w; base.height = d.h;
+			base.pixels.assign(static_cast<const UInt8*>(d.data), static_cast<const UInt8*>(d.data) + (Size)d.w * d.h * 4);
+			chain = Utilities::buildMipChain(std::move(base), d.fmt == TextureFormat::RGBA8_UNorm_SRGB);
+		}
+
+		D::TextureDesc td; td.Name = "Tex"; td.Type = D::RESOURCE_DIM_TEX_2D; td.Width = d.w; td.Height = d.h; td.Format = toDFmt(d.fmt);
+		td.MipLevels = chain.isValid() ? (D::Uint32)chain.levels.size() : d.mipLevels;
 		td.SampleCount = d.sampleCount;
 		td.BindFlags = D::BIND_SHADER_RESOURCE;
 		if (d.asRenderTarget) td.BindFlags |= D::BIND_RENDER_TARGET;
 		if (d.asUAV) td.BindFlags |= D::BIND_UNORDERED_ACCESS;
 		if (d.asDepthStencil) td.BindFlags |= D::BIND_DEPTH_STENCIL;
 		td.Usage = renderTargetLike ? D::USAGE_DEFAULT : D::USAGE_IMMUTABLE;
-		D::TextureSubResData srd; srd.pData = d.data; srd.Stride = d.w * 4; D::TextureData tdata; tdata.pSubResources = d.data ? &srd : nullptr; tdata.NumSubresources = d.data ? 1 : 0;
-		D::RefCntAutoPtr<D::ITexture> t; device->CreateTexture(td, d.data ? &tdata : nullptr, &t); if (!t) return RenderError::TextureCreationFailed;
+
+		Vector<D::TextureSubResData> subRes;
+		D::TextureData tdata;
+		if (chain.isValid()) {
+			UInt32 mw = chain.width;
+			subRes.reserve(chain.levels.size());
+			for (const auto& level : chain.levels) {
+				D::TextureSubResData srd; srd.pData = level.data(); srd.Stride = mw * 4;
+				subRes.push_back(srd);
+				mw = std::max(1u, mw / 2);
+			}
+			tdata.pSubResources = subRes.data();
+			tdata.NumSubresources = (D::Uint32)subRes.size();
+		}
+		else {
+			D::TextureSubResData srd; srd.pData = d.data; srd.Stride = d.w * 4;
+			if (d.data) subRes.push_back(srd);
+			tdata.pSubResources = d.data ? subRes.data() : nullptr;
+			tdata.NumSubresources = d.data ? 1 : 0;
+		}
+		D::RefCntAutoPtr<D::ITexture> t; device->CreateTexture(td, (tdata.pSubResources || tdata.NumSubresources) ? &tdata : nullptr, &t); if (!t) return RenderError::TextureCreationFailed;
 		auto a = textures.allocate(); auto* dd = textures.getUnchecked(a.index); dd->tex = std::move(t); dd->desc = d;
 		dd->srv = dd->tex->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
 		if (d.asRenderTarget) dd->rtv = dd->tex->GetDefaultView(D::TEXTURE_VIEW_RENDER_TARGET);
@@ -1246,13 +1420,22 @@ struct RenderSubsystem::RenderBackend {
 				if (auto* pv = srb->GetVariableByName(D::SHADER_TYPE_VERTEX, "Object")) pv->Set(dd->objCB.RawPtr());
 				if (auto* pv = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "Object")) pv->Set(dd->objCB.RawPtr());
 			}
-			if (auto* pv = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "t_BC")) {
-				D::ITextureView* srv = whiteSRV.RawPtr();
-				if (d.baseColorTexture.isValid()) {
-					if (auto* td = textures.get(d.baseColorTexture.index, d.baseColorTexture.generation)) srv = td->srv.RawPtr();
+			auto bindTex = [&](const char* name, TextureHandle handle, D::ITextureView* fallback) {
+				if (auto* pv = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, name)) {
+					D::ITextureView* srv = fallback;
+					if (handle.isValid()) {
+						if (auto* td = textures.get(handle.index, handle.generation)) srv = td->srv.RawPtr();
+					}
+					pv->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 				}
-				pv->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
-			}
+			};
+			// Every map has a neutral 1x1 fallback so the shaders keep working (and
+			// the mutable variables stay bound) for materials without them: white for
+			// albedo/MR/emissive, flat (128,128,255) for the normal.
+			bindTex("t_BC",          d.baseColorTexture,         whiteSRV.RawPtr());
+			bindTex("t_NormalMap",   d.normalTexture,            flatNormalSRV.RawPtr());
+			bindTex("t_MR",          d.metallicRoughnessTexture, whiteSRV.RawPtr());
+			bindTex("t_EmissiveMap", d.emissiveTexture,          whiteSRV.RawPtr());
 			// The G-buffer shader declares (but does not use) g_ShadowMap; bind a dummy so
 			// the mutable variable is never left unbound when committing the G-buffer SRB.
 			// The regular PBR SRB leaves it unbound here - draw() binds the real shadow map
@@ -1559,6 +1742,51 @@ struct RenderSubsystem::RenderBackend {
 		EInfo("glTF: {} images, {} textures, {} materials, {} meshes",
 			asset.images.size(), asset.textures.size(), asset.materials.size(), asset.meshes.size());
 
+		// ---- Classify the images by role before creating them ----------------
+		//
+		// A glTF image is either *colour* (base colour, emissive) or *data*
+		// (normal, metallic-roughness, occlusion). Colour images are sRGB-encoded
+		// and must be created with an sRGB format so the sampler decodes them to
+		// linear; data images are already linear and must NOT be decoded. Every
+		// image used to go through the same RGBA8_UNORM_SRGB path, which warped
+		// normal vectors and turned a stored roughness of 0.5 into ~0.21 - and the
+		// mip chain then filtered it in the wrong space as well.
+		//
+		// The role is only known from the material slots, so the materials are
+		// scanned first. An image that is never referenced, or that appears in both
+		// kinds of slot, keeps the sRGB view (the safe default for textures).
+		HashMap<UInt32, UInt8> imageSrgb; // image index -> 1 = sRGB colour, 0 = linear data
+		auto imageIndexOf = [&](const auto& info) -> Int32 {
+			if (!info.has_value()) return -1;
+			const size_t ti = (size_t)info->textureIndex;
+			if (ti >= asset.textures.size()) return -1;
+			if (!asset.textures[ti].imageIndex.has_value()) return -1;
+			return (Int32)asset.textures[ti].imageIndex.value();
+		};
+		auto markImage = [&](const auto& info, bool srgb, const char* role) {
+			const Int32 img = imageIndexOf(info);
+			if (img < 0) return;
+			auto it = imageSrgb.find((UInt32)img);
+			if (it == imageSrgb.end()) { imageSrgb[(UInt32)img] = srgb ? 1 : 0; return; }
+			if ((it->second != 0) != srgb) {
+				EWarn("glTF image {} is referenced both as colour and as data ({}); keeping the sRGB view - author the two uses as separate images.", img, role);
+			}
+		};
+		for (auto& m : asset.materials) {
+			markImage(m.pbrData.baseColorTexture, true, "baseColor");
+			markImage(m.emissiveTexture, true, "emissive");
+			markImage(m.pbrData.metallicRoughnessTexture, false, "metallicRoughness");
+			markImage(m.normalTexture, false, "normal");
+			markImage(m.occlusionTexture, false, "occlusion");
+		}
+		auto imageIsSrgb = [&](UInt32 img) -> bool {
+			auto it = imageSrgb.find(img);
+			return it == imageSrgb.end() ? true : (it->second != 0);
+		};
+		auto imageFormat = [&](UInt32 img) {
+			return imageIsSrgb(img) ? TextureFormat::RGBA8_UNorm_SRGB : TextureFormat::RGBA8_UNorm;
+		};
+
 		// Load textures from glTF images
 		HashMap<UInt32, TextureHandle> texMap;
 		for (size_t i = 0; i < asset.images.size(); ++i) {
@@ -1570,7 +1798,7 @@ struct RenderSubsystem::RenderBackend {
 				srcType = "URI";
 				String imgPath = (rootDir / uriSrc->uri.fspath()).string();
 				D::TextureLoadInfo loadInfo;
-				loadInfo.IsSRGB = true;
+				loadInfo.IsSRGB = imageIsSrgb((UInt32)i);
 				D::RefCntAutoPtr<D::ITexture> tex;
 				D::CreateTextureFromFile(imgPath.c_str(), loadInfo, device.RawPtr(), &tex);
 				if (tex) {
@@ -1598,8 +1826,12 @@ struct RenderSubsystem::RenderBackend {
 					if (s && len > 0) {
 						auto decoded = Utilities::decodeImage(s, (Size)len);
 						if (decoded.isValid()) {
-							TextureDesc td; td.fmt = TextureFormat::RGBA8_UNorm_SRGB; td.w = decoded.width; td.h = decoded.height;
+							TextureDesc td; td.fmt = imageFormat((UInt32)i); td.w = decoded.width; td.h = decoded.height;
 							td.data = decoded.pixels.data(); td.dataSize = (UInt32)decoded.pixels.size();
+							// Full mip chain: the ray tracer samples the reflection
+							// hit at a level matched to the reflection lobe, and the
+							// raster path gets derivative-based filtering for free.
+							td.mipChain = true;
 							auto tr = mkTex(td); if (tr.isOk()) th = tr.value();
 						}
 					}
@@ -1609,8 +1841,9 @@ struct RenderSubsystem::RenderBackend {
 				srcType = "Array";
 				auto decoded = Utilities::decodeImage(arr->bytes.data(), arr->bytes.size());
 				if (decoded.isValid()) {
-					TextureDesc td; td.fmt = TextureFormat::RGBA8_UNorm_SRGB; td.w = decoded.width; td.h = decoded.height;
+					TextureDesc td; td.fmt = imageFormat((UInt32)i); td.w = decoded.width; td.h = decoded.height;
 					td.data = decoded.pixels.data(); td.dataSize = (UInt32)decoded.pixels.size();
+					td.mipChain = true; // prefiltered levels for ray-traced reflections
 					auto tr = mkTex(td); if (tr.isOk()) th = tr.value();
 				}
 			}
@@ -1618,8 +1851,9 @@ struct RenderSubsystem::RenderBackend {
 				srcType = "ByteView";
 				auto decoded = Utilities::decodeImage(bv2->bytes.data(), bv2->bytes.size());
 				if (decoded.isValid()) {
-					TextureDesc td; td.fmt = TextureFormat::RGBA8_UNorm_SRGB; td.w = decoded.width; td.h = decoded.height;
+					TextureDesc td; td.fmt = imageFormat((UInt32)i); td.w = decoded.width; td.h = decoded.height;
 					td.data = decoded.pixels.data(); td.dataSize = (UInt32)decoded.pixels.size();
+					td.mipChain = true; // prefiltered levels for ray-traced reflections
 					auto tr = mkTex(td); if (tr.isOk()) th = tr.value();
 				}
 			}
@@ -1642,17 +1876,22 @@ struct RenderSubsystem::RenderBackend {
 			md.metallicFactor = m.pbrData.metallicFactor;
 			md.roughnessFactor = m.pbrData.roughnessFactor;
 			bool hasTex = false;
-			// Resolve baseColorTexture through Texture��Image mapping
-			if (m.pbrData.baseColorTexture.has_value()) {
-				auto& texInfo = m.pbrData.baseColorTexture.value();
-				if (texInfo.textureIndex < asset.textures.size()) {
-					auto& tex = asset.textures[texInfo.textureIndex];
-					if (tex.imageIndex.has_value()) {
-						auto it = texMap.find((UInt32)tex.imageIndex.value());
-						if (it != texMap.end()) { md.baseColorTexture = it->second; hasTex = true; }
-					}
-				}
-			}
+			// Every PBR map goes through the same Texture -> Image mapping. The data
+			// maps used to not be resolved at all, so imported assets were shaded
+			// from the base colour texture plus the scalar factors alone: no normal
+			// detail, no per-texel roughness/metallic, no emissive map.
+			auto resolveMap = [&](const auto& info) -> TextureHandle {
+				const Int32 img = imageIndexOf(info);
+				if (img < 0) return TextureHandle{};
+				auto it = texMap.find((UInt32)img);
+				return it != texMap.end() ? it->second : TextureHandle{};
+			};
+			md.baseColorTexture         = resolveMap(m.pbrData.baseColorTexture);
+			md.metallicRoughnessTexture = resolveMap(m.pbrData.metallicRoughnessTexture);
+			md.normalTexture            = resolveMap(m.normalTexture);
+			md.emissiveTexture          = resolveMap(m.emissiveTexture);
+			md.aoTexture                = resolveMap(m.occlusionTexture);
+			hasTex = md.baseColorTexture.isValid();
 			// glTF emissiveFactor: self-emission color (also feeds RT reflections).
 			{
 				auto& ef = m.emissiveFactor;
@@ -1679,15 +1918,23 @@ struct RenderSubsystem::RenderBackend {
 				auto tcIt = prim.findAttribute("TEXCOORD_0");
 				if (tcIt != prim.attributes.end()) { auto& acc = asset.accessors[tcIt->accessorIndex]; fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec2>(asset, acc, [&](fastgltf::math::fvec2 t, size_t j) { uv[(UInt32)j] = Vec2(t.x(), t.y()); }); }
 				ETrace("  Prim[{}]: {}v {}i uvs={}", pi, vc, prim.indicesAccessor.has_value() ? "indexed" : "none", tcIt != prim.attributes.end() ? "yes" : "no");
+				// glTF TANGENT_0 is optional. The shaders currently build their tangent
+				// frame from screen-space derivatives, but the attribute is carried
+				// through (rather than the dummy (1,0,0,1) every vertex used to get) so
+				// it can be used - and so the mesh round-trips - once the frames switch
+				// to the asset's tangent, which is what the spec defines.
+				Vector<Vec4> tan(vc, Vec4(1, 0, 0, 1));
+				auto tanIt = prim.findAttribute("TANGENT");
+				if (tanIt != prim.attributes.end()) { auto& acc = asset.accessors[tanIt->accessorIndex]; fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec4>(asset, acc, [&](fastgltf::math::fvec4 t, size_t j) { tan[(UInt32)j] = Vec4(t.x(), t.y(), t.z(), t.w()); }); }
 				UInt32 base = (UInt32)allVerts.size();
-				for (UInt32 v = 0; v < vc; ++v) { allVerts.push_back({ pos[v], nrm[v], uv[v], Vec4(1,0,0,1) }); }
+				for (UInt32 v = 0; v < vc; ++v) { allVerts.push_back({ pos[v], nrm[v], uv[v], tan[v] }); }
 				if (prim.indicesAccessor.has_value()) readIndices(asset, asset.accessors[prim.indicesAccessor.value()], allIdx, base);
 				sub.indexCount = (UInt32)allIdx.size() - sub.indexOffset;
 				if (prim.materialIndex.has_value()) { auto it = matMap.find((UInt32)prim.materialIndex.value()); if (it != matMap.end()) sub.material = it->second; else if (!matMap.empty()) sub.material = matMap.begin()->second; }
 				subMeshes.push_back(sub);
 			}
 			if (!allVerts.empty() && !allIdx.empty()) {
-				MeshDesc md; md.vertices = std::move(allVerts); md.indices = std::move(allIdx); md.subMeshes = std::move(subMeshes);
+				MeshDesc md; md.name = String(mesh.name); md.vertices = std::move(allVerts); md.indices = std::move(allIdx); md.subMeshes = std::move(subMeshes);
 				auto mres = mkMesh(md); if (mres.isOk()) result.meshes.push_back(mres.value());
 			}
 		}
@@ -2009,25 +2256,44 @@ Result<TextureHandle, RenderError> RenderSubsystem::createCubemapTexture(const C
 		}
 	}
 
+	// Full mip chain per face. The ray tracer samples the cube at the level that
+	// matches the reflection lobe (a wide lobe must not read a sharp sky texel),
+	// which is the difference between a stable and a sparkling rough reflection.
+	Vector<Utilities::MipChain> chains(6);
+	UInt32 levels = 1;
+	for (int i = 0; i < 6; i++) {
+		chains[i] = Utilities::buildMipChain(std::move(imgs[i]), true);
+		if (!chains[i].isValid()) { EError("Skybox face {}: mip chain failed", i); return RenderError::TextureCreationFailed; }
+		if (i == 0) levels = (UInt32)chains[i].levels.size();
+		else if ((UInt32)chains[i].levels.size() != levels) { EError("Skybox face {}: mip count mismatch", i); return RenderError::TextureCreationFailed; }
+	}
+
 	D::TextureDesc td; td.Name = "SkyCube"; td.Type = D::RESOURCE_DIM_TEX_CUBE;
-	td.Width = w; td.Height = h; td.ArraySize = 6; td.MipLevels = 1;
+	td.Width = w; td.Height = h; td.ArraySize = 6; td.MipLevels = (D::Uint32)levels;
 	td.Format = D::TEX_FORMAT_RGBA8_UNORM_SRGB;
 	td.BindFlags = D::BIND_SHADER_RESOURCE; td.Usage = D::USAGE_IMMUTABLE;
 
-	// Cubemap face order (D3D12): 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
-	D::TextureSubResData subRes[6];
+	// Cubemap face order (D3D12): 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z. Subresources must
+	// be in D3D12 order, i.e. slice-major: (face0, mip0..N), (face1, mip0..N), ...
+	// (Diligent asserts on the count and feeds the array straight to
+	// UpdateSubresources, whose index is MipSlice + ArraySlice * MipLevels.)
+	Vector<D::TextureSubResData> subRes;
+	subRes.reserve((Size)levels * 6);
 	for (int i = 0; i < 6; i++) {
-		subRes[i].pData = imgs[i].pixels.data();
-		subRes[i].Stride = (D::Uint32)(imgs[i].width * 4);
+		for (UInt32 mip = 0; mip < levels; mip++) {
+			D::TextureSubResData srd; srd.pData = chains[i].levels[mip].data();
+			srd.Stride = (D::Uint32)(std::max(1u, w >> mip) * 4);
+			subRes.push_back(srd);
+		}
 	}
-	D::TextureData tdata; tdata.pSubResources = subRes; tdata.NumSubresources = 6;
+	D::TextureData tdata; tdata.pSubResources = subRes.data(); tdata.NumSubresources = (D::Uint32)subRes.size();
 	D::RefCntAutoPtr<D::ITexture> tex;
 	b.device->CreateTexture(td, &tdata, &tex);
 	if (!tex) { EError("Cubemap creation failed"); return RenderError::TextureCreationFailed; }
 	auto a = b.textures.allocate();
 	auto* dd = b.textures.getUnchecked(a.index);
 	dd->tex = std::move(tex); dd->srv = dd->tex->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
-	EInfo("Skybox cubemap created: {}x{}", w, h);
+	EInfo("Skybox cubemap created: {}x{} ({} mips)", w, h, levels);
 	return TextureHandle{ a.index, a.generation };
 }
 

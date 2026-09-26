@@ -28,8 +28,11 @@ struct alignas(16) RayTraceConstants {
 	F32  reflectionBlur = 0.7f; ///< GGX reflection spread scale (0 = mirror, 1 = full roughness spread).
 	UInt32 maxBounces = 1;     ///< Max reflection bounces (0 = single, 1 = two-bounce).
 	F32  bounceRoughness = 0.4f; ///< Roughness threshold for the second bounce (1.0 = all surfaces).
-	UInt32 reflectionSamples = 4; ///< GGX importance-sampled reflection rays per pixel (1..8).
+	UInt32 reflectionSamples = 8; ///< Ray budget per pixel (1..16). The shader spends it by lobe width: a near-mirror surface needs one ray, a rough one every sample.
 	UInt32 frameIndex = 0;       ///< Frame counter (rotates the GGX sample pattern so the temporal denoiser averages different samples).
+	F32  rayConePixelAngle = 0.0011f; ///< Angular size of one pixel in radians (~60 deg fov at 1080p); seeds the reflection ray cone.
+	F32  reflectionCone = 1.0f;  ///< Ray-cone prefilter strength: 0 = sample texture/sky level 0, 1 = full lobe-matched level.
+	UInt32 reflectionShadowPCF = 1; ///< Shadow rays per reflection hit: 1 = a single ray (the lobe and the denoiser already blur it), >1 = full PCSS+PCF.
 };
 
 /// @brief A ray-traced scene object (mesh + material + world transform).
@@ -135,12 +138,20 @@ public:
 	 * @brief Trace shadow + reflection rays for the current G-buffer.
 	 *
 	 * Reads the G-buffer (world normal + depth + color), reconstructs world
-	 * space positions, casts one shadow ray toward the light and one reflection
-	 * ray per pixel, and writes the result into outRT (rgba32f UAV):
-	 * rgb = reflection color, a = lighting (ambient + direct). Additionally
-	 * writes the RT-resolution albedo and world normal into outAlbedo/outNormal
-	 * (consumed by the denoiser; they match the depth-guided texel used for
-	 * lighting so the denoise features align with the color buffer).
+	 * space positions, casts one shadow ray toward the light and up to
+	 * `reflectionSamples` reflection rays per pixel, and writes the result into
+	 * outRT (rgba32f UAV): rgb = reflection color, a = lighting (ambient +
+	 * direct). Additionally writes the RT-resolution albedo and world normal
+	 * into outAlbedo/outNormal (consumed by the denoiser; they match the
+	 * depth-guided texel used for lighting so the denoise features align with
+	 * the color buffer).
+	 *
+	 * The reflection estimator is built to be as noise free as it can be without
+	 * help from a denoiser: rays are drawn from the GGX distribution of visible
+	 * normals (bounded weights, so no fireflies), the ray count is allocated by
+	 * lobe width, and each ray carries a cone whose width at the hit selects the
+	 * prefiltered texture / sky level (see `reflectionCone`).
+	 *
 	 * @param c             Per-frame constants (view-proj inverse, light, camera).
 	 * @param gBufferNormal SRV of the G-buffer world normal (ITextureView* as void*).
 	 * @param gBufferDepth  SRV of the G-buffer depth (ITextureView* as void*).
@@ -209,7 +220,8 @@ public:
 	 *                      scene/G-buffer depth so subsequent 2D/UI passes that
 	 *                      expect a D32 depth stay consistent); nullptr unbinds it.
 	 * @param drawMode      Debug render mode: 0=shaded, 1=G-buffer color,
-	 *                      2=G-buffer normal, 3=diffuse lighting, 4=reflections, 5=Fresnel.
+	 *                      2=G-buffer normal, 3=diffuse lighting, 4=reflections, 5=Fresnel,
+	 *                      6=RT alpha (lighting factor), 7=back-facing normal mask.
 	 * @param viewProjInv   Inverse view-projection (column-major).
 	 * @param cameraPos     World-space camera position.
 	 * @param lightColor    Light color (applied to the diffuse term).

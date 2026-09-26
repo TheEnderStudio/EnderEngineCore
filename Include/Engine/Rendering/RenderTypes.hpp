@@ -160,6 +160,9 @@ struct TextureDesc {
 	bool asRenderTarget = false; ///< Also bind as a render target (BIND_RENDER_TARGET, usage DEFAULT).
 	bool asUAV = false;          ///< Also bind as an unordered access view (BIND_UNORDERED_ACCESS).
 	bool asDepthStencil = false; ///< Also bind as a depth-stencil target (BIND_DEPTH_STENCIL).
+	/// Generate a full CPU mip chain for `data` (box filter in linear light).
+	/// Reflection rays pick a level from the ray cone instead of aliasing level 0.
+	bool mipChain = false;
 };
 
 /// @brief Descriptor for creating a sampler.
@@ -184,7 +187,10 @@ struct MaterialDesc {
 struct SubMesh { UInt32 indexOffset = 0; UInt32 indexCount = 0; UInt32 vertexOffset = 0; MaterialHandle material; };
 
 /// @brief Descriptor for creating a mesh.
-struct MeshDesc { Vector<Vertex> vertices; Vector<UInt32> indices; Vector<SubMesh> subMeshes; };
+struct MeshDesc {
+	String name; ///< Optional; used in diagnostics (e.g. "this asset has inverted normals").
+	Vector<Vertex> vertices; Vector<UInt32> indices; Vector<SubMesh> subMeshes;
+};
 
 /// @brief Descriptor for creating a camera.
 struct CameraDesc {

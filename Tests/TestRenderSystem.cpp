@@ -155,3 +155,73 @@ TEST(RenderSubsystemTest, SetWindowBeforeInitialize) {
 	renderer.setWindow(nullptr); // null window is OK before init
 	EXPECT_FALSE(renderer.isReady());
 }
+
+// ===================================================================
+// Normal orientation against the triangle winding
+// (pure CPU mesh preprocessing, no device required)
+// ===================================================================
+
+namespace {
+
+/// @brief One quad in the XY plane, wound counter-clockwise as seen from +Z.
+/// @param normal The normal the asset stored on every vertex.
+MeshDesc makeQuad(const Vec3& normal) {
+	MeshDesc m;
+	m.vertices.resize(4);
+	m.vertices[0].position = Vec3(0, 0, 0);
+	m.vertices[1].position = Vec3(1, 0, 0);
+	m.vertices[2].position = Vec3(1, 1, 0);
+	m.vertices[3].position = Vec3(0, 1, 0);
+	for (auto& v : m.vertices) v.normal = normal;
+	// CCW from +Z: (0,1,2) and (0,2,3) both have the winding normal +Z.
+	m.indices = { 0, 1, 2, 0, 2, 3 };
+	return m;
+}
+
+} // namespace
+
+TEST(RenderSubsystemTest, NormalsAgreeingWithWindingAreUntouched) {
+	MeshDesc m = makeQuad(Vec3(0, 0, 1));
+	EXPECT_EQ(RenderSubsystem::orientNormalsToWinding(m.vertices, m.indices), 0u);
+	for (const auto& v : m.vertices) EXPECT_FLOAT_EQ(v.normal.z, 1.0f);
+}
+
+TEST(RenderSubsystemTest, InvertedNormalsAreFlippedToMatchTheWinding) {
+	// The whole mesh is inside out: flipping keeps the ray traced reflection lobe
+	// alive (dot(N, V) > 0), which is otherwise exactly black.
+	MeshDesc m = makeQuad(Vec3(0, 0, -1));
+	EXPECT_EQ(RenderSubsystem::orientNormalsToWinding(m.vertices, m.indices), 4u);
+	for (const auto& v : m.vertices) EXPECT_FLOAT_EQ(v.normal.z, 1.0f);
+}
+
+TEST(RenderSubsystemTest, MixedNormalsAreFixedPerVertex) {
+	// Three upright vertices and one exported flipped: only that one is touched, so
+	// a partially broken asset is repaired rather than guessed at.
+	MeshDesc m = makeQuad(Vec3(0, 0, 1));
+	m.vertices[2].normal = Vec3(0, 0, -1);
+	EXPECT_EQ(RenderSubsystem::orientNormalsToWinding(m.vertices, m.indices), 1u);
+	EXPECT_FLOAT_EQ(m.vertices[2].normal.z, 1.0f);
+	EXPECT_FLOAT_EQ(m.vertices[0].normal.z, 1.0f);
+}
+
+TEST(RenderSubsystemTest, UnresolvableNormalsAreLeftAlone) {
+	MeshDesc empty;
+	EXPECT_EQ(RenderSubsystem::orientNormalsToWinding(empty.vertices, empty.indices), 0u);
+
+	// A folded fan: the three triangles around vertex 0 cancel out (+Z +Z -Z), so
+	// there is no orientation to recover there and the stored normal must survive
+	// a coin toss. The other vertices still get fixed normally.
+	MeshDesc m;
+	m.vertices.resize(4);
+	m.vertices[0].position = Vec3(0, 0, 0);
+	m.vertices[1].position = Vec3(1, 0, 0);
+	m.vertices[2].position = Vec3(0, 1, 0);
+	m.vertices[3].position = Vec3(0.5f, 0.5f, 0);
+	for (auto& v : m.vertices) v.normal = Vec3(0, 0, -1);
+	// (0,1,3) and (0,3,2) are +Z, (0,2,1) is -Z.
+	m.indices = { 0, 1, 3, 0, 3, 2, 0, 2, 1 };
+
+	EXPECT_EQ(RenderSubsystem::orientNormalsToWinding(m.vertices, m.indices), 1u);
+	EXPECT_FLOAT_EQ(m.vertices[0].normal.z, -1.0f); // cancelled out: untouched
+	EXPECT_FLOAT_EQ(m.vertices[3].normal.z, 1.0f);  // +Z winding: flipped
+}

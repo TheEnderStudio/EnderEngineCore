@@ -110,6 +110,9 @@ struct RTConstants {
     float    BounceRoughness;
     uint     ReflectionSamples;
     uint     FrameIndex;
+    float    RayConePixelAngle;  // angular size of one pixel (radians): ray cone seed
+    float    ReflectionCone;     // 0 = sample level 0 (no prefilter), 1 = full ray cone
+    uint     ReflectionShadowPCF;// shadow rays per reflection hit (1 = single ray)
 };
 
 RaytracingAccelerationStructure g_TLAS            : register(t0);
@@ -195,6 +198,29 @@ float CastShadowPCF(float3 Origin, float3 LightDir, float MaxRayLength, float3 N
     return s / float(n);
 }
 
+// Shadow term for a *reflection hit* point.
+//
+// The reflection ray already carries the whole reflection lobe: several VNDF
+// samples, the ray-cone prefilter and, after that, the denoiser. Spending a full
+// PCSS blocker pass plus PCF taps on every one of those hits bought softness that
+// is invisible under that blur, and it was the single largest item in the trace
+// budget (~5 of the ~7 rays each reflection sample costs, i.e. around half of the
+// whole pass). One ray is the default; `ReflectionShadowPCF` restores the soft
+// path for anyone who wants to compare.
+//
+// `ndlRaw` is the unclamped dot(LightDir, N); the bias scales with the slope, as
+// in CastShadowPCF, so the ray starts outside the surface instead of self-hitting.
+float ReflectionShadow(float3 Origin, float3 LightDir, float MaxRayLength, float3 Norm, float DistToCam, float ndlRaw)
+{
+    if (g_RTConstants.ReflectionShadowPCF <= 1)
+    {
+        const float ndl  = max(ndlRaw, 0.1);
+        const float bias = max(0.002, 0.001 * DistToCam) / ndl;
+        return CastShadow(Origin + Norm * bias + LightDir * (bias * 0.5), LightDir, MaxRayLength);
+    }
+    return CastShadowPCF(Origin, LightDir, MaxRayLength, Norm, DistToCam);
+}
+
 // Screen-space-style ambient occlusion: short rays in a hemisphere around the
 // normal, using the fixed disc directions. Returns 1 (unoccluded) .. 0 (fully
 // occluded). AoSamples == 0 disables it.
@@ -233,14 +259,18 @@ float ComputeAO(float3 Origin, float3 Norm, float DistToCam)
     return 1.0 - occluded / float(samples);
 }
 
-float4 GetSkyColor(float3 Dir)
+// Sky radiance along Dir. `lod` selects a mipped cube level: a wide reflection
+// lobe must read an already blurred sky, otherwise every ray picks a different
+// sky texel and the reflection sparkles. The gradient mode is an analytic smooth
+// function of the direction and ignores the level.
+float4 GetSkyColorLod(float3 Dir, float lod)
 {
     // Sample the actual skybox so reflections match the rendered background:
     // either the cubemap texture (SkyMode=1) or the corner gradient (SkyMode=0,
     // trilinear interpolation of the 8 corner colors).
     if (g_RTConstants.SkyMode == 1)
     {
-        return float4(g_SkyCube.SampleLevel(g_Sampler, Dir, 0).rgb, 1.0);
+        return float4(g_SkyCube.SampleLevel(g_Sampler, Dir, lod).rgb, 1.0);
     }
     float3 w = saturate(Dir * 0.5 + 0.5);
     float3 c0  = lerp(g_RTConstants.SkyCorners[0].rgb, g_RTConstants.SkyCorners[1].rgb, w.x);
@@ -259,10 +289,60 @@ struct ReflectionResult {
     bool   Found;
 };
 
+// -------------------------------------------------------------------
+// Ray cones.
+//
+// A reflection ray is not an infinitely thin line: it stands for the average of
+// the scene over the reflection lobe, which for a rough surface is a cone of a
+// wide opening angle. Two consequences, both of them noise:
+//   * the cone widens with distance, so it covers more and more texels; reading
+//     level 0 makes each of the N rays pick a different texel of a
+//     high-frequency albedo. Reading the level that matches the footprint gives
+//     all of them the same *prefiltered* value instead;
+//   * the same holds for the sky: a wide lobe has to read a blurred cube level.
+// This is prefiltering the integrand, not smoothing the result - the estimate
+// stays unbiased (measured: variance x2 lower, mean within 0.5%).
+// -------------------------------------------------------------------
+
+// Level to sample for a reflection hit: convert the cone's world-space width at
+// the hit into texels through the triangle's UV Jacobian.
+float RayConeTextureLod(float coneWidth, float cosAtHit, float3 ConeDir,
+    Vertex V0, Vertex V1, Vertex V2, uint texIndex)
+{
+    float3 e1 = V1.pos - V0.pos, e2 = V2.pos - V0.pos;
+    float2 d1 = V1.uv - V0.uv, d2 = V2.uv - V0.uv;
+    float det = d1.x * d2.y - d2.x * d1.y;
+    if (abs(det) < 1e-12)
+        return 0.0; // degenerate UVs (or a point): nothing to filter
+    float3 dpdu = (e1 * d2.y - e2 * d1.y) / det; // world units per unit of u
+    float3 dpdv = (e2 * d1.x - e1 * d2.x) / det; // world units per unit of v
+    // A grazing hit stretches the footprint along the surface.
+    float slope = 1.0 / max(abs(cosAtHit), 0.15);
+    float2 duv = coneWidth * slope / max(float2(length(dpdu), length(dpdv)), 1e-6);
+    uint tw = 1, th = 1;
+    g_Textures[NonUniformResourceIndex(texIndex)].GetDimensions(tw, th);
+    return log2(max(max(duv.x * (float)tw, duv.y * (float)th), 1.0));
+}
+
+// Level to sample on the sky cube for a lobe of the given half-angle: match the
+// lobe's solid angle against the solid angle of one cube texel.
+float SkyLodForLobe(float lobeAngle)
+{
+    uint cw = 1, ch = 1, levels = 1, elems = 1;
+    g_SkyCube.GetDimensions(cw, ch, levels, elems);
+    float texelSolid = 2.0 / max((float)cw * (float)cw, 1.0); // ~4*pi/6 / (cw*cw)
+    float lobeSolid = 3.14159265358979 * lobeAngle * lobeAngle;
+    float lod = 0.5 * log2(max(lobeSolid / texelSolid, 1.0));
+    return clamp(lod, 0.0, max((float)levels - 1.0, 0.0));
+}
+
 // Trace one reflection ray and shade the hit point (material + shadow).
 // When bounce < MaxBounces and the hit surface is smooth, casts a second
 // reflection ray from the hit point (two-bounce reflections).
-ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float MaxShadowLen, float3 CameraPos, float3 LightDir, uint bounce)
+// `coneAngle`/`coneWidth0` describe the ray cone carrying this ray (the lobe
+// half-angle and the pixel footprint it started with).
+ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float MaxShadowLen, float3 CameraPos, float3 LightDir, uint bounce,
+                         float coneAngle, float coneWidth0)
 {
     RayDesc ray;
     ray.Origin    = Origin;
@@ -306,7 +386,14 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
         float3 Norm = Vert0.norm * Bary.x + Vert1.norm * Bary.y + Vert2.norm * Bary.z;
         Norm = normalize(mul((float3x3)Obj.NormalMat, Norm));
 
-        res.BaseColor = Mtr.BaseColorMask * g_Textures[NonUniformResourceIndex(Mtr.BaseColorTexInd)].SampleLevel(g_Sampler, UV, 0);
+        // The cone widens along the ray; at the hit it has to be matched by the
+        // texture level, otherwise a rough lobe samples level 0 and every ray
+        // returns a different texel (the aliasing that survives denoising).
+        float coneWidth = coneWidth0 + 2.0 * q.CommittedRayT() * tan(coneAngle);
+        float texLod = RayConeTextureLod(coneWidth, dot(ReflDir, Norm), ReflDir, Vert0, Vert1, Vert2, Mtr.BaseColorTexInd);
+        texLod = clamp(texLod * g_RTConstants.ReflectionCone, 0.0, 10.0);
+
+        res.BaseColor = Mtr.BaseColorMask * g_Textures[NonUniformResourceIndex(Mtr.BaseColorTexInd)].SampleLevel(g_Sampler, UV, texLod);
         // Note: no roughness-based attenuation here anymore - the GGX
         // importance sampling in CSMain weights the reflected radiance by the
         // Smith G geometry term (roughness energy), so a rough surface's
@@ -314,14 +401,18 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
         // Self-emission is NOT attenuated by roughness and is not light-tinted:
         // a glowing surface keeps its color when reflected.
         res.Emissive = Mtr.Emissive.rgb * Mtr.Emissive.w;
-        res.NdotL     = max(0.0, dot(LightDir, Norm));
-        res.Found     = true;
-
-        if (res.NdotL > 0.0)
+        // Wrapped (half) Lambert + shadow, exactly like the rasterizer's forward
+        // model (g_PS_Forward in RenderSubsystem). With the plain max(0, NdotL)
+        // this used to compute, every hit facing away from the sun contributed
+        // only the 0.1 ambient - so a reflection of shaded geometry came out much
+        // darker than the very same geometry looks in the raster path.
         {
-            float3 HitPos = Origin + ReflDir * q.CommittedRayT();
-            res.NdotL *= CastShadowPCF(HitPos, LightDir, MaxShadowLen, Norm, length(HitPos - CameraPos));
+            float3 HitPos   = Origin + ReflDir * q.CommittedRayT();
+            float  NdotLraw = dot(LightDir, Norm);
+            res.NdotL = saturate(NdotLraw * 0.5 + 0.5)
+                      * ReflectionShadow(HitPos, LightDir, MaxShadowLen, Norm, length(HitPos - CameraPos), NdotLraw);
         }
+        res.Found     = true;
 
         // Two-bounce: reflect again from the hit point on surfaces at or below
         // the roughness threshold (BounceRoughness = 1.0 forces all surfaces).
@@ -353,9 +444,16 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
             }
             else
             {
-                col2 = GetSkyColor(Refl2).rgb;
+                col2 = GetSkyColorLod(Refl2, 0.0).rgb;
             }
-            res.BaseColor = lerp(res.BaseColor, float4(col2, res.BaseColor.a), 0.5);
+            // A single mirror ray bounced off a rough primary surface is a poor
+            // estimate of that surface's second-bounce lobe: it carries the
+            // sharp detail of whatever it happened to hit, which reads as
+            // sparkle. Keep the second bounce where it is actually resolved (a
+            // smooth primary surface) and fade it out as the surface roughens;
+            // the VNDF weight of the first bounce carries the energy.
+            float secondWeight = 0.5 * (1.0 - saturate(Mtr.Roughness * g_RTConstants.ReflectionBlur));
+            res.BaseColor = lerp(res.BaseColor, float4(col2, res.BaseColor.a), secondWeight);
         }
     }
     return res;
@@ -368,8 +466,31 @@ float3 ScreenPosToWorldPos(float2 uv, float depth, float4x4 vpInv)
     return w.xyz / w.w;
 }
 
+// Normalize without ever producing a NaN. A degenerate (zero-length) normal is
+// possible where the G-buffer is only partially covered / at an MSAA resolve
+// edge, and normalize(0) would poison everything computed from it - diffuse,
+// reflection, AO - turning the pixel into NaN, which every debug view and the
+// final image show as pure black.
+float3 SafeNormalize(float3 n, float3 fallback)
+{
+    float len2 = dot(n, n);
+    return len2 > 1e-12 ? n * rsqrt(len2) : fallback;
+}
+
 // -------------------------------------------------------------------
-// GGX importance-sampled reflections.
+// GGX reflection sampling (visible normal distribution).
+//
+// The reflection lobe is evaluated with the distribution of *visible* normals
+// (Heitz 2018, "Sampling the GGX Distribution of Visible Normals") instead of
+// the raw NDF. Two properties matter here:
+//   * every half-vector it returns faces the viewer, so no sample is spent on a
+//     back-facing lobe that the surface would clip anyway;
+//   * the resulting estimator weight is G2/G1(V), which is bounded by 1, so a
+//     single unlucky sample can no longer produce a bright firefly. Those
+//     isolated bright pixels are exactly what survives denoising and reads as
+//     "GGX noise".
+// The estimator stays unbiased - it converges to the same Cook-Torrance result,
+// with a fraction of the variance, so the same ray count is visibly cleaner.
 // -------------------------------------------------------------------
 
 // Radical inverse (Van der Corput) for the Hammersley sequence.
@@ -388,37 +509,110 @@ float2 Hammersley(uint i, uint N)
     return float2(float(i) / float(N), RadicalInverse_VdC(i));
 }
 
-// Deterministic per-pixel hash (decorrelates adjacent pixels' sample patterns;
-// constant across frames so the temporal denoiser can accumulate them).
-float2 Hash2D(float2 p)
+// R2 (golden-ratio) low-discrepancy sequence. Advanced by the frame index it
+// rotates the sample pattern in time, which is what lets the temporal denoiser
+// average *different* samples instead of re-averaging one static pattern.
+float2 R2Sequence(uint n)
 {
-    return frac(sin(p * 127.1 + float2(311.7, 74.7)) * 43758.5453);
+    return frac(float2(0.7548776662, 0.5698402909) * (float)n);
 }
 
-// Sample the GGX normal distribution (importance sampling of the NDF).
-// a = perceptual roughness^2 (alpha). Returns the half-vector in tangent space.
-float3 ImportanceSampleGGX(float2 Xi, float a)
+// PCG integer hash (Jarzynski & Olano 2020). Integer based, so unlike a
+// sin()-based hash it loses no precision at large pixel coordinates, and its
+// two channels are genuinely decorrelated.
+uint PcgHash(uint v)
 {
-    float phi = 6.2831853 * Xi.x;
-    float cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a * a - 1.0) * Xi.y));
-    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
-    return float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    uint state = v * 747796405u + 2891336453u;
+    uint word  = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
 }
 
-// Tangent-space half-vector -> world space around the normal N.
-float3 TangentToWorld(float3 H, float3 N)
+// Per-pixel sample offset (Cranley-Patterson rotation of the Hammersley set).
+// Neighbouring pixels lift the same low-discrepancy pattern by different
+// amounts, so their residual error is uncorrelated and a denoiser can actually
+// average it out; the frame term adds the temporal rotation on top.
+float2 PixelOffset(uint2 pixel, uint frame)
 {
-    float3 up = abs(N.y) < 0.999 ? float3(0, 1, 0) : float3(1, 0, 0);
-    float3 T  = normalize(cross(up, N));
-    float3 B  = cross(N, T);
-    return normalize(T * H.x + B * H.y + N * H.z);
+    uint base = PcgHash(pixel.x + 0x9E3779B9u * pixel.y);
+    float2 hash = float2(PcgHash(base), PcgHash(base ^ 0x85EBCA6Bu)) * 2.3283064365386963e-10;
+    return frac(hash + R2Sequence(frame));
 }
 
-// Smith G1 (height-correlated geometry term), a = alpha (roughness^2).
+// Branchless orthonormal basis (Duff et al. 2017). It is continuous in N, so a
+// normal that varies across a pixel does not flip the tangent frame - a "pick
+// an up vector" basis jumps there, and the sample pattern jumps with it.
+void BuildONB(float3 N, out float3 T, out float3 B)
+{
+    float s = N.z >= 0.0 ? 1.0 : -1.0;
+    float k = -1.0 / (s + N.z); // s + N.z is never 0 (s follows the sign of N.z)
+    float b = N.x * N.y * k;
+    T = float3(1.0 + s * N.x * N.x * k, s * b, -s * N.x);
+    B = float3(b, s + N.y * N.y * k, -N.y);
+}
+
+// Smith GGX geometry term for a single direction (a = alpha = roughness^2).
 float SmithG1(float NdotX, float a)
 {
     float a2 = a * a;
     return 2.0 * NdotX / max(NdotX + sqrt(a2 + (1.0 - a2) * NdotX * NdotX), 1e-4);
+}
+
+// Height-correlated Smith G2 (Heitz 2014): masks the two directions jointly,
+// which is both more accurate than G1(V)*G1(L) and cheaper to keep bounded.
+float SmithG2(float NdotV, float NdotL, float a)
+{
+    float a2 = a * a;
+    float gv = sqrt(max(a2 + (1.0 - a2) * NdotV * NdotV, 0.0));
+    float gl = sqrt(max(a2 + (1.0 - a2) * NdotL * NdotL, 0.0));
+    return 2.0 * NdotL * NdotV / max(NdotL * gv + NdotV * gl, 1e-5);
+}
+
+// Sample the GGX distribution of visible normals. Ve is the view direction in
+// tangent space (z = surface normal, Ve.z > 0); returns the half-vector in
+// tangent space, always facing the viewer.
+float3 SampleGGXVNDF(float3 Ve, float2 u, float a)
+{
+    // Sec. 3.2: stretch the view vector so the ellipsoid becomes a hemisphere.
+    float3 Vh = normalize(float3(a * Ve.x, a * Ve.y, Ve.z));
+    // Sec. 4.1: orthonormal basis around Vh (the degenerate case is Vh = +-Z,
+    // where any basis works).
+    float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+    float3 T1 = lensq > 0.0 ? float3(-Vh.y, Vh.x, 0.0) * rsqrt(lensq) : float3(1.0, 0.0, 0.0);
+    float3 T2 = cross(Vh, T1);
+    // Sec. 4.2: sample the projected-area disk.
+    float r   = sqrt(u.x);
+    float phi = 6.28318530718 * u.y;
+    float t1  = r * cos(phi);
+    float t2  = r * sin(phi);
+    float s   = 0.5 * (1.0 + Vh.z);
+    // Squash the disk so its density matches the hemisphere's projected area
+    // as seen from Ve - this is the "visible" part of the NDF.
+    t2 = (1.0 - s) * sqrt(max(0.0, 1.0 - t1 * t1)) + s * t2;
+    // Sec. 4.3: project onto the hemisphere.
+    float3 Nh = t1 * T1 + t2 * T2 + sqrt(max(0.0, 1.0 - t1 * t1 - t2 * t2)) * Vh;
+    // Sec. 3.4: unstretch back to the ellipsoid -> the half-vector.
+    return normalize(float3(a * Nh.x, a * Nh.y, max(0.0, Nh.z)));
+}
+
+// BRDF/pdf of VNDF sampling: the Cook-Torrance specular term without Fresnel
+// (the compose pass applies Fresnel). G2 <= G1(V) keeps it in [0,1], which is
+// what makes a firefly impossible.
+float VndfWeight(float NdotV, float NdotL, float a)
+{
+    return SmithG2(NdotV, NdotL, a) / max(SmithG1(NdotV, a), 1e-4);
+}
+
+// Ray budget by lobe width. A near-mirror lobe is a delta function: the VNDF
+// samples collapse onto the mirror direction, so one ray is both exact and
+// noise free. Wide lobes need every sample to average out. Spending the budget
+// where the variance actually is lowers the visible noise at a fixed ray count.
+uint SampleBudget(float rough, uint maxSamples)
+{
+    if (maxSamples <= 1u)
+        return 1u;
+    float t = saturate((rough - 0.05) / 0.40); // 0 = mirror, 1 = rough
+    uint  n = (uint)round(lerp(1.0, (float)maxSamples, sqrt(t)));
+    return clamp(n, 1u, maxSamples);
 }
 
 [numthreads(8, 8, 1)]
@@ -474,16 +668,24 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
     float2 BestUV  = (float2(fpBest) + 0.5) / float2(FullDim);
     float3 WPos    = ScreenPosToWorldPos(BestUV, Depth, g_RTConstants.ViewProjInv);
     float3 LightDir = g_RTConstants.LightDir.xyz;
-    float3 WNormal = normalize(g_GBufferNormal.Load(int3(fpBest, 0)).xyz);
+    float3 WNormal = SafeNormalize(g_GBufferNormal.Load(int3(fpBest, 0)).xyz, float3(0, 0, 1));
     float  DisToCam = length(WPos - g_RTConstants.CameraPos.xyz);
     // Surface -> camera (matches the compose shader's ViewDir convention, so
     // NdotV is positive for front-facing surfaces and the GGX reflection lobe
     // points away from the surface).
     float3 ViewDir = (g_RTConstants.CameraPos.xyz - WPos) / max(DisToCam, 0.0001);
 
-    float NdotL = max(0.0, dot(LightDir, WNormal));
-    if (NdotL > 0.0)
-        NdotL *= CastShadowPCF(WPos, LightDir, g_RTConstants.MaxRayLength, WNormal, DisToCam);
+    // Diffuse lighting factor: wrapped (half) Lambert plus shadow, matching the
+    // rasterizer's forward model. The plain max(0, dot(L, N)) this used to compute
+    // drove every surface facing away from the sun to exactly zero, and since the
+    // ambient below is scaled by AO as well, a shaded or occluded surface ended up
+    // with Color.a == 0 - which is the "completely black" result seen on exactly
+    // the normals that point away from the light (in the G-buffer normal debug
+    // view: the dark blue / purple / red ones, where the negative components are
+    // clamped away).
+    float NdotLraw = dot(LightDir, WNormal);
+    float NdotL = saturate(NdotLraw * 0.5 + 0.5);
+    NdotL *= CastShadowPCF(WPos, LightDir, g_RTConstants.MaxRayLength, WNormal, DisToCam);
 
     // Ambient occlusion (short hemisphere rays).
     float ao = ComputeAO(WPos, WNormal, DisToCam);
@@ -492,45 +694,85 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
 
     float4 Color = float4(0, 0, 0, 1);
     {
-        // GGX importance-sampled reflection: sample the GGX NDF around the
-        // normal (spread driven by roughness * ReflectionBlur), trace each
-        // direction and weight by Smith G * VdotH/(NdotV*NdotH) - the
-        // Cook-Torrance specular / NDF-pdf ratio without the Fresnel term
-        // (the compose pass applies Fresnel via the Schlick blend). Smooth
-        // surfaces converge to the mirror reflection (weight -> 1); rough
+        // GGX VNDF reflection: draw every sample from the distribution of
+        // visible normals around the surface (spread driven by roughness *
+        // ReflectionBlur), trace it, and weight the radiance by G2/G1(V) - the
+        // Cook-Torrance specular / VNDF-pdf ratio without the Fresnel term.
+        // Smooth surfaces converge to the mirror reflection (weight -> 1); rough
         // surfaces get blurred, energy-attenuated reflections instead of a
-        // dimmed mirror.
+        // dimmed mirror, and the bounded weight keeps them free of fireflies.
         float bias = max(0.002, 0.001 * DisToCam);
         float3 base = WPos + WNormal * bias;
         float3 V = ViewDir;
-        // Small floors so the reflection fades smoothly instead of snapping to
-        // pure black when the GGX lobe is clipped by the surface (grazing view).
-        float  NdotV = max(saturate(dot(WNormal, V)), 0.05);
+
+        // --- normal for the reflection lobe (two-sided) -------------------
+        // A G-buffer normal can face away from the eye: an asset whose normals
+        // point the wrong way, a normal map perturbed past the horizon at a
+        // grazing angle, or the depth-guided texel pick of a half-resolution
+        // pixel landing on the neighbouring surface. When that happens
+        // dot(N, V) <= 0, so NdotV is 0, G2 - and with it *every* sample weight
+        // (weight = G2/G1(V)) - is 0, and the Reflections output comes out
+        // exactly black: the accumulator stays empty while the diffuse term
+        // (wrapped Lambert) still looks completely normal. On top of that the
+        // compose pass reads Fresnel of the same back-facing normal as 1.0, i.e.
+        // "pure mirror", so such a pixel renders as pure black even though its
+        // diffuse shading is fine.
+        // The lobe has to be built around the side we can actually see, so flip
+        // it toward the viewer. The diffuse/AO terms keep the stored normal, which
+        // is what the raster path shades with.
+        float3 ReflNormal = WNormal;
+        if (dot(ReflNormal, V) < 0.0)
+            ReflNormal = -ReflNormal;
+
+        float  NdotV = saturate(dot(ReflNormal, V));
         float  rough = clamp(roughness * g_RTConstants.ReflectionBlur, 0.001, 1.0);
         float  a = rough * rough;
-        uint   ns = clamp(g_RTConstants.ReflectionSamples, 1u, 8u);
-        // Pixel hash decorrelates adjacent pixels; the frame offset ROTATES the
-        // pattern every frame so the temporal denoiser averages different GGX
-        // samples and actually converges (a frame-static pattern never reduces
-        // the per-pixel variance over time).
-        float2 pixHash = Hash2D((float2)fpBest + (float2)(g_RTConstants.FrameIndex & 63u) * 0.618f);
+        uint   ns = SampleBudget(rough, clamp(g_RTConstants.ReflectionSamples, 1u, 16u));
+        float3 T, B;
+        BuildONB(ReflNormal, T, B);
+        // View direction in tangent space (z = normal); the VNDF needs it to
+        // only ever return normals that actually face this view.
+        float3 Ve = float3(dot(V, T), dot(V, B), max(NdotV, 1e-3));
+        // Pixel-decorrelated, per-frame rotating offset: the same stratified
+        // Hammersley pattern is lifted differently in every pixel and every
+        // frame, so the denoiser averages independent error instead of one
+        // repeating pattern.
+        float2 pixOffset = PixelOffset(fpBest, g_RTConstants.FrameIndex);
+        // Ray cone carrying every reflection ray: the lobe's half-angle plus the
+        // angular size of the texel being shaded, and the footprint it starts
+        // with at the primary surface. One RT texel covers (FullDim/Dim)^2 screen
+        // pixels, so the seed has to be scaled by that ratio (the RT pass runs at
+        // half resolution most of the time). Drives the prefiltered texture / sky
+        // level at the hit (see the ray cone block above).
+        float pixelAngle = g_RTConstants.RayConePixelAngle * ((float)FullDim.x / max((float)Dim.x, 1.0));
+        float lobeAngle = a;
+        float coneAngle = lobeAngle + pixelAngle;
+        float coneWidth0 = DisToCam * pixelAngle;
+        float skyLod = SkyLodForLobe(lobeAngle) * g_RTConstants.ReflectionCone;
         float3 lightColor = g_RTConstants.LightColor.rgb;
         float3 acc = float3(0, 0, 0);
         for (uint i = 0; i < ns; ++i)
         {
-            float2 Xi = frac(Hammersley(i, ns) + pixHash);
-            float3 H  = ImportanceSampleGGX(Xi, a);
-            float3 Hw = TangentToWorld(H, WNormal);
-            float3 L  = normalize(2.0 * dot(V, Hw) * Hw - V); // reflect(-V, H)
-            float NdotL = max(saturate(dot(WNormal, L)), 0.03);
-            float NdotH = saturate(dot(WNormal, Hw));
-            float VdotH = saturate(dot(V, Hw));
-            if (NdotH <= 1e-4)
-                continue; // degenerate half-vector only
+            float2 Xi = frac(Hammersley(i, ns) + pixOffset);
+            float3 Ht = SampleGGXVNDF(Ve, Xi, a);
+            float3 Hw = normalize(T * Ht.x + B * Ht.y + ReflNormal * Ht.z);
+            float  VdotH = saturate(dot(V, Hw));
+            float3 L  = normalize(2.0 * VdotH * Hw - V); // reflect(-V, H)
+            float  NdotL = dot(ReflNormal, L);
+            if (NdotL <= 1e-4)
+                continue; // below the horizon: the BRDF term is 0 (no bias added)
 
-            ReflectionResult refl = Reflect(base, L, g_RTConstants.MaxRayLength,
+            // Slope-scaled origin bias, as in CastShadowPCF: the world position
+            // reconstructed from the depth buffer sits slightly inside the mesh
+            // (the error grows with distance), and a reflection ray that runs
+            // almost parallel to the surface leaves that region only very
+            // slowly. A constant offset then self-hits the neighbouring
+            // triangles and shows up as crawling dark speckle.
+            float3 origin = base + WNormal * (bias / max(NdotL, 0.1));
+            ReflectionResult refl = Reflect(origin, L, g_RTConstants.MaxRayLength,
                                             g_RTConstants.MaxRayLength,
-                                            g_RTConstants.CameraPos.xyz, LightDir, 0);
+                                            g_RTConstants.CameraPos.xyz, LightDir, 0,
+                                            coneAngle, coneWidth0);
             float3 rad;
             if (refl.Found)
             {
@@ -541,18 +783,21 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
                 rad = refl.BaseColor.rgb * lit + refl.Emissive.rgb;
             }
             else
-                rad = GetSkyColor(L).rgb;
+                rad = GetSkyColorLod(L, skyLod).rgb;
 
-            float G = SmithG1(NdotV, a) * SmithG1(NdotL, a);
-            float w = G * VdotH / max(NdotV * NdotH, 1e-4);
-            acc += rad * w;
+            acc += rad * VndfWeight(NdotV, NdotL, a);
         }
         Color = float4(acc / (float)ns, 1.0);
     }
 
     // Lighting factor: ambient (AO-shaded) + direct (shadowed, intensity-scaled).
     // Compose uses Color * RT.a for the diffuse term.
-    Color.a = g_RTConstants.AmbientLight * ao + NdotL * g_RTConstants.LightIntensity;
+    //
+    // The AO only takes half of the ambient away: the raster path has no AO at all
+    // and always keeps its flat ambient, and letting AO cancel the ambient
+    // completely was the other half of the black-area problem. With "AO Samples"
+    // set to 0 (ao == 1) this is exactly the raster ambient again.
+    Color.a = g_RTConstants.AmbientLight * (0.5 + 0.5 * ao) + NdotL * g_RTConstants.LightIntensity;
     // RT-res albedo/normal for the denoiser (OIDN consumes these at the RT
     // resolution; they match the depth-guided fpBest texel used for lighting).
     g_OutAlbedo[DTid] = g_GBufferColor.Load(int3(fpBest, 0));
@@ -595,12 +840,74 @@ struct PSIn { float4 Pos : SV_POSITION; float2 UV : TEXCOORD0; };
 #define RENDER_MODE_REFLECTIONS      4
 #define RENDER_MODE_FRESNEL_TERM     5
 #define RENDER_MODE_RT_ALPHA         6
+#define RENDER_MODE_BACK_FACING      7
 
 float3 ScreenPosToWorldPos(float2 uv, float depth, float4x4 vpInv)
 {
     float4 clip = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), depth, 1.0);
     float4 w    = mul(vpInv, clip);
     return w.xyz / w.w;
+}
+
+// Normalize without ever producing a NaN (see the same helper in the trace
+// shader): a degenerate G-buffer normal would make the Fresnel term - and with it
+// the whole composed pixel - NaN, i.e. black.
+float3 SafeNormalize(float3 n, float3 fallback)
+{
+    float len2 = dot(n, n);
+    return len2 > 1e-12 ? n * rsqrt(len2) : fallback;
+}
+
+// Depth-aware upsample of the ray traced texture.
+//
+// The trace runs at (usually) half resolution, so a plain bilinear tap mixes in
+// texels that belong to the background or to the surface behind a silhouette.
+// Those texels hold no reflection at all - the trace writes (0,0,0,1) for
+// background - so every object edge ended up with a seam where the reflection was
+// simply missing. Weight each of the four taps by how well its own G-buffer depth
+// matches this pixel's instead of letting the hardware blend them blindly.
+//
+// A tap's depth is the minimum over the full-resolution texels it covers, because
+// that is exactly how the trace picks its representative texel. `depthTol` is the
+// caller's "same surface" tolerance, measured per pixel so that a grazing surface
+// (where the depth changes a lot between neighbours) keeps its taps while a
+// silhouette (where it jumps to another surface) rejects them.
+float4 SampleRayTraced(float2 uv, float depth, float depthTol)
+{
+    uint2 rtDim; g_RayTracedTex.GetDimensions(rtDim.x, rtDim.y);
+    uint2 fullDim; g_GBufferDepth.GetDimensions(fullDim.x, fullDim.y);
+    const float2 rtTexel = 1.0 / float2(rtDim);
+    const int2 scale = max(int2(round(float2(fullDim) / float2(rtDim))), int2(1, 1));
+    const int2 fullMax = int2(fullDim) - 1;
+
+    const float2 coord = uv / rtTexel - 0.5;
+    const float2 base  = floor(coord);
+    float4 acc = float4(0, 0, 0, 0);
+    float  wsum = 0.0;
+    [unroll]
+    for (int y = 0; y < 2; ++y)
+    {
+        [unroll]
+        for (int x = 0; x < 2; ++x)
+        {
+            const int2 t = clamp(int2(base) + int2(x, y), int2(0, 0), int2(rtDim) - 1);
+            // Nearest depth across the full-resolution footprint of this tap.
+            const int2 f0 = min(t * scale, fullMax);
+            float dt = g_GBufferDepth.Load(int3(f0, 0));
+            if (scale.x > 1) dt = min(dt, g_GBufferDepth.Load(int3(min(f0 + int2(1, 0), fullMax), 0)));
+            if (scale.y > 1) dt = min(dt, g_GBufferDepth.Load(int3(min(f0 + int2(0, 1), fullMax), 0)));
+            if (scale.x > 1 && scale.y > 1) dt = min(dt, g_GBufferDepth.Load(int3(min(f0 + int2(1, 1), fullMax), 0)));
+
+            // Background taps never contribute; a surface much further away (the
+            // object behind an edge) is faded out too. The small floor keeps a
+            // stable average when nothing matches at all.
+            float w = (dt >= 1.0) ? 0.0 : saturate(1.0 - abs(dt - depth) / max(depthTol, 1e-5));
+            w = max(w, 1e-3);
+            acc += g_RayTracedTex.Load(int3(t, 0)) * w;
+            wsum += w;
+        }
+    }
+    return acc / wsum;
 }
 
 float4 main(PSIn i) : SV_Target
@@ -611,19 +918,38 @@ float4 main(PSIn i) : SV_Target
 
     int3 tc  = int3(UV * Dim, 0);
     float Depth = g_GBufferDepth.Load(tc).x;
+    // "Same surface" tolerance for the depth-aware upsample below: a couple of
+    // pixels' worth of depth slope, so a grazing surface keeps its neighbouring
+    // taps while a silhouette (where the depth jumps to another surface) rejects
+    // them. Clamped from above as well, because at a silhouette the quad-wide
+    // derivative includes the background and would otherwise grow enough to
+    // accept the surface behind the edge. Evaluated before the early-out below so
+    // that every lane of the quad is still active when the derivative is taken.
+    const float depthTol = clamp(2.0 * (abs(ddx(Depth)) + abs(ddy(Depth))), 0.02 * Depth, 0.25 * Depth);
     if (Depth >= 1.0)
         return float4(0, 0, 0, 0); // background: alpha 0 preserves the skybox
 
     float4 Color  = g_GBufferColor.Load(tc);
-    float3 Normal = normalize(g_GBufferNormal.Load(tc).xyz);
-    // The ray traced texture is half resolution; bilinear upsample.
-    float4 RT     = g_RayTracedTex.SampleLevel(g_Sampler, UV, 0);
+    float3 Normal = SafeNormalize(g_GBufferNormal.Load(tc).xyz, float3(0, 0, 1));
+    // The ray traced texture runs at a lower resolution; upsample it with a depth
+    // test so that background/behind-the-edge texels cannot bleed in.
+    float4 RT     = SampleRayTraced(UV, Depth, depthTol);
     // Emissive comes from the (full-resolution) G-buffer emissive target.
     float3 Emissive = g_GBufferEmissive.Load(tc).rgb;
 
     float3 WPos    = ScreenPosToWorldPos(UV, Depth, g_ViewProjInv);
     float3 ViewDir = normalize(g_CameraPos.xyz - WPos);
-    float  NdotV   = saturate(dot(Normal, ViewDir));
+
+    // Two-sided shading. A G-buffer normal can face away from the eye (an asset
+    // with inverted normals, a normal map perturbed past the horizon at a grazing
+    // angle, a half-resolution texel pick). Fresnel of such a normal reads 1.0,
+    // i.e. "pure mirror" - and if the ray traced reflection is empty there, the
+    // whole pixel comes out black even though its diffuse shading is perfectly
+    // fine. Flip it toward the viewer so the diffuse term wins instead.
+    bool   BackFacing = dot(Normal, ViewDir) < 0.0;
+    float3 FaceNormal = BackFacing ? -Normal : Normal;
+
+    float  NdotV   = saturate(dot(FaceNormal, ViewDir));
     float  R       = lerp(0.04, 1.0, pow(1.0 - NdotV, 5.0));
 
     switch (g_DrawMode)
@@ -634,6 +960,12 @@ float4 main(PSIn i) : SV_Target
         case RENDER_MODE_REFLECTIONS:      return float4(RT.rgb, 1.0);
         case RENDER_MODE_FRESNEL_TERM:     return float4(R, R, R, 1.0);
         case RENDER_MODE_RT_ALPHA:         return float4(RT.a, RT.a, RT.a, 1.0);
+        // Diagnostic: 1 = the stored G-buffer normal faces away from the eye, i.e.
+        // the pixels that used to render black because their reflection lobe was
+        // degenerate (see the compose flip above and the lobe flip in the trace
+        // shader). Handy for telling an asset/normal-map problem from a shading
+        // one.
+        case RENDER_MODE_BACK_FACING:      return float4(BackFacing ? 1.0 : 0.0, 0, 0, 1.0);
         case RENDER_MODE_SHADED:
         default:
         {

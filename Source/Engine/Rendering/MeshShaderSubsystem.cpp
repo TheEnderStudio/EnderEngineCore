@@ -1727,6 +1727,27 @@ struct PSInput {
 
 // Tangent frame from screen-space derivatives (no TANGENT attribute is loaded
 // by the glTF importer, and this is robust across the whole mesh).
+// Tangent-frame sign for the normal map, one factor per tangent axis:
+//   x -> the red channel (tangent / +u), y -> the green channel (bitangent).
+//
+// This is NOT an asset-format quirk that can be reasoned away: the frame below is
+// built from screen-space derivatives (a cotangent frame) instead of the glTF
+// TANGENT attribute - which this loader does not use yet, it writes a dummy
+// tangent - and the resulting handedness depends on the screen/UV orientation, so
+// the conversion from the asset's tangent-space convention into *this* frame is a
+// sign that has to be verified once, visually:
+//
+//   put a directional normal map (bricks, rock, tiles) on a surface, light it from
+//   the side, and check that the bumps are lit on the side facing the light. If
+//   the relief looks inverted left/right, flip kNormalMapSign.x; if it is inverted
+//   up/down, flip kNormalMapSign.y. Current setting matches the glTF (+Y up /
+//   OpenGL-style) maps that the loader feeds in.
+//
+// Loading the real glTF TANGENT_0 attribute (or generating MikkTSpace tangents, as
+// the spec asks when they are absent) removes the ambiguity entirely: the frame
+// would then come from the asset exactly as the spec defines it.
+static const float2 kNormalMapSign = float2(1.0, -1.0);
+
 float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
     float3 dp1 = ddx(wp);
     float3 dp2 = ddy(wp);
@@ -1739,8 +1760,7 @@ float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
     // Epsilon: degenerate UVs (or the debug triangle) give a zero frame, and
     // rsqrt(0) would produce NaN normals.
     float invmax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
-    // glTF normal maps use the OpenGL convention (+Y up); D3D wants +Y down.
-    float3 n = float3(sampledNormal.x, -sampledNormal.y, sampledNormal.z);
+    float3 n = sampledNormal * float3(kNormalMapSign, 1.0);
     return normalize(mul(n, float3x3(T * invmax, B * invmax, N)));
 }
 
@@ -1873,6 +1893,11 @@ struct PSOut {
     float4 Emis  : SV_Target2;  // emissive (RGBA16_FLOAT)
 };
 
+// See the note on kNormalMapSign in the cluster G-buffer shader above: the sign
+// belongs to the derivative-built tangent frame, not to the asset, and is meant to
+// be verified visually once (flip x for a left/right inversion, y for up/down).
+static const float2 kNormalMapSign = float2(1.0, -1.0);
+
 float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
     float3 dp1 = ddx(wp);
     float3 dp2 = ddy(wp);
@@ -1883,7 +1908,7 @@ float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
     float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
     float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
     float invmax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
-    float3 n = float3(sampledNormal.x, -sampledNormal.y, sampledNormal.z);
+    float3 n = sampledNormal * float3(kNormalMapSign, 1.0);
     return normalize(mul(n, float3x3(T * invmax, B * invmax, N)));
 }
 
@@ -2215,8 +2240,19 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 	if (meshes.empty()) return RenderError::InvalidArgument;
 
 	// Release previous geometry pools.
+	//
+	// Every pool that setMeshes recreates has to be released here: the call runs
+	// again whenever the mesh set changes, and Diligent asserts when a reference
+	// that is already set is overwritten ("Overwriting reference to existing
+	// object may cause memory leaks"). The cluster pools are created further down
+	// by createImmutable(), so they must be dropped here as well - a re-entrant
+	// call (the Demo re-registers once the asynchronously loaded model arrives)
+	// otherwise trips that assert on "MS ClPos".
 	p.scenePos.Release(); p.sceneNorm.Release(); p.sceneMeshlets.Release();
 	p.sceneMeshletVerts.Release(); p.sceneMeshletTris.Release(); p.sceneMeshInfo.Release(); p.sceneTasks.Release();
+	p.clPos.Release(); p.clNorm.Release(); p.clUV.Release();
+	p.clClusters.Release(); p.clClusterVerts.Release(); p.clClusterTris.Release();
+	p.clGroups.Release(); p.clMeshInfo.Release(); p.clMaterials.Release();
 	p.sceneMeshList = meshes;
 	p.sceneMeshCount = (UInt32)meshes.size();
 
@@ -2698,6 +2734,10 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 
 	// ---- Upload pools (immutable) ----
 	auto createImmutable = [&](const char* name, const void* data, UInt64 size, UInt32 stride, D::RefCntAutoPtr<D::IBuffer>& out) -> bool {
+		// Never hand a set reference to CreateBuffer: Diligent treats that as an
+		// overwrite and asserts on it in debug builds. Dropping it here keeps a
+		// re-registration safe even if a caller forgets to release the pool.
+		out.Release();
 		if (size == 0 || !data) return true;
 		D::BufferDesc bd; bd.Name = name; bd.Size = size;
 		bd.BindFlags = D::BIND_SHADER_RESOURCE;

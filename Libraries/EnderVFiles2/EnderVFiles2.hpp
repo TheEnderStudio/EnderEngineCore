@@ -16,7 +16,7 @@
 #define EVF_MAKEVERSION(major, minor, patch) ((major << 4) | (minor << 2) | patch)
 #define EVF_VERSION EVF_MAKEVERSION(EVF_VERSION_MAJOR, EVF_VERSION_MINOR, EVF_VERSION_PATCH)
 
-#define EVF_INFO(...) printf(__VA_ARGS__)
+#define EVF_INFO(...) fprintf(stdout, __VA_ARGS__)
 #define EVF_ERROR(...) fprintf(stderr, __VA_ARGS__)
 
 EVF_NAMESPACE_BEGIN
@@ -40,6 +40,14 @@ using Vector = std::vector<T>;
 template <typename T, Size size>
 using Array = std::array<T, size>;
 
+namespace MagicNumbers {
+#define EVF_COMMON_HEADER_MAGIC 'E', 'V', 'F', '2'
+	static const UInt8 CommonHeaderMagic[4] = { EVF_COMMON_HEADER_MAGIC };
+	static const UInt8 IndexFileHeaderMagic[8] = { EVF_COMMON_HEADER_MAGIC, 'I', 'N', 'D', 'x' };
+	static const UInt8 VolumeFileHeaderMagic[8] = { EVF_COMMON_HEADER_MAGIC, 'V', 'O', 'L', 'm' };
+#define EVF_WRAP_TO_VECTOR(array) Vector(std::begin(array), std::end(array))
+}
+
 /*
  * @brief Packer for EnderVFiles2. When this object destructs, it will start pack.
  */
@@ -49,20 +57,22 @@ public:
 		String name;
 		String filename;
 		String password;
-		Path   AssetDir;
-		Path   OutputDir;
+		Path   assetDir;
+		Path   outputDir;
+		UInt64 volumeSize;
 	};
 
+	void pack(); // pack manually
+
 	Packer() = default;
-	~Packer();
+	~Packer() { pack(); }
 
 	Packer& setName(const String& name) { m_config.name = name; return *this; }
 	Packer& setFileName(const String& name) { m_config.filename = name; return *this; }
 	Packer& setPassword(const String& password) { m_config.password = password; return *this; }
 	Packer& setAssetDir(const Path& path);
-	Packer& setOutputDir(const Path& path);
-
-	void pack(); // pack manually
+	Packer& setOutputDir(const Path& path, bool replaceOld);
+	Packer& setVolumeSize(UInt64 size) { m_config.volumeSize = size; return *this; }
 
 private:
 	Config m_config;
@@ -80,5 +90,18 @@ public:
 };
 
 using VFS = VirtualFileSystem;
+
+/* static */ class IOHelper {
+public:
+	/* Static class doesn't need to be created and deleted */
+	IOHelper() = delete;
+	~IOHelper() = delete;
+	void* operator new(Size) = delete;
+	void  operator delete(void*) = delete;
+
+	static bool   createFile(const Path& path);
+	static bool   writeFile(const Path& path, const Vector<UInt8>& bytes);
+	static UInt64 readFile(const Path& path, Vector<UInt8>& bytes, UInt64 offset = 0, UInt64 bytesToRead = UINT64_MAX);
+};
 
 EVF_NAMESPACE_END

@@ -97,6 +97,29 @@ TEST(RenderPipelineTest, GraphBuildsWithoutCycles) {
 	EXPECT_TRUE(pipeline.build().isOk());
 }
 
+TEST(RenderPipelineTest, GpuStatsCoverEveryTimedPass) {
+	RenderFixture fx;
+	RenderPipeline pipeline(fx.executor, fx.context);
+
+	// One GPU timing slot per pass, minus present: that pass submits and waits for
+	// the frame instead of doing GPU work, so its timestamps would fall on either
+	// side of the submission. Slots are handed out in registration order, so this
+	// also guards the wrap order against a pass being (un)wrapped by accident.
+	ASSERT_EQ(pipeline.passStats().size(), allPasses().size());
+	EXPECT_EQ(pipeline.passGpuStats().size() + 1, pipeline.passStats().size());
+
+	EXPECT_TRUE(pipeline.gpuTiming());
+	pipeline.setGpuTiming(false);
+	EXPECT_FALSE(pipeline.gpuTiming());
+	for (const auto& gpu : pipeline.passGpuStats()) {
+		EXPECT_DOUBLE_EQ(gpu.lastMs, 0.0);
+		EXPECT_DOUBLE_EQ(gpu.averageMs, 0.0);
+		EXPECT_DOUBLE_EQ(gpu.maxMs, 0.0);
+	}
+	pipeline.setGpuTiming(true);
+	EXPECT_TRUE(pipeline.gpuTiming());
+}
+
 TEST(RenderPipelineTest, DependenciesProduceTheExpectedLevels) {
 	RenderFixture fx;
 	RenderPipeline pipeline(fx.executor, fx.context);

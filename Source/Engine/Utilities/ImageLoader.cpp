@@ -1,10 +1,12 @@
-﻿#include <Utilities/ImageLoader.hpp>
+#include <Utilities/ImageLoader.hpp>
 #include <Core/Log.hpp>
 #include <Resource/ResourcesManager.hpp>
 
 #include <spng.h>
 #include <stb_image.h>
 #include <fstream>
+#include <algorithm>
+#include <cmath>
 
 #include <DiligentTools/TextureLoader/interface/TextureUtilities.h>
 #include <DiligentCore/Graphics/GraphicsEngine/interface/RenderDevice.h>
@@ -61,6 +63,61 @@ DecodedImage decodePNG(const void* data, Size size) {
 	spng_ctx_free(ctx);
 	EInfo("PNG decoded (libspng): {}x{} -> {} bytes", result.width, result.height, outLen);
 	return result;
+}
+
+MipChain buildMipChain(DecodedImage image, bool srgb) {
+	MipChain chain;
+	if (!image.isValid() || image.width == 0 || image.height == 0) return chain;
+
+	chain.width = image.width;
+	chain.height = image.height;
+
+	// sRGB <-> linear lookup, so the box filter runs in linear light. The encode
+	// side uses the sRGB transfer function directly (only 1/4 of the texels of a
+	// level need it, since each output texel consumes four inputs).
+	auto toLinear = [srgb](UInt8 v) -> F32 {
+		if (!srgb) return (F32)v / 255.0f;
+		static const Vector<F32> lut = [] {
+			Vector<F32> t(256);
+			for (int i = 0; i < 256; i++) {
+				F32 c = (F32)i / 255.0f;
+				t[i] = c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+			}
+			return t;
+			}();
+		return lut[v];
+	};
+	auto toEncoded = [srgb](F32 c) -> UInt8 {
+		c = glm::clamp(c, 0.0f, 1.0f);
+		if (!srgb) return (UInt8)(c * 255.0f + 0.5f);
+		F32 s = c <= 0.0031308f ? c * 12.92f : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+		return (UInt8)(glm::clamp(s, 0.0f, 1.0f) * 255.0f + 0.5f);
+	};
+
+	chain.levels.push_back(std::move(image.pixels));
+	UInt32 w = image.width, h = image.height;
+	while (w > 1 || h > 1) {
+		const UInt32 nw = std::max(1u, w / 2), nh = std::max(1u, h / 2);
+		const Vector<UInt8>& src = chain.levels.back();
+		Vector<UInt8> dst((Size)nw * nh * 4);
+		for (UInt32 y = 0; y < nh; y++) {
+			for (UInt32 x = 0; x < nw; x++) {
+				// 2x2 footprint, clamped at the right/bottom edge for odd sizes.
+				const UInt32 x0 = std::min(x * 2, w - 1), x1 = std::min(x * 2 + 1, w - 1);
+				const UInt32 y0 = std::min(y * 2, h - 1), y1 = std::min(y * 2 + 1, h - 1);
+				const Size i00 = ((Size)y0 * w + x0) * 4, i10 = ((Size)y0 * w + x1) * 4;
+				const Size i01 = ((Size)y1 * w + x0) * 4, i11 = ((Size)y1 * w + x1) * 4;
+				for (int c = 0; c < 4; c++) {
+					F32 sum = toLinear(src[i00 + c]) + toLinear(src[i10 + c])
+						+ toLinear(src[i01 + c]) + toLinear(src[i11 + c]);
+					dst[((Size)y * nw + x) * 4 + c] = toEncoded(sum * 0.25f);
+				}
+			}
+		}
+		chain.levels.push_back(std::move(dst));
+		w = nw; h = nh;
+	}
+	return chain;
 }
 
 DecodedImage decodeImage(const void* data, Size size) {

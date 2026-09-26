@@ -234,6 +234,15 @@ struct RenderPipelineContext {
  * is not thread safe. @c PipelineTaskMode::Parallel is available for
  * application-added tasks that touch no rendering subsystem.
  */
+/**
+ * @brief GPU time of one render pass (duration query, read one frame late).
+ */
+struct RenderPassGpuTime {
+	F64 lastMs = 0.0;    ///< GPU milliseconds of the last measured frame.
+	F64 averageMs = 0.0; ///< Exponential moving average of lastMs.
+	F64 maxMs = 0.0;     ///< Largest lastMs observed (catches intermittent hitches).
+};
+
 class EE_API RenderPipeline : public Pipeline {
 public:
 	/**
@@ -281,7 +290,27 @@ public:
 	EE_NODISCARD PipelineTaskId passId(StringView passName) const;
 
 	/// @brief Per-pass statistics of the most recent frame (same order as describe()).
+	///
+	/// The reported time is CPU time: it covers what the pass spends *recording*
+	/// its commands, which for a GPU pass is not its cost. All the work of a frame
+	/// is submitted and waited on once, in the present pass, so that pass appears
+	/// to take as long as the whole GPU frame. Use passGpuStats() to see the GPU
+	/// side.
 	EE_NODISCARD const Vector<PipelineTaskStats>& passStats() const;
+
+	/**
+	 * @brief GPU time of each pass, measured with a duration query (same order as passStats()).
+	 *
+	 * The values are read back one frame late and never stall the pipeline, and
+	 * the present pass is excluded because its begin/end timestamps would land on
+	 * either side of the frame submission (its "GPU cost" is the wait for the
+	 * frame, which already shows up as its CPU time).
+	 */
+	EE_NODISCARD const Vector<RenderPassGpuTime>& passGpuStats() const;
+
+	/// @brief Enable/disable the per-pass GPU timers (see passGpuStats()).
+	void setGpuTiming(bool enabled);
+	EE_NODISCARD bool gpuTiming() const;
 
 private:
 	struct Impl;

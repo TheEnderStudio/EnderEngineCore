@@ -1,7 +1,14 @@
 #include <Engine/Rendering/RenderPipeline.hpp>
 #include <Engine/Core/Log.hpp>
 
+#include <DiligentCore/Graphics/GraphicsEngine/interface/RenderDevice.h>
+#include <DiligentCore/Graphics/GraphicsEngine/interface/DeviceContext.h>
+#include <DiligentCore/Graphics/GraphicsEngine/interface/Query.h>
+#include <DiligentCore/Common/interface/RefCntAutoPtr.hpp>
+
 #include <algorithm>
+
+namespace D = Diligent;
 
 EE_NAMESPACE_RENDERING_BEGIN
 
@@ -36,6 +43,102 @@ struct RenderPipeline::Impl {
 	RenderPipelineContext context;
 	UInt64 frameIndex = 0;
 	F64 elapsedTime = 0.0;
+
+	// ------------------------------------------------------------------
+	// GPU timing.
+	//
+	// The per-pass times in PipelineTaskStats are CPU times: a pass only
+	// *records* its commands, so its cost is invisible there. Everything is
+	// submitted and waited on once, inside the present pass (Flush +
+	// WaitForFrame + vsync), which is why that pass looks as expensive as the
+	// whole GPU frame. These duration queries time the GPU work between passes
+	// so the table can show where the time actually goes. They are read a frame
+	// late and never block.
+	//
+	// The present pass is deliberately not wrapped: its begin/end timestamps
+	// would fall on either side of the frame submission.
+	// ------------------------------------------------------------------
+	Vector<D::RefCntAutoPtr<D::IQuery>> gpuQueries; ///< One duration query per pass (present excluded).
+	Vector<RenderPassGpuTime> gpuStats;             ///< Results, indexed like passStats().
+	Vector<UInt8> gpuEnded;                         ///< Per slot: the query has been ended at least once.
+	Size nextGpuSlot = 0;                           ///< Registration order -> task id.
+	D::IDeviceContext* gpuCtx = nullptr;
+	bool gpuTiming = true;
+
+	/// @brief Wrap one pass so its GPU work is timed.
+	///
+	/// Must be called exactly once per addTask(), in registration order: the slot
+	/// is the index the pipeline assigns to the pass.
+	PipelineTaskFn timed(PipelineTaskFn fn) {
+		const Size slot = nextGpuSlot++;
+		if (gpuStats.size() <= slot) {
+			gpuStats.resize(slot + 1);
+			gpuEnded.resize(slot + 1, 0);
+		}
+		return [this, slot, fn = std::move(fn)](const PipelineFrameContext& frame) -> Result<void, CoreError> {
+			if (!gpuTiming || !gpuCtx || slot >= gpuQueries.size() || !gpuQueries[slot])
+				return fn(frame);
+			D::IQuery* query = gpuQueries[slot];
+
+			// Read the *previous* frame's measurement here - before BeginQuery,
+			// not after EndQuery. Two reasons, both of which silently produced a
+			// column of zeros when this was written the other way round:
+			//   * Diligent re-allocates the query's query-heap slots inside
+			//     BeginQuery, so the old timestamps are gone once a new frame has
+			//     started;
+			//   * the fence the measurement is compared against is only reached
+			//     once the frame that produced it has been submitted *and*
+			//     waited on - which happens in the present pass, i.e. before the
+			//     next frame's passes run.
+			// GetData is a non-blocking poll: it returns false while the frame is
+			// still in flight, in which case the previous value is kept.
+			if (gpuEnded[slot]) {
+				D::QueryDataDuration data;
+				if (query->GetData(&data, sizeof(data), false) && data.Frequency != 0) {
+					const F64 ms = (F64)data.Duration / (F64)data.Frequency * 1000.0;
+					RenderPassGpuTime& t = gpuStats[slot];
+					t.lastMs = ms;
+					t.maxMs = (std::max)(t.maxMs, ms);
+					t.averageMs = (t.averageMs == 0.0) ? ms : (t.averageMs * 0.9 + ms * 0.1);
+				}
+			}
+
+			gpuCtx->BeginQuery(query);
+			const Result<void, CoreError> result = fn(frame);
+			gpuCtx->EndQuery(query);
+			gpuEnded[slot] = 1;
+			return result;
+		};
+	}
+
+	/// @brief Create the query objects (once) and remember the context to submit them on.
+	void prepareGpuTiming(D::IRenderDevice* device, D::IDeviceContext* ctx) {
+		gpuCtx = ctx;
+		if (!device || !ctx) { gpuTiming = false; return; }
+		if (gpuQueries.size() != nextGpuSlot) gpuQueries.resize(nextGpuSlot);
+		for (Size i = 0; i < gpuQueries.size(); ++i) {
+			if (gpuQueries[i]) continue;
+			D::QueryDesc desc;
+			desc.Name = "RenderPipeline pass timer";
+			desc.Type = D::QUERY_TYPE_DURATION;
+			device->CreateQuery(desc, &gpuQueries[i]);
+			if (!gpuQueries[i]) {
+				EError("RenderPipeline '{}': duration queries unavailable - per-pass GPU times are disabled.", m_pipeline->name());
+				gpuTiming = false;
+				gpuQueries.clear();
+				return;
+			}
+		}
+		EInfo("RenderPipeline '{}': per-pass GPU timers enabled ({} duration queries).",
+			m_pipeline->name(), gpuQueries.size());
+	}
+
+	/// @return Whether any pass produced a GPU measurement so far.
+	bool anyGpuMeasured() const {
+		for (const RenderPassGpuTime& t : gpuStats)
+			if (t.averageMs > 0.0) return true;
+		return false;
+	}
 
 	/// @brief Register a dependency, logging if the ids are somehow invalid.
 	void link(PipelineTaskId dependent, PipelineTaskId dependency) {
@@ -73,7 +176,7 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 	// shadow - cascaded shadow map. Raster only: the hybrid path takes its
 	// shadows from the ray trace, and no G-buffer shader samples the shadow map.
 	// ------------------------------------------------------------------
-	addTask(RenderPass::Shadow, [this, c](const PipelineFrameContext& context) -> Result<void, CoreError> {
+	addTask(RenderPass::Shadow, impl->timed([this, c](const PipelineFrameContext& context) -> Result<void, CoreError> {
 		RenderFrame& frame = *static_cast<RenderFrame*>(context.payload);
 		ShadowSubsystem& shadow = *c->shadow;
 		RenderSubsystem& renderer = *c->renderer;
@@ -108,13 +211,13 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 		// needs the same cascades.
 		c->meshShader->setShadowMap(renderer.getShadowSRV(), cascadeUV, splits);
 		return {};
-	}, PipelineTaskMode::MainThread, c->shadow);
+	}), PipelineTaskMode::MainThread, c->shadow);
 
 	// ------------------------------------------------------------------
 	// rtScene - BLAS/TLAS update. Independent of every raster pass, so it shares
 	// the first level with the shadow and G-buffer passes.
 	// ------------------------------------------------------------------
-	addTask(RenderPass::RtScene, [c](const PipelineFrameContext& context) -> Result<void, CoreError> {
+	addTask(RenderPass::RtScene, impl->timed([c](const PipelineFrameContext& context) -> Result<void, CoreError> {
 		RenderFrame& frame = *static_cast<RenderFrame*>(context.payload);
 		if (frame.rtGroups.empty()) return {};
 		const Result<void, RenderError> result = c->rayTracing->updateScene(frame.rtGroups);
@@ -123,12 +226,12 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 			return toCoreError(result.error());
 		}
 		return {};
-	}, PipelineTaskMode::MainThread, c->rayTracing);
+	}), PipelineTaskMode::MainThread, c->rayTracing);
 
 	// ------------------------------------------------------------------
 	// scene - shaded pass into the HDR target (raster).
 	// ------------------------------------------------------------------
-	PipelineTaskId scene = addTask(RenderPass::Scene, [this, c](const PipelineFrameContext& context) -> Result<void, CoreError> {
+	PipelineTaskId scene = addTask(RenderPass::Scene, impl->timed([this, c](const PipelineFrameContext& context) -> Result<void, CoreError> {
 		RenderFrame& frame = *static_cast<RenderFrame*>(context.payload);
 		RenderSubsystem& renderer = *c->renderer;
 
@@ -169,13 +272,13 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 		renderer.endFrame();
 		renderer.setRenderTarget(nullptr);
 		return {};
-	}, PipelineTaskMode::MainThread, c->renderer);
+	}), PipelineTaskMode::MainThread, c->renderer);
 	impl->link(scene, passId(RenderPass::Shadow));
 
 	// ------------------------------------------------------------------
 	// gbuffer - hybrid G-buffer pass.
 	// ------------------------------------------------------------------
-	PipelineTaskId gbuffer = addTask(RenderPass::GBuffer, [this, c](const PipelineFrameContext& context) -> Result<void, CoreError> {
+	PipelineTaskId gbuffer = addTask(RenderPass::GBuffer, impl->timed([this, c](const PipelineFrameContext& context) -> Result<void, CoreError> {
 		RenderFrame& frame = *static_cast<RenderFrame*>(context.payload);
 		RenderSubsystem& renderer = *c->renderer;
 
@@ -215,13 +318,13 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 		frame.sourceEmissive = frame.gBufferEmissive;
 		frame.sourceDepth = frame.gBufferDepth;
 		return {};
-	}, PipelineTaskMode::MainThread, c->renderer);
+	}), PipelineTaskMode::MainThread, c->renderer);
 
 	// ------------------------------------------------------------------
 	// resolve - MSAA G-buffer down to single-sample targets, which the trace and
 	// compose compute shaders read. Skipped at 1x.
 	// ------------------------------------------------------------------
-	PipelineTaskId resolve = addTask(RenderPass::Resolve, [c](const PipelineFrameContext& context) -> Result<void, CoreError> {
+	PipelineTaskId resolve = addTask(RenderPass::Resolve, impl->timed([c](const PipelineFrameContext& context) -> Result<void, CoreError> {
 		RenderFrame& frame = *static_cast<RenderFrame*>(context.payload);
 		RenderSubsystem& renderer = *c->renderer;
 
@@ -240,13 +343,13 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 		frame.sourceEmissive = frame.resolveEmissive;
 		frame.sourceDepth = frame.resolveDepth;
 		return {};
-	}, PipelineTaskMode::MainThread, c->renderer);
+	}), PipelineTaskMode::MainThread, c->renderer);
 	impl->link(resolve, gbuffer);
 
 	// ------------------------------------------------------------------
 	// trace - shadow + reflection rays against the G-buffer.
 	// ------------------------------------------------------------------
-	PipelineTaskId trace = addTask(RenderPass::Trace, [c](const PipelineFrameContext& context) -> Result<void, CoreError> {
+	PipelineTaskId trace = addTask(RenderPass::Trace, impl->timed([c](const PipelineFrameContext& context) -> Result<void, CoreError> {
 		RenderFrame& frame = *static_cast<RenderFrame*>(context.payload);
 		RenderSubsystem& renderer = *c->renderer;
 
@@ -260,13 +363,13 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 			return toCoreError(result.error());
 		}
 		return {};
-	}, PipelineTaskMode::MainThread, c->rayTracing);
+	}), PipelineTaskMode::MainThread, c->rayTracing);
 	impl->link(trace, { resolve, passId(RenderPass::RtScene) });
 
 	// ------------------------------------------------------------------
 	// denoise - NRD, else OIDN / temporal.
 	// ------------------------------------------------------------------
-	PipelineTaskId denoise = addTask(RenderPass::Denoise, [c](const PipelineFrameContext& context) -> Result<void, CoreError> {
+	PipelineTaskId denoise = addTask(RenderPass::Denoise, impl->timed([c](const PipelineFrameContext& context) -> Result<void, CoreError> {
 		RenderFrame& frame = *static_cast<RenderFrame*>(context.payload);
 		RenderSubsystem& renderer = *c->renderer;
 		const Mat4 viewProj = frame.proj * frame.view;
@@ -309,13 +412,13 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 		// Gated on the RT subsystem, not on NRD: the pass falls back to the ray
 		// tracer's own OIDN/temporal filter when NRD is unavailable, so NRD being
 		// down must not disable denoising altogether.
-	}, PipelineTaskMode::MainThread, c->rayTracing);
+	}), PipelineTaskMode::MainThread, c->rayTracing);
 	impl->link(denoise, trace);
 
 	// ------------------------------------------------------------------
 	// compose - blend the traced result over the skybox into the HDR target.
 	// ------------------------------------------------------------------
-	PipelineTaskId compose = addTask(RenderPass::Compose, [c](const PipelineFrameContext& context) -> Result<void, CoreError> {
+	PipelineTaskId compose = addTask(RenderPass::Compose, impl->timed([c](const PipelineFrameContext& context) -> Result<void, CoreError> {
 		RenderFrame& frame = *static_cast<RenderFrame*>(context.payload);
 		RenderSubsystem& renderer = *c->renderer;
 
@@ -338,7 +441,7 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 		renderer.endFrame();
 		renderer.setRenderTarget(nullptr);
 		return {};
-	}, PipelineTaskMode::MainThread, c->rayTracing);
+	}), PipelineTaskMode::MainThread, c->rayTracing);
 	impl->link(compose, denoise);
 
 	// ------------------------------------------------------------------
@@ -346,32 +449,32 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 	// disabled by the frame mode; a skipped dependency is not a failure, so the
 	// tail always runs.
 	// ------------------------------------------------------------------
-	PipelineTaskId uiPost = addTask(RenderPass::UiPost, [c](const PipelineFrameContext&) -> Result<void, CoreError> {
+	PipelineTaskId uiPost = addTask(RenderPass::UiPost, impl->timed([c](const PipelineFrameContext&) -> Result<void, CoreError> {
 		c->ui->beginFrame(false);
 		c->ui->endFrame();
 		return {};
-	}, PipelineTaskMode::MainThread, c->ui);
+	}), PipelineTaskMode::MainThread, c->ui);
 	impl->link(uiPost, { scene, compose });
 
-	PipelineTaskId postExecute = addTask(RenderPass::PostExecute, [c](const PipelineFrameContext&) -> Result<void, CoreError> {
+	PipelineTaskId postExecute = addTask(RenderPass::PostExecute, impl->timed([c](const PipelineFrameContext&) -> Result<void, CoreError> {
 		c->postProcess->execute();
 		return {};
-	}, PipelineTaskMode::MainThread, c->postProcess);
+	}), PipelineTaskMode::MainThread, c->postProcess);
 	impl->link(postExecute, uiPost);
 
-	PipelineTaskId uiLate = addTask(RenderPass::UiLate, [c](const PipelineFrameContext&) -> Result<void, CoreError> {
+	PipelineTaskId uiLate = addTask(RenderPass::UiLate, impl->timed([c](const PipelineFrameContext&) -> Result<void, CoreError> {
 		c->ui->beginFrame(true);
 		c->ui->endFrame();
 		return {};
-	}, PipelineTaskMode::MainThread, c->ui);
+	}), PipelineTaskMode::MainThread, c->ui);
 	impl->link(uiLate, postExecute);
 
 	// The application calls debugUI.beginFrame() earlier in the frame to build
 	// the UI; this pass only renders it.
-	PipelineTaskId debugUi = addTask(RenderPass::DebugUi, [c](const PipelineFrameContext&) -> Result<void, CoreError> {
+	PipelineTaskId debugUi = addTask(RenderPass::DebugUi, impl->timed([c](const PipelineFrameContext&) -> Result<void, CoreError> {
 		c->debugUI->endFrameAndRender();
 		return {};
-	}, PipelineTaskMode::MainThread, c->debugUI);
+	}), PipelineTaskMode::MainThread, c->debugUI);
 	impl->link(debugUi, uiLate);
 
 	PipelineTaskId present = addTask(RenderPass::Present, [c](const PipelineFrameContext&) -> Result<void, CoreError> {
@@ -421,7 +524,23 @@ Result<void, CoreError> RenderPipeline::render(RenderFrame& frame) {
 	m_impl->elapsedTime += frame.deltaTime;
 	context.elapsedTime = m_impl->elapsedTime;
 	context.payload = &frame;
-	return run(context);
+
+	// First frame: create the per-pass GPU timers on the device we are about to
+	// submit to. Failure is not fatal - the table simply keeps showing CPU times.
+	if (m_impl->gpuTiming && m_impl->gpuQueries.size() != m_impl->nextGpuSlot) {
+		auto* device = static_cast<D::IRenderDevice*>(m_impl->context.renderer->getDevice());
+		auto* ctx = static_cast<D::IDeviceContext*>(m_impl->context.renderer->getContext());
+		m_impl->prepareGpuTiming(device, ctx);
+	}
+
+	const Result<void, CoreError> result = run(context);
+	if (m_impl->gpuTiming && context.frameIndex == 240 && !m_impl->anyGpuMeasured()) {
+		// The queries exist but never became readable: say so instead of leaving a
+		// silent column of zeros in the statistics.
+		EWarn("RenderPipeline '{}': per-pass GPU timers produced no data in {} frames (the query readback is not completing).",
+			name(), context.frameIndex + 1);
+	}
+	return result;
 }
 
 Result<void, CoreError> RenderPipeline::setPassEnabled(StringView passName, bool enabled) {
@@ -442,5 +561,17 @@ PipelineTaskId RenderPipeline::passId(StringView passName) const {
 }
 
 const Vector<PipelineTaskStats>& RenderPipeline::passStats() const { return taskStats(); }
+
+const Vector<RenderPassGpuTime>& RenderPipeline::passGpuStats() const { return m_impl->gpuStats; }
+
+void RenderPipeline::setGpuTiming(bool enabled) {
+	m_impl->gpuTiming = enabled;
+	// Clear the table either way: a stale column is worse than an empty one, and
+	// after re-enabling the first measurement has to start a fresh Begin/End cycle.
+	for (RenderPassGpuTime& t : m_impl->gpuStats) t = RenderPassGpuTime{};
+	for (UInt8& ended : m_impl->gpuEnded) ended = 0;
+}
+
+bool RenderPipeline::gpuTiming() const { return m_impl->gpuTiming; }
 
 EE_NAMESPACE_RENDERING_END

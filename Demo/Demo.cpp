@@ -379,7 +379,9 @@ float4 main(PSIn i) : SV_TARGET {
 	F32  msClusterBudget = 262144.0f; // hard cap on cluster mesh groups dispatched per frame
 	int  msDebugTri = 0;         // MS diagnostic: 0 = off, 1 = fixed triangle, 2 = albedo only
 	int  msMeshFilter = 5;       // MS diagnostic: 0..4 = only that mesh, >4 = all
-	UInt32 rtReflectionSamples = 4; // GGX reflection rays per pixel (1..8)
+	UInt32 rtReflectionSamples = 8; // GGX VNDF reflection ray budget per pixel (1..8); smooth surfaces spend fewer
+	F32 rtReflectionCone = 1.0f;    // ray-cone prefilter strength (0 = offset-free LOD0 sampling, 1 = lobe-matched mip)
+	UInt32 rtReflectionShadowPCF = 1; // shadow rays per reflection hit (1 = single ray; >1 = PCSS+PCF)
 	float rtResScale = 0.5f; // RT resolution scale (0.5 / 1.0)
 	bool rtResAuto = true;   // auto-pick the scale from the distance to the nearest object
 	TextureHandle gbufColor, gbufNormal, gbufEmissive, gbufDepth, rtTex;
@@ -952,15 +954,31 @@ HALT
 			debugUI.text("RT trace: {:.2f} ms", rayTracing.lastTraceMs());
 		}
 
-		// ---- Render pipeline: pass graph and per-pass timing ----
+		// ---- Render pipeline: pass graph, CPU and GPU time per pass ----
 		if (renderPipeline) {
 			const auto& run = renderPipeline->lastRunStats();
 			debugUI.text("  frame {:.2f} ms | run {} skip {} fail {} | {} lv, widest {}",
 				run.totalMs, run.tasksRun, run.tasksSkipped, run.tasksFailed,
 				run.levelCount, run.maxLevelWidth);
-			for (const auto& pass : renderPipeline->passStats()) {
-				debugUI.text("  {:<11} {:>7.2f} ms  (avg {:>6.2f}, max {:>6.2f})  {}",
-					pass.name, pass.lastMs, pass.averageMs, pass.maxMs, ToString(pass.status));
+			// cpu = time spent recording the pass (all GPU passes are cheap here);
+			// gpu = the work the pass actually put on the GPU, read one frame late.
+			// 'present' has no gpu value: the frame is submitted and waited on
+			// there, so its cpu time is where the whole GPU frame shows up.
+			const auto& gpu = renderPipeline->passGpuStats();
+			const auto& stats = renderPipeline->passStats();
+			for (size_t i = 0; i < stats.size(); i++) {
+				const auto& pass = stats[i];
+				// A skipped pass has no measurement of its own (the timers never
+				// ran), so keep its GPU column at zero instead of showing the last
+				// frame it did run.
+				const bool ran = pass.status == PipelineTaskStatus::Succeeded || pass.status == PipelineTaskStatus::Failed;
+				const F64 gpuMs = (ran && i < gpu.size()) ? gpu[i].lastMs : 0.0;
+				const F64 gpuMax = (ran && i < gpu.size()) ? gpu[i].maxMs : 0.0;
+				debugUI.text("  {:<11} cpu {:>6.2f} | gpu {:>6.2f} (max {:>6.2f}) | cpu avg {:>6.2f} max {:>6.2f} | {}",
+					pass.name, pass.lastMs, gpuMs, gpuMax, pass.averageMs, pass.maxMs, ToString(pass.status));
+			}
+			if (debugUI.button(fmt::format("GPU pass timers: {}", renderPipeline->gpuTiming() ? "On" : "Off").c_str())) {
+				renderPipeline->setGpuTiming(!renderPipeline->gpuTiming());
 			}
 		}
 		else {
@@ -968,9 +986,9 @@ HALT
 		}
 		debugUI.text("Mode: {} (F9)", hybridRT ? "Hybrid RT" : "Raster");
 		if (hybridRT) {
-			static const char* rtModeNames[] = { "Shaded", "GBufferColor", "GBufferNormal", "Diffuse", "Reflections", "Fresnel", "RTAlpha" };
+			static const char* rtModeNames[] = { "Shaded", "GBufferColor", "GBufferNormal", "Diffuse", "Reflections", "Fresnel", "RTAlpha", "BackFacingNormals" };
 			if (debugUI.button(fmt::format("RT View: {}", rtModeNames[rtDrawMode]).c_str())) {
-				rtDrawMode = (rtDrawMode + 1) % 7;
+				rtDrawMode = (rtDrawMode + 1) % 8;
 			}
 			static const char* rtResNames[] = { "Auto", "Full", "Half" };
 			// Auto(0) / Full(1) / Half(2) cycle.
@@ -999,9 +1017,21 @@ HALT
 				}
 			}
 			if (debugUI.sliderFloat("Refl Blur", &rtReflectionBlur, 0.0f, 1.0f)) {}
+			// Ray-cone prefiltering: 1 = every ray reads the mip that matches its
+			// lobe (stable), 0 = raw level 0 (aliased, for comparison).
+			if (debugUI.sliderFloat("Refl Cone", &rtReflectionCone, 0.0f, 1.0f)) {}
+			// Shadow cost inside reflections: 1 = one ray per reflection hit, which
+			// is what the lobe blur and the denoiser can actually use; higher values
+			// restore the soft PCSS+PCF path (roughly doubles/triples trace()).
+			{
+				float rsf = (float)rtReflectionShadowPCF;
+				if (debugUI.sliderFloat("Refl Shadow", &rsf, 1.0f, 8.0f)) {
+					rtReflectionShadowPCF = (UInt32)(rsf + 0.5f);
+				}
+			}
 			{
 				float rsF = (float)rtReflectionSamples;
-				if (debugUI.sliderFloat("Refl Samples", &rsF, 1.0f, 8.0f)) {
+				if (debugUI.sliderFloat("Refl Max Rays", &rsF, 1.0f, 16.0f)) {
 					rtReflectionSamples = (UInt32)(rsF + 0.5f);
 				}
 			}
@@ -1549,6 +1579,14 @@ HALT
 				frame.rtConstants.maxBounces = rtMaxBounces;
 				frame.rtConstants.bounceRoughness = rtBounceRoughness;
 				frame.rtConstants.reflectionSamples = rtReflectionSamples;
+				frame.rtConstants.reflectionCone = rtReflectionCone;
+				frame.rtConstants.reflectionShadowPCF = rtReflectionShadowPCF;
+				// One pixel's angular size: seeds the reflection ray cone whose
+				// width at the hit picks the prefiltered texture / sky level.
+				{
+					auto camDesc = fly.toDesc(ww, wh);
+					frame.rtConstants.rayConePixelAngle = 2.0f * std::tan(glm::radians(camDesc.fov) * 0.5f) / (F32)std::max(wh, 1u);
+				}
 				{
 					static Vec4 s_disc[8];
 					static bool s_discInit = false;

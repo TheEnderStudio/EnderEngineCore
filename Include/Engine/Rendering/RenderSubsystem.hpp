@@ -231,6 +231,31 @@ public:
 	/// @brief Create a mesh from a descriptor (vertices, indices, submeshes).
 	Result<MeshHandle, RenderError> createMesh(const MeshDesc& desc);
 
+	/**
+	 * @brief Orient vertex normals so they agree with the triangle winding.
+	 *
+	 * Assets exported with flipped normals look almost fine in a rasterizer that
+	 * shades with a wrapped Lambert term (the surface is still lit, just from the
+	 * wrong side), but everything that uses the normal *direction* breaks:
+	 *   * the ray traced reflection lobe collapses - dot(N, V) <= 0 zeroes NdotV,
+	 *     and with it G2 and every VNDF sample weight, so the reflection comes out
+	 *     exactly black while the diffuse term still looks normal;
+	 *   * ambient occlusion samples the hemisphere behind the surface;
+	 *   * the G-buffer stores the opposite of the visible side.
+	 *
+	 * Each vertex is compared against the area-weighted winding normal of its
+	 * incident triangles - the orientation the rasterizer culls and draws with -
+	 * and flipped when the two disagree. createMesh() runs this automatically, so
+	 * every consumer (resident buffers, mesh shader pools, ray tracing scene
+	 * buffers) sees corrected data; it is public because tools that want to report
+	 * or repair an asset use the exact same rule.
+	 *
+	 * @param vertices Vertex array, corrected in place.
+	 * @param indices  Triangle indices.
+	 * @return Number of vertices that were flipped.
+	 */
+	static UInt32 orientNormalsToWinding(Vector<Vertex>& vertices, const Vector<UInt32>& indices);
+
 	// -------------------------------------------------------------------
 	// Texture management
 	// -------------------------------------------------------------------
