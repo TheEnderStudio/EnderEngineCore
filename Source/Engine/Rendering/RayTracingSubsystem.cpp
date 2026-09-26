@@ -282,10 +282,52 @@ float4 GetSkyColorLod(float3 Dir, float lod)
     return float4(lerp(c01, c23, w.z), 1.0);
 }
 
+// -------------------------------------------------------------------
+// GGX terms.
+//
+// Shared by the reflection lobe (which samples the visible normal distribution)
+// and by the per-hit shading of a reflection, which needs the same microfacet
+// terms the rasterizer's forward model uses. Declared above Reflect() because
+// both use them.
+// -------------------------------------------------------------------
+
+// GGX/Trowbridge-Reitz normal distribution (a = alpha = roughness^2).
+float D_GGX(float NdotH, float a)
+{
+    float a2 = a * a;
+    float d  = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / max(3.14159265358979 * d * d, 1e-8);
+}
+
+// Schlick Fresnel. F0 is the material's normal-incidence reflectance, which for
+// metals is the base colour.
+float3 F_Schlick(float3 F0, float VdotH)
+{
+    return F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+}
+
+// Smith GGX geometry term for a single direction (a = alpha = roughness^2).
+float SmithG1(float NdotX, float a)
+{
+    float a2 = a * a;
+    return 2.0 * NdotX / max(NdotX + sqrt(a2 + (1.0 - a2) * NdotX * NdotX), 1e-4);
+}
+
+// Height-correlated Smith G2 (Heitz 2014): masks the two directions jointly,
+// which is both more accurate than G1(V)*G1(L) and cheaper to keep bounded.
+float SmithG2(float NdotV, float NdotL, float a)
+{
+    float a2 = a * a;
+    float gv = sqrt(max(a2 + (1.0 - a2) * NdotV * NdotV, 0.0));
+    float gl = sqrt(max(a2 + (1.0 - a2) * NdotL * NdotL, 0.0));
+    return 2.0 * NdotL * NdotV / max(NdotL * gv + NdotV * gl, 1e-5);
+}
+
 struct ReflectionResult {
     float4 BaseColor;
     float  NdotL;
     float3 Emissive; ///< Self-emission of the hit surface (not light-tinted).
+    float3 Specular; ///< Direct + ambient specular of the hit surface.
     bool   Found;
 };
 
@@ -359,6 +401,7 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
     res.BaseColor = float4(0, 0, 0, 0);
     res.NdotL     = 0.0;
     res.Emissive  = float3(0, 0, 0);
+    res.Specular  = float3(0, 0, 0);
     res.Found     = false;
 
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
@@ -406,13 +449,44 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
         // this used to compute, every hit facing away from the sun contributed
         // only the 0.1 ambient - so a reflection of shaded geometry came out much
         // darker than the very same geometry looks in the raster path.
+        float  shadowTerm = 0.0;
         {
             float3 HitPos   = Origin + ReflDir * q.CommittedRayT();
             float  NdotLraw = dot(LightDir, Norm);
-            res.NdotL = saturate(NdotLraw * 0.5 + 0.5)
-                      * ReflectionShadow(HitPos, LightDir, MaxShadowLen, Norm, length(HitPos - CameraPos), NdotLraw);
+            shadowTerm = ReflectionShadow(HitPos, LightDir, MaxShadowLen, Norm, length(HitPos - CameraPos), NdotLraw);
+            res.NdotL = saturate(NdotLraw * 0.5 + 0.5) * shadowTerm;
         }
         res.Found     = true;
+
+        // Direct + ambient specular of the hit point.
+        //
+        // Without this a reflection of a metal surface looked exactly like a
+        // reflection of a matte one: the hit was only ever shaded with albedo and
+        // a diffuse term. Nothing new is needed for it - the scene data already
+        // carries per-material roughness/metallic, and the same GGX/D/G terms the
+        // reflection lobe uses apply here (view direction of the hit = the
+        // incoming reflection ray).
+        {
+            const float  aHit  = max(Mtr.Roughness * Mtr.Roughness, 1e-4);
+            const float3 Vhit  = -ReflDir;
+            const float3 Hhit  = normalize(LightDir + Vhit);
+            const float  NdotL = saturate(dot(Norm, LightDir));
+            const float  NdotV = saturate(dot(Norm, Vhit));
+            const float  NdotH = saturate(dot(Norm, Hhit));
+            const float  VdotH = saturate(dot(Vhit, Hhit));
+            // Metals reflect their base colour, dielectrics a flat 4%.
+            const float3 F0    = lerp(float3(0.04, 0.04, 0.04), res.BaseColor.rgb, Mtr.Metallic);
+            const float3 F     = F_Schlick(F0, VdotH);
+            const float  DG    = D_GGX(NdotH, aHit) * SmithG2(NdotV, NdotL, aHit);
+            const float  denom = max(4.0 * NdotV * max(NdotL, 1e-3), 1e-4);
+            res.Specular = F * (DG / denom) * g_RTConstants.LightColor.rgb
+                         * g_RTConstants.LightIntensity * NdotL * shadowTerm;
+            // Ambient specular: the hit surface also mirrors its surroundings.
+            // Without an environment map at hand this is approximated with the
+            // ambient term tinted by F0, which is what keeps metal readable in
+            // shadow instead of flat.
+            res.Specular += F0 * g_RTConstants.AmbientLight * g_RTConstants.LightColor.rgb;
+        }
 
         // Two-bounce: reflect again from the hit point on surfaces at or below
         // the roughness threshold (BounceRoughness = 1.0 forces all surfaces).
@@ -550,22 +624,8 @@ void BuildONB(float3 N, out float3 T, out float3 B)
     B = float3(b, s + N.y * N.y * k, -N.y);
 }
 
-// Smith GGX geometry term for a single direction (a = alpha = roughness^2).
-float SmithG1(float NdotX, float a)
-{
-    float a2 = a * a;
-    return 2.0 * NdotX / max(NdotX + sqrt(a2 + (1.0 - a2) * NdotX * NdotX), 1e-4);
-}
-
-// Height-correlated Smith G2 (Heitz 2014): masks the two directions jointly,
-// which is both more accurate than G1(V)*G1(L) and cheaper to keep bounded.
-float SmithG2(float NdotV, float NdotL, float a)
-{
-    float a2 = a * a;
-    float gv = sqrt(max(a2 + (1.0 - a2) * NdotV * NdotV, 0.0));
-    float gl = sqrt(max(a2 + (1.0 - a2) * NdotL * NdotL, 0.0));
-    return 2.0 * NdotL * NdotV / max(NdotL * gv + NdotV * gl, 1e-5);
-}
+// Smith G1/G2 live next to D_GGX above (they are shared with the reflection-hit
+// shading, which is declared earlier in this file).
 
 // Sample the GGX distribution of visible normals. Ve is the view direction in
 // tangent space (z = surface normal, Ve.z > 0); returns the half-vector in
@@ -780,7 +840,7 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
                 // color (consistent with the compose diffuse term); self-emission of
                 // the hit surface added afterwards, untinted.
                 float3 lit = (g_RTConstants.AmbientLight + max(0.0, refl.NdotL) * g_RTConstants.LightIntensity) * lightColor;
-                rad = refl.BaseColor.rgb * lit + refl.Emissive.rgb;
+                rad = refl.BaseColor.rgb * lit + refl.Emissive.rgb + refl.Specular;
             }
             else
                 rad = GetSkyColorLod(L, skyLod).rgb;
