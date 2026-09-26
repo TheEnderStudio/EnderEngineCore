@@ -739,8 +739,10 @@ struct SceneConstants { // 264 B payload (buffer 320 B; layout matches the HLSL 
 	Vec4   lightColor = Vec4(1, 1, 1, 1); // 336: rgb = sun colour, a = sun intensity
 	Mat4   shadowMapUVDepth[4] = {};      // 352: world -> shadow UV/depth, one per cascade
 	Vec4   cascadeSplits = Vec4(0);       // 608: camera-space far distance of cascades 0..2
-}; // 624 B (buffer 1024 B)
-static_assert(sizeof(SceneConstants) == 624, "SceneConstants must match the HLSL cbuffer layout");
+	Vec4   skyCorners[8] = {};            // 624: skybox corner colours (bit0=x+, bit1=y+, bit2=z+)
+	                                      //      -> the ambient term is derived from them, see SkyIrradiance
+}; // 752 B (buffer 1024 B)
+static_assert(sizeof(SceneConstants) == 752, "SceneConstants must match the HLSL cbuffer layout");
 
 struct SceneMeshInfo { // 96 B (16-byte aligned; layout must match the HLSL struct)
 	Vec4   center;           // 0  mesh-local LOD0 bounding-sphere center
@@ -1698,7 +1700,37 @@ cbuffer cbSceneConstants : register(b0) {
     float4   g_LightColor;
     float4x4 g_ShadowMapUVDepth[4];
     float4   g_CascadeSplits;
+    float4   g_SkyCorners[8];   // 8 skybox corner colours, see SkyIrradiance below
 };
+
+// Diffuse irradiance of the analytic sky.
+//
+// The 8-corner skybox is trilinear in the direction, which to first order is
+// A + dot(B, l), with A the mean of the corners and B_i the mean of the corners
+// that have the i-th bit set minus A. The cosine-weighted average of such a
+// function over the hemisphere around n is A + (2/3) * dot(B, n) - the 2/3 is the
+// standard cosine-weighted mean of a linear function - so the ambient becomes both
+// directional (bright from the sky, ground bounce from below) and coloured by the
+// sky, instead of a flat grey that lights every surface identically.
+// When no skybox is set the corners are filled with the ambient colour, which
+// makes this fall back to exactly the old behaviour.
+float3 SkyIrradiance(float3 n)
+{
+    float3 A = float3(0, 0, 0);
+    float3 B[3] = { float3(0, 0, 0), float3(0, 0, 0), float3(0, 0, 0) };
+    [unroll]
+    for (int j = 0; j < 8; ++j)
+    {
+        const float3 c = g_SkyCorners[j].rgb;
+        A += c * 0.125;
+        [unroll]
+        for (int i = 0; i < 3; ++i)
+            if (((j >> i) & 1) != 0) B[i] += c * 0.25;
+    }
+    [unroll]
+    for (int i = 0; i < 3; ++i) B[i] -= A;
+    return max(A + (2.0 / 3.0) * (B[0] * n.x + B[1] * n.y + B[2] * n.z), 0.0);
+}
 struct MaterialGPU {
     float4 baseColor;
     float4 emissive;
@@ -1788,8 +1820,9 @@ float4 main(in PSInput i) : SV_TARGET {
 
     // Same shading model as the forward PBR shader: ambient + one directional
     // light with half-Lambert diffuse and a Blinn specular lobe, attenuated by
-    // the cascaded shadow map.
-    float3 col = g_Ambient.rgb * g_Ambient.a * bc;
+    // the cascaded shadow map. The ambient is the sky's irradiance, so it carries
+    // the sky's colour and direction (g_Ambient.a still scales it).
+    float3 col = SkyIrradiance(N) * g_Ambient.a * bc;
     {
         float3 Ldir = normalize(-g_LightDir.xyz);
         float  NdotL = dot(N, Ldir) * 0.5 + 0.5;
@@ -3047,6 +3080,14 @@ Result<void, RenderError> MeshShaderSubsystem::drawSceneImpl(const Vector<MeshDr
 		// splits stay 0 so the last slice of the always-lit dummy is used.
 		for (int i = 0; i < 4; ++i) cb.shadowMapUVDepth[i] = p.shadowUV[i];
 		cb.cascadeSplits = p.cascadeSplits;
+		// Sky colours feed the ambient irradiance (SkyIrradiance in the pixel
+		// shader). Without a skybox the corners are filled with the ambient colour,
+		// which degenerates the irradiance back to exactly the old flat ambient.
+		{
+			Vec4 skyCorners[8];
+			const bool haveSky = p.renderer->getSkyboxCorners(skyCorners);
+			for (int i = 0; i < 8; ++i) cb.skyCorners[i] = haveSky ? skyCorners[i] : cb.ambient;
+		}
 		Vec3 sunDir(0); Vec4 sunColor(1, 1, 1, 1);
 		if (p.renderer->getPrimaryDirectionalLight(sunDir, sunColor)) {
 			cb.lightDir = Vec4(glm::normalize(sunDir), 0.0f);

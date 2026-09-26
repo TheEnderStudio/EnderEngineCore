@@ -453,6 +453,17 @@ public:
 	/// @brief Set skybox parameters (call before beginFrame).
 	void setSkybox(const SkyboxDesc& desc);
 
+	/**
+	 * @brief Read the skybox corner colours that are currently set.
+	 *
+	 * The ambient light is derived from them (see the mesh shader path's
+	 * SkyIrradiance), so anything that shades without going through the skybox
+	 * draw needs them too.
+	 * @param outCorners Filled with the 8 corner colours (bit0=x+, bit1=y+, bit2=z+).
+	 * @return false when no skybox is set, in which case the array is untouched.
+	 */
+	EE_NODISCARD bool getSkyboxCorners(Vec4 outCorners[8]) const;
+
 	/// @brief Remove skybox.
 	void clearSkybox();
 

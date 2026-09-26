@@ -2228,6 +2228,11 @@ void RenderSubsystem::clearShadowCascades(ShadowSubsystem& sh) {
 void RenderSubsystem::getCameraMatrices(Mat4& view, Mat4& proj) const { view = m_backend->cam.view; proj = m_backend->cam.proj; }
 void RenderSubsystem::setSkybox(const SkyboxDesc& d) { m_backend->skyDesc = d; }
 void RenderSubsystem::clearSkybox() { m_backend->skyDesc.reset(); }
+bool RenderSubsystem::getSkyboxCorners(Vec4 outCorners[8]) const {
+	if (!m_backend->skyDesc.has_value()) return false;
+	for (int i = 0; i < 8; ++i) outCorners[i] = m_backend->skyDesc->corners[i];
+	return true;
+}
 
 Result<TextureHandle, RenderError> RenderSubsystem::createCubemapTexture(const CubemapFace faces[6]) {
 	auto& b = *m_backend;
