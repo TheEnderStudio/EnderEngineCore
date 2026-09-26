@@ -240,7 +240,32 @@ cbuffer Frame : register(b0)
     float    _p1;
     float    _p2;
     float4x4 g_ShadowMapUVDepth[4]; float4 g_CascadeSplits;
+    float4   g_SkyCorners[8];   // skybox corners -> ambient irradiance, see SkyIrradiance
 };
+
+// Diffuse irradiance of the analytic sky (the same closed form the mesh shader and
+// ray tracing paths use). The 8-corner sky is trilinear in the direction, so to
+// first order it is A + dot(B, l) with A the corner mean and B_i the mean of the
+// corners carrying the i-th bit minus A; its cosine-weighted average around n is
+// A + (2/3) dot(B, n). That turns the flat ambient into environment lighting that
+// is bright and cool from above, ground-tinted from below.
+float3 SkyIrradiance(float3 n)
+{
+    float3 A = float3(0, 0, 0);
+    float3 B[3] = { float3(0, 0, 0), float3(0, 0, 0), float3(0, 0, 0) };
+    [unroll]
+    for (int j = 0; j < 8; ++j)
+    {
+        const float3 c = g_SkyCorners[j].rgb;
+        A += c * 0.125;
+        [unroll]
+        for (int i = 0; i < 3; ++i)
+            if (((j >> i) & 1) != 0) B[i] += c * 0.25;
+    }
+    [unroll]
+    for (int i = 0; i < 3; ++i) B[i] -= A;
+    return max(A + (2.0 / 3.0) * (B[0] * n.x + B[1] * n.y + B[2] * n.z), 0.0);
+}
 
 struct Light
 {
@@ -274,7 +299,9 @@ struct PSIn
 
 float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r)
 {
-    float3 col = g_Ambient.rgb * g_Ambient.a * bc;
+    // Ambient: the sky's irradiance along the normal (environment lighting instead
+    // of a flat colour). g_Ambient.a still scales it.
+    float3 col = SkyIrradiance(N) * g_Ambient.a * bc;
     for (uint i = 0; i < g_LightCount && i < 8; i++)
     {
         Light L = g_Lights[i];
@@ -705,6 +732,15 @@ struct RenderSubsystem::RenderBackend {
 	D::RefCntAutoPtr<D::ITexture> skyCubeTex;
 	D::RefCntAutoPtr<D::ITextureView> skyCubeSRV;
 	Optional<RenderSubsystem::SkyboxDesc> skyDesc;
+
+	/// @brief Copy the skybox corners into the frame constants.
+	///
+	/// The shaders derive the ambient light from them (SkyIrradiance); when no
+	/// skybox is set they are filled with the ambient colour, which degenerates the
+	/// irradiance back to the previous flat ambient instead of turning it black.
+	void applySkyCorners(FrameConstants& fc) const {
+		for (int i = 0; i < 8; ++i) fc.skyCorners[i] = skyDesc.has_value() ? skyDesc->corners[i] : fc.ambient;
+	}
 
 	CamData cam; CameraHandle camHandle;
 	Vec4 ambient = Vec4(0.30f, 0.30f, 0.35f, 1.0f);
@@ -1478,7 +1514,7 @@ struct RenderSubsystem::RenderBackend {
 		if (!pd) return;
 		ctx->SetPipelineState(pd->pso);
 		// Update frame CB: ViewProj = Proj * View (column-major, for mul(g_ViewProj, worldPos))
-		{ FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits; void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); } }
+		{ FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; applySkyCorners(fc); fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits; void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); } }
 		{ void* m = nullptr; ctx->MapBuffer(lightCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &lcBuf, sizeof(lcBuf)); ctx->UnmapBuffer(lightCB, D::MAP_WRITE); } }
 		D::Uint64 vo = 0; D::IBuffer* vbs[] = { md->vb.RawPtr() };
 		ctx->SetVertexBuffers(0, 1, vbs, &vo, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION, D::SET_VERTEX_BUFFERS_FLAG_RESET);
@@ -1532,7 +1568,7 @@ struct RenderSubsystem::RenderBackend {
 
 		ctx->SetPipelineState(pd->pso);
 		{
-			FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(camPos, 1.0f); fc.ambient = ambient; fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits;
+			FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(camPos, 1.0f); fc.ambient = ambient; applySkyCorners(fc); fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits;
 			void* m2 = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m2); if (m2) { memcpy(m2, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); }
 			D::IShaderResourceVariable* fv = pd->srb->GetVariableByName(D::SHADER_TYPE_VERTEX, "Frame");
 			if (fv) fv->Set(frameCB, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
@@ -1563,7 +1599,7 @@ struct RenderSubsystem::RenderBackend {
 		ctx->UpdateBuffer(instanceCB, 0, count * (D::Uint32)sizeof(Mat4), worldMatrices.data(), D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
 		ctx->SetPipelineState(pd->pso);
-		{ FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits; void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); } }
+		{ FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; applySkyCorners(fc); fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits; void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); } }
 		{ void* m = nullptr; ctx->MapBuffer(lightCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &lcBuf, sizeof(lcBuf)); ctx->UnmapBuffer(lightCB, D::MAP_WRITE); } }
 		D::Uint64 offsets[] = { 0, 0 };
 		D::IBuffer* pBuffs[] = { md->vb.RawPtr(), instanceCB.RawPtr() };
@@ -1592,7 +1628,7 @@ struct RenderSubsystem::RenderBackend {
 		auto* pd = psos.get(defPSO_Indirect.index, defPSO_Indirect.generation); if (!pd) return;
 
 		ctx->SetPipelineState(pd->pso);
-		{ FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits; void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); } }
+		{ FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; applySkyCorners(fc); fc.lightCount = (UInt32)activeLights.size(); for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits; void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); } }
 		{ void* m = nullptr; ctx->MapBuffer(lightCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &lcBuf, sizeof(lcBuf)); ctx->UnmapBuffer(lightCB, D::MAP_WRITE); } }
 		D::Uint64 vo = 0; D::IBuffer* vbs[] = { md->vb.RawPtr() };
 		ctx->SetVertexBuffers(0, 1, vbs, &vo, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION, D::SET_VERTEX_BUFFERS_FLAG_RESET);
@@ -1675,7 +1711,7 @@ struct RenderSubsystem::RenderBackend {
 
 		ctx->SetPipelineState(pd->pso);
 		{
-			FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; fc.lightCount = 0; for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits;
+			FrameConstants fc{}; fc.viewProj = cam.proj * cam.view; fc.cameraPos = Vec4(cam.desc.pos, 1.0f); fc.ambient = ambient; applySkyCorners(fc); fc.lightCount = 0; for(int i=0;i<4;i++) fc.shadowMapUVDepth[i]=shadowMapUVDepth[i]; fc.cascadeSplits = cascadeSplits;
 			void* m = nullptr; ctx->MapBuffer(frameCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &fc, sizeof(fc)); ctx->UnmapBuffer(frameCB, D::MAP_WRITE); }
 		}
 		{

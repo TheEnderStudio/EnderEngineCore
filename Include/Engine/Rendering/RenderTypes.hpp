@@ -236,6 +236,10 @@ struct alignas(16) FrameConstants {
 	UInt32 lightCount; F32 _p0; F32 _p1; F32 _p2;
 	Mat4 shadowMapUVDepth[4];
 	Vec4 cascadeSplits;
+	/// Skybox corner colours (bit0=x+, bit1=y+, bit2=z+). The ambient light is the
+	/// sky's irradiance, which is derived from them in the shaders; appended at the
+	/// end so shaders that do not read them keep working unchanged.
+	Vec4 skyCorners[8];
 };
 
 /// @brief Single light data in the light constant buffer.

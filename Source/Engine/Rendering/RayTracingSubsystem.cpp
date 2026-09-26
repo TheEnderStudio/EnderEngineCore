@@ -221,6 +221,34 @@ float ReflectionShadow(float3 Origin, float3 LightDir, float MaxRayLength, float
     return CastShadowPCF(Origin, LightDir, MaxRayLength, Norm, DistToCam);
 }
 
+// Diffuse irradiance of the analytic sky gradient.
+//
+// The 8-corner sky is trilinear in the direction, so to first order it is
+// A + dot(B, l) (A = mean of the corners, B_i = mean of the corners with the i-th
+// bit set minus A), and its cosine-weighted average around n is A + (2/3) dot(B, n).
+// Returning the ratio to the sky's mean keeps the ambient *level* exactly where the
+// caller's AmbientLight puts it and only adds the direction - bright from the sky,
+// ground bounce from below - which is what the flat scalar ambient was missing.
+float SkyIrradianceRatio(float3 n)
+{
+    float3 A = float3(0, 0, 0);
+    float3 B[3] = { float3(0, 0, 0), float3(0, 0, 0), float3(0, 0, 0) };
+    [unroll]
+    for (int j = 0; j < 8; ++j)
+    {
+        const float3 c = g_RTConstants.SkyCorners[j].rgb;
+        A += c * 0.125;
+        [unroll]
+        for (int i = 0; i < 3; ++i)
+            if (((j >> i) & 1) != 0) B[i] += c * 0.25;
+    }
+    [unroll]
+    for (int i = 0; i < 3; ++i) B[i] -= A;
+    const float3 irr = max(A + (2.0 / 3.0) * (B[0] * n.x + B[1] * n.y + B[2] * n.z), 0.0);
+    const float3 luma = float3(0.2126, 0.7152, 0.0722);
+    return dot(irr, luma) / max(dot(A, luma), 1e-3);
+}
+
 // Screen-space-style ambient occlusion: short rays in a hemisphere around the
 // normal, using the fixed disc directions. Returns 1 (unoccluded) .. 0 (fully
 // occluded). AoSamples == 0 disables it.
@@ -850,14 +878,17 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
         Color = float4(acc / (float)ns, 1.0);
     }
 
-    // Lighting factor: ambient (AO-shaded) + direct (shadowed, intensity-scaled).
+    // Lighting factor: direct (shadowed, intensity-scaled) + ambient.
     // Compose uses Color * RT.a for the diffuse term.
     //
-    // The AO only takes half of the ambient away: the raster path has no AO at all
-    // and always keeps its flat ambient, and letting AO cancel the ambient
-    // completely was the other half of the black-area problem. With "AO Samples"
-    // set to 0 (ao == 1) this is exactly the raster ambient again.
-    Color.a = g_RTConstants.AmbientLight * (0.5 + 0.5 * ao) + NdotL * g_RTConstants.LightIntensity;
+    // The ambient is the sky's irradiance along the surface normal (the same
+    // closed form the raster paths use), so it now darkens on downward faces and
+    // brightens on upward ones instead of being one flat number, and AO still
+    // scales it. It is expressed relative to the sky's mean so that the ambient
+    // level stays exactly where AmbientLight puts it.
+    const float ao01 = 0.5 + 0.5 * ao;
+    Color.a = g_RTConstants.AmbientLight * SkyIrradianceRatio(WNormal) * ao01
+            + NdotL * g_RTConstants.LightIntensity;
     // RT-res albedo/normal for the denoiser (OIDN consumes these at the RT
     // resolution; they match the depth-guided fpBest texel used for lighting).
     g_OutAlbedo[DTid] = g_GBufferColor.Load(int3(fpBest, 0));
