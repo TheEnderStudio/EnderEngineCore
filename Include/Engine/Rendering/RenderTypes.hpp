@@ -255,6 +255,11 @@ struct alignas(16) ObjectConstants {
 	Mat4 world; Mat4 normalMat;
 	Vec4 baseColor; Vec4 metallicRough;
 	Vec4 emissive; ///< Emissive color (rgb) + intensity (w).
+	/// Which PBR maps this material actually has, so the shaders only sample what
+	/// exists instead of relying on a fallback texture: x = normal map, y = MR map,
+	/// z = emissive map, w unused. (The mesh shader path carries the same flags in
+	/// its material constant, which is why it never had this problem.)
+	Vec4 mapFlags = Vec4(0.0f);
 };
 
 // ---------------------------------------------------------------------------

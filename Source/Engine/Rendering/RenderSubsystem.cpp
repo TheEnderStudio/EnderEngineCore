@@ -287,6 +287,7 @@ cbuffer Object : register(b2)
     float4   g_BaseColor;
     float4   g_MetallicRough;
     float4   g_Emissive;
+    float4   g_MapFlags;      // x = has normal map, y = has MR map, z = has emissive map
 };
 
 struct PSIn
@@ -391,24 +392,26 @@ float4 main(PSIn i) : SV_TARGET
     float4 tex = t_BC.Sample(t_BC_sampler, i.UV);
     float3 bc = tex.rgb * g_BaseColor.rgb;
     float  a  = tex.a * g_BaseColor.a;
-    // glTF packs metallic in the blue channel and roughness in the green one. The
-    // fallbacks are 1x1 white textures, so materials without the maps keep using
-    // the plain factors through the same code path.
-    float4 orm = t_MR.Sample(t_BC_sampler, i.UV);
-    float3 emissive = t_EmissiveMap.Sample(t_BC_sampler, i.UV).rgb * g_Emissive.rgb * g_Emissive.w;
 
+    // Normal mapping, only for materials that actually carry a normal map
+    // (g_MapFlags.x). Sampling a 1x1 fallback for everything else is what broke
+    // this path the first time: the tangent frame below is built from screen-space
+    // derivatives, so a garbage texel becomes a garbage normal over the whole face.
+    // The mesh shader path gates on the same kind of flag for the same reason.
+    // None of the current assets ship TANGENT_0, so the frame has to come from the
+    // derivatives (see kNormalMapSign for the sign convention).
     float3 N = normalize(i.N);
-    // Flat fallback (128,128,255) maps to (0,0,1), so an unmapped material keeps
-    // the interpolated vertex normal.
-    float3 sn = t_NormalMap.Sample(t_BC_sampler, i.UV).xyz * 2.0 - 1.0;
-    N = NormalMapped(N, i.WP, i.UV, sn);
+    if (g_MapFlags.x > 0.5) {
+        float3 sn = t_NormalMap.Sample(t_BC_sampler, i.UV).xyz * 2.0 - 1.0;
+        N = NormalMapped(N, i.WP, i.UV, sn);
+    }
 
     float3 V = normalize(g_CameraPos.xyz - i.WP);
-    float m = g_MetallicRough.x * orm.b;
-    float r = g_MetallicRough.y * orm.g;
+    float m = g_MetallicRough.x;
+    float r = g_MetallicRough.y;
     float3 lit = DoLight(i.WP, N, V, bc, m, r);
     // Emissive is self-emission: added after lighting (not tinted by the light).
-    return float4(lit + emissive, a);
+    return float4(lit + g_Emissive.rgb * g_Emissive.w, a);
 }
 )";
 
@@ -442,6 +445,7 @@ cbuffer Object : register(b2)
     float4   g_BaseColor;
     float4   g_MetallicRough;
     float4   g_Emissive;
+    float4   g_MapFlags;      // x = has normal map, y = has MR map, z = has emissive map
 };
 
 struct PSIn
@@ -480,15 +484,17 @@ float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
 PSOut main(PSIn i)
 {
     PSOut o;
-    float4 orm = t_MR.Sample(t_BC_sampler, i.UV);
     o.Color = t_BC.Sample(t_BC_sampler, i.UV) * g_BaseColor;
-    // Flat fallback maps to (0,0,1), so an unmapped material keeps the vertex normal.
-    float3 sn = t_NormalMap.Sample(t_BC_sampler, i.UV).xyz * 2.0 - 1.0;
-    float3 N = NormalMapped(normalize(i.N), i.WP, i.UV, sn);
-    // The ray tracer reads roughness from here, so the map (not just the factor)
-    // now drives the reflection lobe width as well.
-    o.Norm  = float4(N, saturate(orm.g * g_MetallicRough.y));
-    o.Emis  = float4(t_EmissiveMap.Sample(t_BC_sampler, i.UV).rgb * g_Emissive.rgb * g_Emissive.w, 1.0);
+    // Same gating as the forward shader: only materials that carry a normal map are
+    // sampled, so the unmapped majority never touches the fallback texture - which
+    // is what corrupted every object's G-buffer normal the first time round.
+    float3 N = normalize(i.N);
+    if (g_MapFlags.x > 0.5) {
+        float3 sn = t_NormalMap.Sample(t_BC_sampler, i.UV).xyz * 2.0 - 1.0;
+        N = NormalMapped(N, i.WP, i.UV, sn);
+    }
+    o.Norm  = float4(N, g_MetallicRough.y);
+    o.Emis  = float4(g_Emissive.rgb * g_Emissive.w, 1.0);
     return o;
 }
 )";
@@ -1525,7 +1531,7 @@ struct RenderSubsystem::RenderBackend {
 		for (UInt32 si = 0; si < (UInt32)md->sub.size(); si++) {
 			auto& s = md->sub[si];
 			auto* mt = materials.get(s.material.index, s.material.generation);
-			if (mt && mt->objCB) { ObjectConstants oc; oc.world = wm; oc.normalMat = nm; oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
+			if (mt && mt->objCB) { ObjectConstants oc; oc.world = wm; oc.normalMat = nm; oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
 			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
 			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
 			if (mt && srb) {
@@ -1608,7 +1614,7 @@ struct RenderSubsystem::RenderBackend {
 
 		for (auto& s : md->sub) {
 			auto* mt = materials.get(s.material.index, s.material.generation);
-			if (mt && mt->objCB) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
+			if (mt && mt->objCB) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
 			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
 			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
 			if (mt && srb) {
@@ -1658,7 +1664,7 @@ struct RenderSubsystem::RenderBackend {
 
 			if (mt) {
 				void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
-				if (m) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); }
+				if (m) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, 0.0f); memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); }
 				if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_VERTEX, "Object"))
 					v->Set(mt->objCB, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 			}
