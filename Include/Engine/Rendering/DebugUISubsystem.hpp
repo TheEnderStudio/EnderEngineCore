@@ -75,8 +75,21 @@ public:
 	bool button(const char* label);
 	/// @brief Display an ImGui float slider.
 	bool sliderFloat(const char* label, float* v, float min, float max);
+	/**
+	 * @brief Display an RGB colour picker.
+	 * @param label Widget label.
+	 * @param rgb   Three floats, edited in place.
+	 * @param hdr   Allow values above 1 (colour pickers clamp the displayed swatch
+	 *              either way, but an emissive factor is an HDR quantity).
+	 * @return true while the value is being changed.
+	 */
+	bool colorEdit3(const char* label, float* rgb, bool hdr = false);
 	/// @brief Display an ImGui checkbox.
 	bool checkbox(const char* label, bool* v);
+	/// @brief Display an ImGui int slider.
+	bool sliderInt(const char* label, int* v, int min, int max);
+	/// @brief Display an ImGui separator.
+	void separator();
 
 	// ---------------------------------------------------------------
 	// Frame lifecycle

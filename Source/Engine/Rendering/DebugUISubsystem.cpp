@@ -86,11 +86,33 @@ bool DebugUISubsystem::sliderFloat(const char* label, float* v, float min, float
 	return false;
 #endif
 }
+bool DebugUISubsystem::colorEdit3(const char* label, float* rgb, bool hdr) {
+#ifdef EE_DEBUG
+	return ImGui::ColorEdit3(label, rgb, ImGuiColorEditFlags_Float | (hdr ? ImGuiColorEditFlags_HDR : 0));
+#else
+	(void)label; (void)rgb; (void)hdr;
+	return false;
+#endif
+}
 bool DebugUISubsystem::checkbox(const char* label, bool* v) {
 #ifdef EE_DEBUG
 	return ImGui::Checkbox(label, v);
 #else
 	return false;
+#endif
+}
+
+bool DebugUISubsystem::sliderInt(const char* label, int* v, int min, int max) {
+#ifdef EE_DEBUG
+	return ImGui::SliderInt(label, v, min, max);
+#else
+	return false;
+#endif
+}
+
+void DebugUISubsystem::separator() {
+#ifdef EE_DEBUG
+	ImGui::Separator();
 #endif
 }
 
