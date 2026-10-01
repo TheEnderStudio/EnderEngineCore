@@ -469,9 +469,14 @@ void MeshShaderSubsystem::setShadowMap(TextureSRV shadowMap, const Mat4 worldToS
 	// The binding already exists once the pipeline has been built; refresh it so
 	// a shadow map created after the first draw still takes effect.
 	if (p.clusterSrb) {
-		if (auto* v = p.clusterSrb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap")) {
-			auto* srv = p.shadowMapSRV ? p.shadowMapSRV.RawPtr() : (p.shadowDummySRV ? p.shadowDummySRV.RawPtr() : nullptr);
-			if (srv) v->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+		auto* srv = p.shadowMapSRV ? p.shadowMapSRV.RawPtr() : (p.shadowDummySRV ? p.shadowDummySRV.RawPtr() : nullptr);
+		if (srv) {
+			// Both variables: the comparison-sampled view for the PCF lookups and the
+			// typed one the contact shadow march needs.
+			if (auto* v = p.clusterSrb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap"))
+				v->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+			if (auto* v = p.clusterSrb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMapDepth"))
+				v->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 		}
 	}
 }
@@ -777,8 +782,11 @@ struct SceneConstants { // 264 B payload (buffer 320 B; layout matches the HLSL 
 	Vec4   envParams = Vec4(0, 1, 0, 1);  // 752: x = sky IBL on, y = mip scale, z = debug, w = intensity
 	Vec4   shadowParams = Vec4(1, 0.15f, 0.002f, 2); // 768: x = PCF radius, y = cascade blend,
 	                                      //      z/w = shadow depth bias base / slope scale
-}; // 784 B (buffer 1024 B)
-static_assert(sizeof(SceneConstants) == 784, "SceneConstants must match the HLSL cbuffer layout");
+	Vec4   contactParams = Vec4(1.5f, 24.0f, 0.5f, 50); // 784: x = normal offset, y = contact
+	                                      //      ray length, z = strength, w = fade distance
+	Vec4   lightParams = Vec4(0);         // 800: x = diffuse wrap (0 = Lambert, 1 = half-Lambert)
+}; // 816 B (buffer 1024 B)
+static_assert(sizeof(SceneConstants) == 816, "SceneConstants must match the HLSL cbuffer layout");
 
 struct SceneMeshInfo { // 96 B (16-byte aligned; layout must match the HLSL struct)
 	Vec4   center;           // 0  mesh-local LOD0 bounding-sphere center
@@ -1775,6 +1783,8 @@ cbuffer cbSceneConstants : register(b0) {
     float4   g_SkyCorners[8];   // 8 skybox corner colours, see SkyIrradiance below
     float4   g_EnvParams;       // x = sky IBL on, y = mip scale, z = debug, w = intensity
     float4   g_ShadowParams;    // x = PCF radius, y = cascade blend, z/w = depth bias base/slope
+    float4   g_ContactParams;   // x = normal offset, y = contact length, z = strength, w = fade distance
+    float4   g_LightParams;     // x = diffuse wrap (0 = Lambert, 1 = half-Lambert)
 };
 
 // Diffuse irradiance of the analytic sky.
@@ -1820,6 +1830,10 @@ Texture2D    g_EmissiveMap[MAX_MATERIALS] : register(t96);
 // there; here the material palettes already own t0..t127).
 Texture2DArray g_ShadowMap : register(t128);
 SamplerComparisonState g_ShadowMapSampler : register(s1);
+// The same shadow map as a typed depth texture for the contact shadow march (a
+// comparison sampler cannot return the stored depth). Everything else in the shading
+// is shared with the forward path, this is no exception.
+Texture2DArray<float> g_ShadowMapDepth : register(t130);
 SamplerState g_AlbedoSampler : register(s0);
 // Prefiltered sky environment for the specular ambient (see RenderSubsystem::
 // prepareEnvironment and SkySpecular below). Bound per frame from the renderer, so
@@ -1893,10 +1907,18 @@ float SampleShadow(float3 wp, float3 N, float3 Ldir)
     if (camZ > g_CascadeSplits.y) c = 2;
     if (camZ > g_CascadeSplits.z) c = 3;
 
+    // World size of one shadow map texel for this cascade, from its own world -> UV
+    // matrix, so the normal offset and the contact ray length are in texels and stay
+    // correct across cascades.
+    uint sw = 1, sh = 1, se = 1;
+    g_ShadowMap.GetDimensions(sw, sh, se);
+    const float texelWorld = 1.0 / max(length(g_ShadowMapUVDepth[c][0].xyz) * (float)sw, 1e-6);
+    const float3 spos = wp + N * (texelWorld * g_ContactParams.x);
+
     const float slope = sqrt(saturate(1.0 - NdotL * NdotL)) / max(NdotL, 0.15);
     const float bias = g_ShadowParams.z * (1.0 + g_ShadowParams.w * slope);
 
-    float4 sc = mul(g_ShadowMapUVDepth[c], float4(wp, 1.0));
+    float4 sc = mul(g_ShadowMapUVDepth[c], float4(spos, 1.0));
     sc.xyz /= max(sc.w, 1e-6);
     float shadow = SampleShadowCascade(c, float3(sc.xy, sc.z - bias), g_ShadowParams.x);
 
@@ -1907,9 +1929,40 @@ float SampleShadow(float3 wp, float3 N, float3 Ldir)
         const float bw = saturate((camZ - fadeStart) / max(splitEnd - fadeStart, 1e-4));
         if (bw > 0.0)
         {
-            float4 sn = mul(g_ShadowMapUVDepth[c + 1], float4(wp, 1.0));
+            float4 sn = mul(g_ShadowMapUVDepth[c + 1], float4(spos, 1.0));
             sn.xyz /= max(sn.w, 1e-6);
             shadow = lerp(shadow, SampleShadowCascade(c + 1, float3(sn.xy, sn.z - bias), g_ShadowParams.x), bw);
+        }
+    }
+
+    // Contact shadows (see the longer note in the forward shader's ContactShadow).
+    if (g_ContactParams.w > 0.0 && g_ContactParams.y > 0.0 && g_ContactParams.z > 0.0)
+    {
+        const float fade = 1.0 - saturate(camZ / max(g_ContactParams.w, 1e-3));
+        if (fade > 0.0)
+        {
+            const float2 dim = max(float2(sw, sh), 1.0);
+            const int kSteps = 8;
+            const float stepLen = texelWorld * g_ContactParams.y / (float)kSteps;
+            float3 p = spos;
+            float occl = 0.0, wsum = 0.0;
+            [loop]
+            for (int i = 0; i < kSteps; ++i)
+            {
+                p += Ldir * stepLen;
+                float4 cs = mul(g_ShadowMapUVDepth[c], float4(p, 1.0));
+                cs.xyz /= max(cs.w, 1e-6);
+                if (cs.x < 0.0 || cs.x > 1.0 || cs.y < 0.0 || cs.y > 1.0 || cs.z < 0.0 || cs.z > 1.0)
+                    break;
+                const int2 tc = min(int2(cs.xy * dim), int2(dim) - 1);
+                const float stored = g_ShadowMapDepth.Load(int4(tc, (int)c, 0));
+                const float eps = 0.00015 + 0.0015 * ((float)i / (float)kSteps);
+                const float w = (float)(kSteps - i) / (float)kSteps;
+                occl += (stored + eps < cs.z) ? w : 0.0;
+                wsum += w;
+            }
+            const float o = wsum > 0.0 ? occl / wsum : 0.0;
+            shadow *= 1.0 - saturate(o * g_ContactParams.z) * fade;
         }
     }
     return shadow;
@@ -2035,7 +2088,11 @@ float4 main(in PSInput i) : SV_TARGET {
     float3 col = (SkyIrradiance(N) * g_Ambient.a * bc * (1.0 - m) + SkySpecular(N, V, F0, r) * g_Ambient.a) * ao;
     {
         float3 Ldir = normalize(-g_LightDir.xyz);
-        float  NdotL = dot(N, Ldir) * 0.5 + 0.5;
+        // Direct diffuse: real NdotL by default, the wrapped form as the wrap parameter
+        // rises (g_LightParams.x = 1 is exactly the half-Lambert this used to be, so the
+        // two can be compared live).
+        const float dWrap = max(g_LightParams.x, 0.0);
+        float  NdotL = saturate((dot(N, Ldir) + dWrap) / (1.0 + dWrap));
         float3 diff = bc * (1.0 - m);
         float3 spec = DirectSpecular(N, V, Ldir, F0, r) * saturate(dot(N, Ldir));
 
@@ -2449,8 +2506,13 @@ Result<void, RenderError> MeshShaderSubsystem::ensureClusterPipeline(Impl& p, UI
 		{
 			D::ITextureView* srv = p.shadowValid && p.shadowMapSRV ? p.shadowMapSRV.RawPtr()
 				: (p.shadowDummySRV ? p.shadowDummySRV.RawPtr() : nullptr);
-			if (srv) if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap"))
-				v->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+			if (srv) {
+				if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap"))
+					v->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+				// The typed view the contact shadow march reads (same resource).
+				if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMapDepth"))
+					v->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+			}
 			if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMapSampler"))
 				if (p.shadowSampler) v->Set(p.shadowSampler);
 		}
@@ -3335,6 +3397,8 @@ Result<void, RenderError> MeshShaderSubsystem::drawSceneImpl(const Vector<MeshDr
 		cb.envParams = p.renderer->skyEnvParams();
 		// Same for the shadow quality/bias knobs (PCF radius, cascade blend, bias).
 		cb.shadowParams = p.renderer->shadowParams();
+		cb.contactParams = p.renderer->contactShadowParams();
+		cb.lightParams = Vec4(p.renderer->diffuseWrap(), 0.0f, 0.0f, 0.0f);
 		Vec3 sunDir(0); Vec4 sunColor(1, 1, 1, 1);
 		if (p.renderer->getPrimaryDirectionalLight(sunDir, sunColor)) {
 			cb.lightDir = Vec4(glm::normalize(sunDir), 0.0f);

@@ -591,6 +591,40 @@ public:
 	 */
 	void setShadowParams(F32 pcfRadiusTexels, F32 cascadeBlend, F32 biasBase, F32 biasSlope);
 	EE_NODISCARD Vec4 shadowParams() const;
+	/**
+	 * @brief Contact shadows and the normal offset for the cascaded shadow lookup.
+	 *
+	 * The single biased shadow lookup answers "is there an occluder along the light
+	 * direction"; anything nearer to the surface than the bias is invisible, which is
+	 * what leaves the thin bright gap where two objects touch. The contact term walks
+	 * a short ray in shadow map space towards the light with an epsilon that starts at
+	 * (nearly) zero, so exactly that missing occlusion comes back. Its length is given
+	 * in shadow map texels, so it scales with the cascade instead of the world.
+	 *
+	 * @param normalOffsetTexels How far off the surface, along the normal, the whole
+	 *        shadow lookup is moved. This is the scale-correct way to avoid
+	 *        self-shadowing and to reduce shadows floating away from their casters.
+	 * @param lengthTexels  Contact ray length in texels (this is what makes it a
+	 *        *contact* effect rather than a second shadow map).
+	 * @param strength      How dark a fully occluded contact ray gets (0..1).
+	 * @param fadeDistance  Camera distance at which the contact term has faded to
+	 *        nothing (0 disables contact shadows entirely).
+	 */
+	void setContactShadows(F32 normalOffsetTexels, F32 lengthTexels, F32 strength, F32 fadeDistance);
+	EE_NODISCARD Vec4 contactShadowParams() const;
+	/**
+	 * @brief Diffuse wrap of the direct lights (0 = Lambert, 1 = half-Lambert).
+	 *
+	 * The direct diffuse term used to be the half-Lambert `NdotL * 0.5 + 0.5`, which
+	 * never goes below half brightness: it lifts the terminator, but it also means a
+	 * surface turned away from the sun is lit exactly as much as one at grazing
+	 * incidence, and every shadow lands on the same value. 0 is the real NdotL, which
+	 * the sun's falloff and the shadow term then actually shape; the intermediate
+	 * values are the standard wrapped form `saturate((NdotL + w) / (1 + w))`, which at
+	 * w = 1 reproduces the old behaviour exactly, so the two can be compared live.
+	 */
+	void setDiffuseWrap(F32 wrap);
+	EE_NODISCARD F32 diffuseWrap() const;
 	/// @brief Shader parameters of the specular IBL (mirrors FrameConstants::envParams).
 	EE_NODISCARD Vec4 skyEnvParams() const;
 	/// @brief Cubemap SRV of the prefiltered environment (never null after initialize).

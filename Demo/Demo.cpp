@@ -1,4 +1,4 @@
-﻿#include <Engine/Core/Core.hpp>
+#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -1050,6 +1050,37 @@ HALT
 				changed = true;
 			}
 			if (changed) renderer.setShadowParams(pcfRadius, cascadeBlend, biasBase, biasSlope);
+		}
+		// ---- Contact shadows --------------------------------------------------
+		// A short ray march in shadow map space towards the light, with an epsilon that
+		// starts at almost zero. It recovers the occlusion the biased lookup cannot see
+		// - the darkening where two objects actually touch - and it is why the depth
+		// bias above can stay small without acne. The length is in shadow map texels, so
+		// it scales with the cascade instead of with world units.
+		{
+			const Vec4 cp = renderer.contactShadowParams();
+			F32 normalOffset = cp.x, contactLen = cp.y, contactStrength = cp.z, contactFade = cp.w;
+			bool changed = false;
+			changed |= debugUI.sliderFloat("Contact Normal Offset", &normalOffset, 0.0f, 6.0f);
+			changed |= debugUI.sliderFloat("Contact Length (texels)", &contactLen, 0.0f, 128.0f);
+			changed |= debugUI.sliderFloat("Contact Strength", &contactStrength, 0.0f, 1.0f);
+			changed |= debugUI.sliderFloat("Contact Fade (units)", &contactFade, 0.0f, 300.0f);
+			if (debugUI.button("Reset contact shadows")) {
+				normalOffset = 1.5f; contactLen = 24.0f; contactStrength = 0.5f; contactFade = 50.0f;
+				changed = true;
+			}
+			if (changed) renderer.setContactShadows(normalOffset, contactLen, contactStrength, contactFade);
+		}
+		// ---- Direct light falloff ---------------------------------------------
+		// The direct diffuse used to be half-Lambert, which never goes below half
+		// brightness: the terminator is lifted, but a surface facing away is lit as much
+		// as one at grazing incidence and every shadow lands on the same value. 0 is the
+		// real NdotL; 1 reproduces the old look exactly, so this is a live A/B.
+		{
+			F32 wrap = renderer.diffuseWrap();
+			if (debugUI.sliderFloat("Diffuse Wrap (0=Lambert)", &wrap, 0.0f, 1.0f)) {
+				renderer.setDiffuseWrap(wrap);
+			}
 		}
 		if (hybridRT) {
 			static const char* rtModeNames[] = { "Shaded", "GBufferColor", "GBufferNormal", "Diffuse", "Reflections", "Fresnel", "RTAlpha", "BackFacingNormals" };

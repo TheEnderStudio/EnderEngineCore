@@ -526,6 +526,10 @@ Result<void, CoreError> RenderPipeline::render(RenderFrame& frame) {
 	const Mat4 viewProj = frame.proj * frame.view;
 	frame.rtConstants.viewProjInv = glm::inverse(viewProj);
 	frame.rtConstants.cameraPos = Vec4(frame.cameraPos, 1.0f);
+	// The direct light falloff has to match the raster paths, which shade the same
+	// scene with the same parameter (RenderSubsystem::setDiffuseWrap); otherwise the
+	// two modes disagree on where the terminator sits.
+	frame.rtConstants.diffuseWrap = m_impl->context.renderer->diffuseWrap();
 
 	PipelineFrameContext context;
 	context.frameIndex = m_impl->frameIndex++;

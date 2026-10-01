@@ -6,10 +6,10 @@
 
 EE_NAMESPACE_EDITOR_BEGIN
 
-class MainWindow : public QWidget {
+class MainWindow : public QMainWindow {
 	Q_OBJECT
 public:
-	explicit MainWindow(QWidget* parent = nullptr);
+	MainWindow();
 };
 
 EE_NAMESPACE_EDITOR_END

@@ -113,6 +113,10 @@ struct RTConstants {
     float    RayConePixelAngle;  // angular size of one pixel (radians): ray cone seed
     float    ReflectionCone;     // 0 = sample level 0 (no prefilter), 1 = full ray cone
     uint     ReflectionShadowPCF;// shadow rays per reflection hit (1 = single ray)
+    float    DiffuseWrap;        // direct light falloff: 0 = Lambert, 1 = half-Lambert
+    float    _padWrap0;
+    float    _padWrap1;
+    float    _padWrap2;
 };
 
 RaytracingAccelerationStructure g_TLAS            : register(t0);
@@ -486,7 +490,10 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
             float3 HitPos   = Origin + ReflDir * q.CommittedRayT();
             float  NdotLraw = dot(LightDir, Norm);
             shadowTerm = ReflectionShadow(HitPos, LightDir, MaxShadowLen, Norm, length(HitPos - CameraPos), NdotLraw);
-            res.NdotL = saturate(NdotLraw * 0.5 + 0.5) * shadowTerm;
+            // Same diffuse falloff as the raster paths (RenderSubsystem::setDiffuseWrap):
+            // the wrapped form at wrap = 1 is what this used to be unconditionally.
+            const float wr = max(g_RTConstants.DiffuseWrap, 0.0);
+            res.NdotL = saturate((NdotLraw + wr) / (1.0 + wr)) * shadowTerm;
         }
         res.Found     = true;
 
@@ -776,7 +783,13 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
     // view: the dark blue / purple / red ones, where the negative components are
     // clamped away).
     float NdotLraw = dot(LightDir, WNormal);
-    float NdotL = saturate(NdotLraw * 0.5 + 0.5);
+    // Diffuse falloff shared with the raster paths (see RenderSubsystem::setDiffuseWrap):
+    // 0 is the real NdotL, 1 is the half-Lambert that used to be hardcoded here. The
+    // note above is why the wrap can no longer be dropped silently - without the
+    // ambient/specular terms that were added since, a real NdotL alone would put black
+    // pixels on the surfaces facing away from the light.
+    const float wrapRT = max(g_RTConstants.DiffuseWrap, 0.0);
+    float NdotL = saturate((NdotLraw + wrapRT) / (1.0 + wrapRT));
     NdotL *= CastShadowPCF(WPos, LightDir, g_RTConstants.MaxRayLength, WNormal, DisToCam);
 
     // Ambient occlusion (short hemisphere rays).

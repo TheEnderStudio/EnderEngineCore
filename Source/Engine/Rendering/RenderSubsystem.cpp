@@ -228,10 +228,13 @@ Texture2D    t_EmissiveMap: register(t3);
 SamplerState t_BC_sampler : register(s0);
 Texture2DArray g_ShadowMap        : register(t4);
 SamplerComparisonState g_ShadowMap_sampler : register(s4);
-// Prefiltered sky environment (see RenderSubsystem::prepareEnvironment): one mip per
-// roughness level, built by the GGX prefilter compute shader.
+// Prefiltered sky environment (see RenderSubsystem::prepareEnvironment): the sky
+// drawn face by face into a cube and mip-mapped, looked up by reflection direction.
 TextureCube  g_SkyEnv     : register(t5);
 SamplerState g_SkyEnv_sampler : register(s5);
+// The same shadow map again, read as a typed texture: the contact shadow march needs
+// the stored depth value itself, which a comparison sampler cannot give.
+Texture2DArray<float> g_ShadowMapDepth : register(t6);
 
 
 cbuffer Frame : register(b0)
@@ -247,6 +250,8 @@ cbuffer Frame : register(b0)
     float4   g_SkyCorners[8];   // skybox corners -> ambient irradiance, see SkyIrradiance
     float4   g_EnvParams;       // x = sky IBL on, y = mip scale, z = debug, w = intensity
     float4   g_ShadowParams;    // x = PCF radius, y = cascade blend, z/w = depth bias base/slope
+    float4   g_ContactParams;   // x = normal offset, y = contact length, z = strength, w = fade distance
+    float4   g_LightParams;     // x = diffuse wrap (0 = Lambert, 1 = half-Lambert)
 };
 
 // Diffuse irradiance of the analytic sky (the same closed form the mesh shader and
@@ -427,8 +432,70 @@ float SampleShadowCascade(uint c, float3 uvDepth, float radiusTexels)
     return acc * 0.25;
 }
 
-// Cascaded shadow term for a directional light: cascade selection, a slope-scaled
-// depth bias, the PCF kernel and a blend into the next cascade near the split.
+// World size of one shadow map texel for cascade c, derived from the cascade's own
+// world -> UV matrix (its first row is the u gradient, so its length is UV units per
+// world unit). Doing it here means the normal offset and the contact ray length can be
+// expressed in texels and stay correct across cascades and scene scales, instead of
+// being a different world distance in every cascade.
+float ShadowTexelWorldSize(uint c)
+{
+    uint sw = 1, sh = 1, se = 1;
+    g_ShadowMap.GetDimensions(sw, sh, se);
+    const float3 duvdx = g_ShadowMapUVDepth[c][0].xyz;
+    return 1.0 / max(length(duvdx) * (float)sw, 1e-6);
+}
+
+// Contact shadows: a short ray march in shadow map space along the light direction.
+//
+// The biased lookup answers "is there an occluder along the light direction"; anything
+// nearer to the surface than the bias is invisible, which is what leaves the thin
+// bright gap where two objects touch (and, worse, what makes shadows float away from
+// their casters once the bias is raised to kill acne). Marching a few texels' worth of
+// world distance towards the light, with an epsilon that starts at almost zero and
+// ramps up, recovers exactly that missing occlusion. The length is tied to the
+// cascade's texel size and the effect fades out with camera distance, so it stays a
+// near-field contact term rather than a second shadow map.
+float ContactShadow(float3 wp, float3 N, float3 Ldir, uint c, float texelWorld, float camZ)
+{
+    if (g_ContactParams.w <= 0.0 || g_ContactParams.y <= 0.0 || g_ContactParams.z <= 0.0)
+        return 1.0;
+    const float fade = 1.0 - saturate(camZ / max(g_ContactParams.w, 1e-3));
+    if (fade <= 0.0)
+        return 1.0;
+
+    uint sw = 1, sh = 1, se = 1;
+    g_ShadowMap.GetDimensions(sw, sh, se);
+    const float2 dim = max(float2(sw, sh), 1.0);
+
+    const int kSteps = 8;
+    const float stepLen = texelWorld * g_ContactParams.y / (float)kSteps;
+    float3 p = wp;
+    float occl = 0.0, wsum = 0.0;
+    [loop]
+    for (int i = 0; i < kSteps; ++i)
+    {
+        p += Ldir * stepLen;
+        float4 sc = mul(g_ShadowMapUVDepth[c], float4(p, 1.0));
+        sc.xyz /= max(sc.w, 1e-6);
+        if (sc.x < 0.0 || sc.x > 1.0 || sc.y < 0.0 || sc.y > 1.0 || sc.z < 0.0 || sc.z > 1.0)
+            break;
+        const int2 tc = min(int2(sc.xy * dim), int2(dim) - 1);
+        const float stored = g_ShadowMapDepth.Load(int4(tc, (int)c, 0));
+        // The epsilon ramps with the step because the depth error of the projection
+        // grows with the distance from the point the ray was offset from.
+        const float eps = 0.00015 + 0.0015 * ((float)i / (float)kSteps);
+        // Nearer steps carry more weight: this is a contact term.
+        const float w = (float)(kSteps - i) / (float)kSteps;
+        occl += (stored + eps < sc.z) ? w : 0.0;
+        wsum += w;
+    }
+    const float o = wsum > 0.0 ? occl / wsum : 0.0;
+    return 1.0 - saturate(o * g_ContactParams.z) * fade;
+}
+
+// Cascaded shadow term for a directional light: cascade selection, a normal offset, a
+// slope-scaled depth bias, the PCF kernel, a contact shadow march and a blend into the
+// next cascade near the split.
 float SampleShadow(float3 wp, float3 N, float3 Ldir)
 {
     const float NdotL = saturate(dot(N, Ldir));
@@ -438,6 +505,12 @@ float SampleShadow(float3 wp, float3 N, float3 Ldir)
     if (camZ > g_CascadeSplits.y) c = 2;
     if (camZ > g_CascadeSplits.z) c = 3;
 
+    // Normal offset: move the lookup off the surface along the normal, by a distance
+    // derived from the cascade's texel size. This removes the self-shadowing error at
+    // its source, which is what lets the depth bias below stay small.
+    const float texelWorld = ShadowTexelWorldSize(c);
+    const float3 spos = wp + N * (texelWorld * g_ContactParams.x);
+
     // Slope-scaled bias: the depth error of a shadow lookup grows with tan(angle
     // between the surface normal and the light), so the bias has to follow it. A
     // constant bias big enough for the worst slope is what detaches shadows from the
@@ -445,8 +518,8 @@ float SampleShadow(float3 wp, float3 N, float3 Ldir)
     const float slope = sqrt(saturate(1.0 - NdotL * NdotL)) / max(NdotL, 0.15);
     const float bias = g_ShadowParams.z * (1.0 + g_ShadowParams.w * slope);
 
-    float4 sc = mul(g_ShadowMapUVDepth[c], float4(wp, 1.0));
-    sc.xyz /= sc.w;
+    float4 sc = mul(g_ShadowMapUVDepth[c], float4(spos, 1.0));
+    sc.xyz /= max(sc.w, 1e-6);
     float shadow = SampleShadowCascade(c, float3(sc.xy, sc.z - bias), g_ShadowParams.x);
 
     // Cascade blend: near the far end of a cascade, fade into the next one, so the
@@ -459,16 +532,24 @@ float SampleShadow(float3 wp, float3 N, float3 Ldir)
         const float bw = saturate((camZ - fadeStart) / max(splitEnd - fadeStart, 1e-4));
         if (bw > 0.0)
         {
-            float4 sn = mul(g_ShadowMapUVDepth[c + 1], float4(wp, 1.0));
-            sn.xyz /= sn.w;
+            float4 sn = mul(g_ShadowMapUVDepth[c + 1], float4(spos, 1.0));
+            sn.xyz /= max(sn.w, 1e-6);
             shadow = lerp(shadow, SampleShadowCascade(c + 1, float3(sn.xy, sn.z - bias), g_ShadowParams.x), bw);
         }
     }
-    return shadow;
+
+    // The contact term is applied once, after the blend: it is extra occlusion the
+    // cascade lookup cannot see at all, not a per-cascade correction.
+    return shadow * ContactShadow(spos, N, Ldir, c, texelWorld, camZ);
 }
 
 float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r, float ao)
 {
+    // Diffuse term of one light: real NdotL by default, the wrapped form as the wrap
+    // parameter rises. g_LightParams.x = 0 is Lambert, 1 is exactly the half-Lambert
+    // this used to be.
+    const float wrap = max(g_LightParams.x, 0.0);
+    const float invWrap = 1.0 / (1.0 + wrap);
     // F0 of the dielectric/metal mix, used by the direct specular lobe and by the
     // environment below.
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), bc, m);
@@ -510,7 +591,7 @@ float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r, float
             att = sf / (1.0 + 0.09 * d + 0.032 * d * d);
         }
 
-	float NdotL = dot(N, Ldir) * 0.5 + 0.5;
+	float NdotL = saturate((dot(N, Ldir) + wrap) * invWrap);
         float3 diff = bc * (1.0 - m);
         float3 spec = DirectSpecular(N, V, Ldir, F0, r) * saturate(dot(N, Ldir));
         float shadow = 1.0;
@@ -599,7 +680,10 @@ float4 main(PSIn i) : SV_TARGET
 )";
 
 // G-buffer pixel shader: writes albedo (SV_Target0) and world normal (SV_Target1).
-// g_ShadowMap is declared (but unused) so the resource layout matches the PBR PSOs.
+// The shadow map and the environment cube are declared (but unused) so this shader's
+// resource layout matches the PBR PSOs: the two are created from one code path that
+// decides which variables exist from the shader itself, and a mismatch there is a
+// pipeline creation failure rather than a missing binding.
 static const char* g_PS_GBuffer = R"(
 Texture2D    t_BC         : register(t0);
 Texture2D    t_NormalMap  : register(t1);
@@ -608,6 +692,9 @@ Texture2D    t_EmissiveMap: register(t3);
 SamplerState t_BC_sampler : register(s0);
 Texture2DArray g_ShadowMap        : register(t4);
 SamplerComparisonState g_ShadowMap_sampler : register(s4);
+TextureCube  g_SkyEnv     : register(t5);
+SamplerState g_SkyEnv_sampler : register(s5);
+Texture2DArray<float> g_ShadowMapDepth : register(t6);
 
 cbuffer Frame : register(b0)
 {
@@ -996,6 +1083,25 @@ struct RenderSubsystem::RenderBackend {
 	bool envMirrorY = false;    ///< Mirror the sky about the world's up axis.
 	/// Cascaded shadow quality and bias (FrameConstants::shadowParams).
 	Vec4 shadowParams = Vec4(1.0f, 0.15f, 0.002f, 2.0f);
+	/// Contact shadows + normal offset (FrameConstants::contactParams).
+	Vec4 contactParams = Vec4(1.5f, 24.0f, 0.5f, 50.0f);
+	/// Diffuse wrap of the direct lights (FrameConstants::lightParams.x).
+	F32 diffuseWrap = 0.0f;
+
+	/// @brief Bind the shadow map to both of its shader variables.
+	///
+	/// The pixel shaders read it twice: through the comparison sampler for the PCF
+	/// lookups, and as a plain typed texture for the contact shadow march, which needs
+	/// the stored depth itself rather than a comparison result. One view, two
+	/// variables (both mutable, both have to be set - an unbound one would sample
+	/// whatever the descriptor heap holds).
+	void bindShadow(D::IShaderResourceBinding* srb, D::ITextureView* srv) {
+		if (!srb || !srv) return;
+		if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap"))
+			v->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+		if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMapDepth"))
+			v->Set(srv, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	}
 
 	/// @brief Fill the frame constants the shaders derive lighting from.
 	///
@@ -1008,6 +1114,8 @@ struct RenderSubsystem::RenderBackend {
 		for (int i = 0; i < 8; ++i) fc.skyCorners[i] = skyDesc.has_value() ? skyDesc->corners[i] : fc.ambient;
 		fc.envParams = Vec4(envEnabled ? 1.0f : 0.0f, envMipScale, envDebug ? 1.0f : 0.0f, envIntensity);
 		fc.shadowParams = shadowParams;
+		fc.contactParams = contactParams;
+		fc.lightParams = Vec4(diffuseWrap, 0.0f, 0.0f, 0.0f);
 	}
 
 	/// @brief View-projection that maps a direction onto cube face @p face.
@@ -1288,7 +1396,7 @@ struct RenderSubsystem::RenderBackend {
 		{ D::BufferDesc bd; bd.Name = "FrameCB"; bd.Size = sizeof(FrameConstants); bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DYNAMIC; bd.CPUAccessFlags = D::CPU_ACCESS_WRITE; device->CreateBuffer(bd, nullptr, &frameCB); }
 		{ D::BufferDesc bd; bd.Name = "LightCB"; bd.Size = sizeof(LightConstants); bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DYNAMIC; bd.CPUAccessFlags = D::CPU_ACCESS_WRITE; device->CreateBuffer(bd, nullptr, &lightCB); memset(&lcBuf, 0, sizeof(lcBuf)); }
 		{ D::BufferDesc bd; bd.Name = "InstCB"; bd.Size = sizeof(Mat4) * MaxInstances; bd.BindFlags = D::BIND_VERTEX_BUFFER; bd.Usage = D::USAGE_DEFAULT; device->CreateBuffer(bd, nullptr, &instanceCB); }
-		// Create PBR PSOs �� then fix up shadow vars on all four
+		// Create PBR PSOs, then fix up shadow vars on all four
 		{ PipelineStateDesc pd; pd.name = "DefPSO"; pd.vs = defVS; pd.ps = defPS; auto r = mkPSO(pd); if (r.isErr()) return r.error(); defPSO = r.value(); }
 		{ PipelineStateDesc pd; pd.name = "WirePSO"; pd.vs = defVS; pd.ps = defPS; pd.rasterizer.fillMode = FillMode::Wireframe; auto r = mkPSO(pd); if (r.isErr()) return r.error(); defPSO_wire = r.value(); }
 		{ PipelineStateDesc pd; pd.name = "InstPSO"; pd.vs = defVS_Inst; pd.ps = defPS; auto r = mkPSO(pd, true); if (r.isErr()) return r.error(); defPSO_Inst = r.value(); }
@@ -1336,6 +1444,7 @@ struct RenderSubsystem::RenderBackend {
 					{D::SHADER_TYPE_PIXEL, "t_EmissiveMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					{D::SHADER_TYPE_VERTEX | D::SHADER_TYPE_PIXEL, "Object", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					{D::SHADER_TYPE_PIXEL, "g_ShadowMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+					{D::SHADER_TYPE_PIXEL, "g_ShadowMapDepth", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					// Pinned to the pixel stage so it matches its immutable sampler (see
 					// the same note in mkPSO).
 					{D::SHADER_TYPE_PIXEL, "g_SkyEnv", D::SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
@@ -1741,6 +1850,9 @@ struct RenderSubsystem::RenderBackend {
 			{D::SHADER_TYPE_PIXEL, "t_EmissiveMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 			{D::SHADER_TYPE_VERTEX | D::SHADER_TYPE_PIXEL, "Object", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 			{D::SHADER_TYPE_PIXEL, "g_ShadowMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+			// The same shadow map, readable as a depth texture for the contact shadow
+			// march (no immutable sampler: it is read with Load).
+			{D::SHADER_TYPE_PIXEL, "g_ShadowMapDepth", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 			// Explicit, and deliberately not left to DefaultVariableMergeStages: an
 			// automatically detected resource is merged across the default stages
 			// (VERTEX|PIXEL here), and Diligent then rejects the PIXEL-only immutable
@@ -1749,12 +1861,12 @@ struct RenderSubsystem::RenderBackend {
 			// stage list of a resource has to match its immutable sampler's.
 			{D::SHADER_TYPE_PIXEL, "g_SkyEnv", D::SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 		};
-		// Only the shaded pixel shader declares the environment cube - the G-buffer
-		// variant leaves the lighting to the RT compose pass - so its entry (and its
-		// immutable sampler, which must be the last one) is only part of the layout
-		// when the shader actually has the resource.
-		const D::Uint32 numVars = gbuffer ? EE_ARRAY_SIZE(Vars) - 1u : EE_ARRAY_SIZE(Vars);
-		ci.PSODesc.ResourceLayout.Variables = Vars; ci.PSODesc.ResourceLayout.NumVariables = numVars;
+		// The layout is the same for both pixel shaders: the G-buffer variant declares
+		// the shadow map and the environment cube without using them, exactly like it
+		// already did for g_ShadowMap, so the signature never has to be trimmed
+		// per variant (a resource the shader does not declare is not an error, but a
+		// signature is easier to reason about when it is one list).
+		ci.PSODesc.ResourceLayout.Variables = Vars; ci.PSODesc.ResourceLayout.NumVariables = EE_ARRAY_SIZE(Vars);
 
 		D::SamplerDesc cmpSamp; cmpSamp.MinFilter = D::FILTER_TYPE_COMPARISON_LINEAR; cmpSamp.MagFilter = D::FILTER_TYPE_COMPARISON_LINEAR; cmpSamp.MipFilter = D::FILTER_TYPE_COMPARISON_LINEAR; cmpSamp.ComparisonFunc = D::COMPARISON_FUNC_LESS; cmpSamp.AddressU = D::TEXTURE_ADDRESS_CLAMP; cmpSamp.AddressV = D::TEXTURE_ADDRESS_CLAMP; cmpSamp.AddressW = D::TEXTURE_ADDRESS_CLAMP;
 		D::ImmutableSamplerDesc ImtblSamps[] = {
@@ -1763,7 +1875,7 @@ struct RenderSubsystem::RenderBackend {
 			{D::SHADER_TYPE_PIXEL, "g_SkyEnv", D::SamplerDesc{}},
 		};
 		ci.PSODesc.ResourceLayout.ImmutableSamplers = ImtblSamps;
-		ci.PSODesc.ResourceLayout.NumImmutableSamplers = gbuffer ? EE_ARRAY_SIZE(ImtblSamps) - 1u : EE_ARRAY_SIZE(ImtblSamps);
+		ci.PSODesc.ResourceLayout.NumImmutableSamplers = EE_ARRAY_SIZE(ImtblSamps);
 
 		D::RefCntAutoPtr<D::IPipelineState> p; device->CreateGraphicsPipelineState(ci, &p);
 		if (!p) return RenderError::PipelineStateCreationFailed;
@@ -1901,14 +2013,11 @@ struct RenderSubsystem::RenderBackend {
 			bindTex("t_NormalMap",   d.normalTexture,            flatNormalSRV.RawPtr());
 			bindTex("t_MR",          d.metallicRoughnessTexture, whiteSRV.RawPtr());
 			bindTex("t_EmissiveMap", d.emissiveTexture,          whiteSRV.RawPtr());
-			// The G-buffer shader declares (but does not use) g_ShadowMap; bind a dummy so
-			// the mutable variable is never left unbound when committing the G-buffer SRB.
-			// The regular PBR SRB leaves it unbound here - draw() binds the real shadow map
-			// (with ALLOW_OVERWRITE) right before the draw call.
-			if (bindShadowDummy) {
-				if (auto* sv = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap"))
-					sv->Set(shadowDummy, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
-			}
+			// The G-buffer shader declares (but does not use) the shadow map; bind a dummy
+			// so the mutable variables are never left unbound when committing the G-buffer
+			// SRB. The regular PBR SRB leaves them unbound here - draw() binds the real
+			// shadow map (with ALLOW_OVERWRITE) right before the draw call.
+			if (bindShadowDummy) bindShadow(srb.RawPtr(), shadowDummy);
 		};
 		bindSRB(dd->srb, p->pso, false);
 		// G-buffer SRB (only meaningful when the G-buffer PSOs exist, i.e. always after createDefaults).
@@ -1958,10 +2067,7 @@ struct RenderSubsystem::RenderBackend {
 			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
 			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
 			if (mt && srb) {
-				if (!gBufferActive) {
-					auto* sv = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap");
-					if (sv) sv->Set(shadowSRV ? shadowSRV : shadowDummy, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
-				}
+				if (!gBufferActive) bindShadow(srb, shadowSRV ? shadowSRV : shadowDummy);
 				ctx->CommitShaderResources(srb, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 			}
 			D::DrawIndexedAttribs da; da.IndexType = D::VT_UINT32; da.NumIndices = s.indexCount; da.FirstIndexLocation = s.indexOffset; da.BaseVertex = (D::Uint32)s.vertexOffset; da.Flags = D::DRAW_FLAG_VERIFY_ALL;
@@ -2041,10 +2147,7 @@ struct RenderSubsystem::RenderBackend {
 			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
 			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
 			if (mt && srb) {
-				if (!gBufferActive) {
-					auto* sv = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap");
-					if (sv) sv->Set(shadowSRV ? shadowSRV : shadowDummy, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
-				}
+				if (!gBufferActive) bindShadow(srb, shadowSRV ? shadowSRV : shadowDummy);
 				ctx->CommitShaderResources(srb, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 			}
 			D::DrawIndexedAttribs da; da.IndexType = D::VT_UINT32; da.NumIndices = s.indexCount; da.FirstIndexLocation = s.indexOffset; da.BaseVertex = (D::Uint32)s.vertexOffset; da.NumInstances = count; da.Flags = D::DRAW_FLAG_VERIFY_ALL;
@@ -2091,8 +2194,7 @@ struct RenderSubsystem::RenderBackend {
 					v->Set(obj, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 				}
 			}
-			if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_ShadowMap"))
-				v->Set(shadowSRV ? shadowSRV : shadowDummy, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+			bindShadow(srb, shadowSRV ? shadowSRV : shadowDummy);
 
 			if (mt) {
 				void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
@@ -2830,6 +2932,16 @@ void RenderSubsystem::setShadowParams(F32 pcfRadiusTexels, F32 cascadeBlend, F32
 		std::clamp(biasSlope, 0.0f, 16.0f));
 }
 Vec4 RenderSubsystem::shadowParams() const { return m_backend->shadowParams; }
+void RenderSubsystem::setContactShadows(F32 normalOffsetTexels, F32 lengthTexels, F32 strength, F32 fadeDistance) {
+	m_backend->contactParams = Vec4(
+		std::clamp(normalOffsetTexels, 0.0f, 8.0f),
+		std::clamp(lengthTexels, 0.0f, 128.0f),
+		std::clamp(strength, 0.0f, 1.0f),
+		std::max(fadeDistance, 0.0f));
+}
+Vec4 RenderSubsystem::contactShadowParams() const { return m_backend->contactParams; }
+void RenderSubsystem::setDiffuseWrap(F32 wrap) { m_backend->diffuseWrap = std::clamp(wrap, 0.0f, 1.0f); }
+F32 RenderSubsystem::diffuseWrap() const { return m_backend->diffuseWrap; }
 Vec4 RenderSubsystem::skyEnvParams() const {
 	return Vec4(m_backend->envEnabled ? 1.0f : 0.0f, m_backend->envMipScale,
 	            m_backend->envDebug ? 1.0f : 0.0f, m_backend->envIntensity);

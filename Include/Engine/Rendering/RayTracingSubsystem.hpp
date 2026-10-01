@@ -33,6 +33,8 @@ struct alignas(16) RayTraceConstants {
 	F32  rayConePixelAngle = 0.0011f; ///< Angular size of one pixel in radians (~60 deg fov at 1080p); seeds the reflection ray cone.
 	F32  reflectionCone = 1.0f;  ///< Ray-cone prefilter strength: 0 = sample texture/sky level 0, 1 = full lobe-matched level.
 	UInt32 reflectionShadowPCF = 1; ///< Shadow rays per reflection hit: 1 = a single ray (the lobe and the denoiser already blur it), >1 = full PCSS+PCF.
+	F32  diffuseWrap = 0.0f;      ///< Direct light falloff: 0 = Lambert, 1 = half-Lambert (RenderSubsystem::setDiffuseWrap).
+	F32  _padWrap0 = 0.0f, _padWrap1 = 0.0f, _padWrap2 = 0.0f; ///< Keep the constant buffer 16-byte aligned.
 };
 
 /// @brief A ray-traced scene object (mesh + material + world transform).

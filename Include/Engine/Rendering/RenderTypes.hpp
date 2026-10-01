@@ -252,6 +252,18 @@ struct alignas(16) FrameConstants {
 	/// tan(angle between the normal and the light), which is where the depth error
 	/// grows too). Appended at the end like the fields above.
 	Vec4 shadowParams = Vec4(1.0f, 0.15f, 0.002f, 2.0f);
+	/// Contact shadows and normal offset: x = normal offset in shadow map texels (the
+	/// lookup is pushed that far off the surface along the normal, which removes
+	/// self-shadowing at its source and, being in world units derived from the
+	/// cascade, stays scale-correct), y = contact ray length in texels, z = contact
+	/// strength, w = distance from the camera at which the contact term has faded out
+	/// completely (0 disables it). Appended at the end like the fields above.
+	Vec4 contactParams = Vec4(1.5f, 24.0f, 0.5f, 50.0f);
+	/// Diffuse wrap of the direct lights: x = wrap amount (0 = Lambert, the physically
+	/// correct falloff, 1 = the half-Lambert this used to be, which keeps every shadow
+	/// at half brightness or more), y/z/w reserved. Appended at the end like the fields
+	/// above.
+	Vec4 lightParams = Vec4(0.0f);
 };
 
 /// @brief Single light data in the light constant buffer.
