@@ -4,7 +4,6 @@ Binary/
 build/
 Object/
 ThirdParty/
-!ThirdParty/qwindowkit/
 Tools/BuildHelper/.work
 Tools/BuildHelper/BuildHelper.exe
 Tools/BuildHelper/go.sum
