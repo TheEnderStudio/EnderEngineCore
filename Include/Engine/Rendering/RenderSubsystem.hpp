@@ -542,7 +542,10 @@ public:
 	 *              ground for the four side faces).
 	 *
 	 * Changing any of them rebuilds the cube (a few milliseconds), so they can be
-	 * toggled live while looking at the "Sky IBL Debug" mirror ball.
+	 * toggled live while looking at the "Sky IBL Debug" mirror ball. The defaults are
+	 * "U off, V on, world mirror off" - the combination that matched the visible sky
+	 * on screen - and the controls are kept so the convention can be re-checked rather
+	 * than re-derived.
 	 */
 	void setSkyEnvFlip(bool flipU, bool flipV, bool mirrorY);
 	EE_NODISCARD bool skyEnvFlipU() const;

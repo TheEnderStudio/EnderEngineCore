@@ -1812,6 +1812,42 @@ float3 SkySpecular(float3 N, float3 V, float3 F0, float roughness)
     return pre * (F0 * ab.x + ab.y) * g_EnvParams.w;
 }
 
+// Direct lighting: the same GGX / Smith / Schlick terms as the ray tracing path and
+// the forward PBR shader (identical constants, alpha = roughness^2), so a roughness
+// means the same lobe width in every path.
+float D_GGX(float NdotH, float a)
+{
+    float a2 = a * a;
+    float d  = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / max(3.14159265358979 * d * d, 1e-8);
+}
+
+float3 F_Schlick(float3 F0, float VdotH)
+{
+    return F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+}
+
+float SmithG2(float NdotV, float NdotL, float a)
+{
+    float a2 = a * a;
+    float gv = sqrt(max(a2 + (1.0 - a2) * NdotV * NdotV, 0.0));
+    float gl = sqrt(max(a2 + (1.0 - a2) * NdotL * NdotL, 0.0));
+    return 2.0 * NdotL * NdotV / max(NdotL * gv + NdotV * gl, 1e-5);
+}
+
+float3 DirectSpecular(float3 N, float3 V, float3 Ldir, float3 F0, float roughness)
+{
+    const float a = max(roughness * roughness, 1e-4);
+    const float NdotL = saturate(dot(N, Ldir));
+    const float NdotV = saturate(dot(N, V));
+    const float3 H = normalize(Ldir + V);
+    const float NdotH = saturate(dot(N, H));
+    const float VdotH = saturate(dot(V, H));
+    const float DG = D_GGX(NdotH, a) * SmithG2(NdotV, NdotL, a);
+    const float denom = max(4.0 * NdotV * max(NdotL, 1e-3), 1e-4);
+    return F_Schlick(F0, VdotH) * (DG / denom);
+}
+
 struct PSInput {
     float4 Pos      : SV_POSITION;
     float3 WorldPos : TEXCOORD2;
@@ -1872,32 +1908,33 @@ float4 main(in PSInput i) : SV_TARGET {
     float3 bc  = tex.rgb * mat.baseColor.rgb;
     float  a   = tex.a * mat.baseColor.a;
 
-    // glTF ORM packing: G = roughness, B = metallic.
+    // glTF ORM packing: R = occlusion, G = roughness, B = metallic. Only roughness and
+    // metallic come out of it: occlusion is a separate glTF reference and this palette
+    // is filled from metallicRoughnessTexture, so R is not an occlusion map here.
     float4 orm = g_MetalRough[id].Sample(g_AlbedoSampler, i.UV);
     float  m = saturate(orm.b * mat.params.x);
     float  r = saturate(orm.g * mat.params.y);
+    float  ao = 1.0;
 
     float3 N = normalize(i.Normal);
     float3 sn = g_NormalMap[id].Sample(g_AlbedoSampler, i.UV).xyz * 2.0 - 1.0;
     N = NormalMapped(N, i.WorldPos, i.UV, sn);
     float3 V = normalize(g_CameraPos.xyz - i.WorldPos);
 
-    // Same shading model as the forward PBR shader: ambient + one directional
-    // light with half-Lambert diffuse and a Blinn specular lobe, attenuated by
-    // the cascaded shadow map. The ambient is the sky's irradiance, so it carries
-    // the sky's colour and direction (g_Ambient.a still scales it), plus the
-    // specular lobe's share of the prefiltered environment - without that a metal
-    // has no ambient specular at all.
+    // Same shading model as the forward PBR shader: ambient + one directional light
+    // with half-Lambert diffuse and a GGX specular lobe (the same D/G/F terms the ray
+    // tracing path uses), attenuated by the cascaded shadow map. The ambient is the
+    // sky's irradiance, so it carries the sky's colour and direction (g_Ambient.a
+    // still scales it), plus the specular lobe's share of the environment - without
+    // that a metal has no ambient specular at all. A metal has no diffuse lobe, hence
+    // the (1-m), and the occlusion only scales the two indirect terms.
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), bc, m);
-    float3 col = SkyIrradiance(N) * g_Ambient.a * bc + SkySpecular(N, V, F0, r) * g_Ambient.a;
+    float3 col = (SkyIrradiance(N) * g_Ambient.a * bc * (1.0 - m) + SkySpecular(N, V, F0, r) * g_Ambient.a) * ao;
     {
         float3 Ldir = normalize(-g_LightDir.xyz);
         float  NdotL = dot(N, Ldir) * 0.5 + 0.5;
-        float3 H = normalize(Ldir + V);
-        float  specExp = max(1.0, (1.0 - r) * 256.0);
-        float  spec = pow(max(dot(N, H), 0.001), specExp);
         float3 diff = bc * (1.0 - m);
-        float3 specC = F0;
+        float3 spec = DirectSpecular(N, V, Ldir, F0, r) * saturate(dot(N, Ldir));
 
         // Cascade selection + PCF comparison, matching g_PS_Forward's DoLight.
         // Without this every object drawn through the mesh shader path would be
@@ -1915,7 +1952,7 @@ float4 main(in PSInput i) : SV_TARGET {
             shadow = g_ShadowMap.SampleCmpLevelZero(g_ShadowMapSampler, float3(sc.xy, (float)c), sc.z - bias);
         }
 
-        col += (diff * NdotL + specC * spec) * g_LightColor.rgb * g_LightColor.a * shadow;
+        col += (diff * NdotL + spec) * g_LightColor.rgb * g_LightColor.a * shadow;
     }
 
     // Emissive is self-emission: added after lighting (not tinted by the light).

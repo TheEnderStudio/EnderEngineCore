@@ -353,17 +353,59 @@ struct PSIn
     float2 UV  : TEXCOORD2;
 };
 
-float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r)
+// ---------------------------------------------------------------------------
+// Direct lighting BRDF: the same GGX / Smith / Schlick terms the ray tracing path
+// uses (RayTracingSubsystem's D_GGX, SmithG2, F_Schlick, and the same alpha =
+// roughness^2), so one roughness value means the same lobe width everywhere: the
+// direct highlight, the ray traced reflection and the environment split-sum all
+// agree. The previous Blinn-Phong lobe (pow(NdotH, (1-r)*256)) had no relation to
+// the roughness the reflections used.
+// ---------------------------------------------------------------------------
+float D_GGX(float NdotH, float a)
+{
+    float a2 = a * a;
+    float d  = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / max(3.14159265358979 * d * d, 1e-8);
+}
+
+float3 F_Schlick(float3 F0, float VdotH)
+{
+    return F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+}
+
+float SmithG2(float NdotV, float NdotL, float a)
+{
+    float a2 = a * a;
+    float gv = sqrt(max(a2 + (1.0 - a2) * NdotV * NdotV, 0.0));
+    float gl = sqrt(max(a2 + (1.0 - a2) * NdotL * NdotL, 0.0));
+    return 2.0 * NdotL * NdotV / max(NdotL * gv + NdotV * gl, 1e-5);
+}
+
+// Cook-Torrance specular of one light, without the NdotL of the light integral.
+float3 DirectSpecular(float3 N, float3 V, float3 Ldir, float3 F0, float roughness)
+{
+    const float a = max(roughness * roughness, 1e-4);
+    const float NdotL = saturate(dot(N, Ldir));
+    const float NdotV = saturate(dot(N, V));
+    const float3 H = normalize(Ldir + V);
+    const float NdotH = saturate(dot(N, H));
+    const float VdotH = saturate(dot(V, H));
+    const float DG = D_GGX(NdotH, a) * SmithG2(NdotV, NdotL, a);
+    const float denom = max(4.0 * NdotV * max(NdotL, 1e-3), 1e-4);
+    return F_Schlick(F0, VdotH) * (DG / denom);
+}
+
+float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r, float ao)
 {
     // F0 of the dielectric/metal mix, used by the direct specular lobe and by the
     // environment below.
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), bc, m);
     // Ambient: the sky's irradiance along the normal (environment lighting instead
-    // of a flat colour), plus the specular lobe's share of the environment. g_Ambient.a
-    // still scales both. The specular term is what lights a metal: the irradiance
-    // term above only ever fed the diffuse lobe, so metals and polished dielectrics
-    // had no ambient specular at all.
-    float3 col = SkyIrradiance(N) * g_Ambient.a * bc + SkySpecular(N, V, F0, r) * g_Ambient.a;
+    // of a flat colour) plus the specular lobe's share of the environment, both
+    // scaled by g_Ambient.a. A metal has no diffuse lobe at all, hence the (1-m):
+    // without it a metal surface would be lit twice by the ambient. Occlusion is a
+    // property of indirect light only, so it scales these two terms and not the sun.
+    float3 col = (SkyIrradiance(N) * g_Ambient.a * bc * (1.0 - m) + SkySpecular(N, V, F0, r) * g_Ambient.a) * ao;
     for (uint i = 0; i < g_LightCount && i < 8; i++)
     {
         Light L = g_Lights[i];
@@ -397,11 +439,8 @@ float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r)
         }
 
 	float NdotL = dot(N, Ldir) * 0.5 + 0.5;
-		float3 H = normalize(Ldir + V);
-		float specExp = max(1.0, (1.0 - r) * 256.0);
-		float spec = pow(max(dot(N, H), 0.001), specExp);
         float3 diff = bc * (1.0 - m);
-        float3 specC = F0;
+        float3 spec = DirectSpecular(N, V, Ldir, F0, r) * saturate(dot(N, Ldir));
         float shadow = 1.0;
         if (lt < 0.5) {
             float camZ = abs(mul(g_ViewProj, float4(wp, 1.0)).w);
@@ -416,7 +455,7 @@ float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r)
                 shadow = g_ShadowMap.SampleCmpLevelZero(g_ShadowMap_sampler, float3(sc.xy, c), sc.z - bias).r;
             }
         }
-        col += (diff * NdotL + specC * spec) * lc * intensity * att * shadow;
+        col += (diff * NdotL + spec) * lc * intensity * att * shadow;
     }
     return col;
 }
@@ -473,11 +512,29 @@ float4 main(PSIn i) : SV_TARGET
     if (g_EnvParams.z > 0.5) {
         return float4(g_SkyEnv.SampleLevel(g_SkyEnv_sampler, reflect(-V, N), 0).rgb, 1.0);
     }
-    float m = g_MetallicRough.x;
-    float r = g_MetallicRough.y;
-    float3 lit = DoLight(i.WP, N, V, bc, m, r);
+    // glTF ORM (occlusion / roughness / metallic) packed in one texture.
+    //
+    // The maps are sampled unconditionally: a material without them has the neutral
+    // white 1x1 fallback bound (see mkMat), so the multiplication is a no-op there.
+    // This is what the mesh shader path has always done with its material palettes,
+    // and it is why that path showed the Wall's roughness variation while this one
+    // showed a constant - the maps were declared and bound here but never read.
+    float4 orm = t_MR.Sample(t_BC_sampler, i.UV);
+    float m  = saturate(g_MetallicRough.x * orm.b);
+    float r  = saturate(g_MetallicRough.y * orm.g);
+    // Occlusion is *not* orm.r. glTF references the occlusion map separately
+    // (occlusionTexture), and a material can well have a metallicRoughness texture
+    // without one - the Demo's Wall does exactly that - in which case the R channel
+    // holds whatever the exporter put there and using it would black out the ambient
+    // light. Wiring up real occlusion needs its own binding (the loader already
+    // resolves the reference), which is why this stays neutral for now.
+    float ao = 1.0;
+    // glTF emissive = factor * texture (w carries the strength).
+    float3 emis = g_Emissive.rgb * g_Emissive.w * t_EmissiveMap.Sample(t_BC_sampler, i.UV).rgb;
+
+    float3 lit = DoLight(i.WP, N, V, bc, m, r, ao);
     // Emissive is self-emission: added after lighting (not tinted by the light).
-    return float4(lit + g_Emissive.rgb * g_Emissive.w, a);
+    return float4(lit + emis, a);
 }
 )";
 
@@ -571,8 +628,15 @@ PSOut main(PSIn i)
         float3 sn = t_NormalMap.Sample(t_BC_sampler, i.UV).xyz * 2.0 - 1.0;
         N = NormalMapped(N, i.WP, i.UV, sn);
     }
-    o.Norm  = float4(N, g_MetallicRough.y);
-    o.Emis  = float4(g_Emissive.rgb * g_Emissive.w, 1.0);
+    // The hybrid path takes its shading from the ray trace, but it does read two
+    // things from here: the reflection lobe's roughness (the normal target's alpha)
+    // and the emissive. Both now come from the material's maps, so a textured
+    // roughness - the Wall has one - actually reaches the traced reflections instead
+    // of every material being equally rough. Metallic is not in the G-buffer yet, so
+    // the compose still assumes a dielectric F0 (see the note in the compose shader).
+    float4 orm = t_MR.Sample(t_BC_sampler, i.UV);
+    o.Norm  = float4(N, saturate(g_MetallicRough.y * orm.g));
+    o.Emis  = float4(g_Emissive.rgb * g_Emissive.w * t_EmissiveMap.Sample(t_BC_sampler, i.UV).rgb, 1.0);
     return o;
 }
 )";
@@ -863,9 +927,12 @@ struct RenderSubsystem::RenderBackend {
 	F32  envIntensity = 1.0f;   ///< Specular IBL intensity (envParams.w).
 	/// Cube-map orientation fixes (see envFaceMatrix): which mirrors the built
 	/// environment needs so that it matches the visible sky. Kept as data rather than
-	/// as a baked-in correction until the right combination is confirmed on screen.
+	/// as a correction baked into the face table, so the convention can be re-dialled
+	/// on screen instead of re-derived. The defaults were settled that way: the table
+	/// is the textbook one, yet the vertical axis still came out mirrored, so V is
+	/// flipped by default (U and the world mirror turned out not to be needed).
 	bool envFlipU = false;      ///< Mirror every face horizontally.
-	bool envFlipV = false;      ///< Mirror every face vertically.
+	bool envFlipV = true;       ///< Mirror every face vertically (the measured default).
 	bool envMirrorY = false;    ///< Mirror the sky about the world's up axis.
 
 	/// @brief Fill the frame constants the shaders derive lighting from.

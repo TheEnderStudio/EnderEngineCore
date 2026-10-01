@@ -34,13 +34,22 @@ namespace {
 		return nullptr;
 	}
 
+	void toRelativePath(/*[in]*/ FileNode* tree) {
+		if (tree->nextNodes.has_value()) {
+			for (auto& node : tree->nextNodes.value()) {
+				toRelativePath(node);
+			}
+		}
+		tree->path = relative(tree->path);
+	}
+
 	void destroyFileTree(FileNode* tree) {
-		if (!tree->nextNodes.has_value()) {
-			delete tree;
+		if (tree->nextNodes.has_value()) {
+			for (auto& node : tree->nextNodes.value()) {
+				destroyFileTree(node);
+			}
 		}
-		for (auto& node : tree->nextNodes.value()) {
-			destroyFileTree(node);
-		}
+		delete tree;
 	}
 
 	struct VolumeEntry {
