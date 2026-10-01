@@ -421,6 +421,27 @@ target("dxcreflect")
 target_end()
 
 -- ---------------------------------------------------------------------------
+-- EnderEditor (based on Qt 6, need Qt SDK)
+-- ---------------------------------------------------------------------------
+target("EnderEditor")
+	add_rules("qt.widgetapp")
+	set_kind("binary")
+	add_headerfiles("Include/Editor/**/*.h")
+	add_files("Source/Editor/**/*.cpp")
+	add_files("Source/Editor/**/*.ui")
+	add_files("Include/Editor/**/*.h") -- For qt.moc
+
+	add_files("Source/Editor/Version.rc")
+	
+	add_deps("EnderEngineCore")
+
+	if is_plat("windows") then
+		add_cxflags("/permissive-", { force = true })
+	end
+
+target_end()
+
+-- ---------------------------------------------------------------------------
 -- Libraries
 -- ---------------------------------------------------------------------------
 includes("Libraries/EnderVFiles2") -- EnderVFiles2

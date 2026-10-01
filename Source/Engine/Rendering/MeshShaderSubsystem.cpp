@@ -775,8 +775,10 @@ struct SceneConstants { // 264 B payload (buffer 320 B; layout matches the HLSL 
 	Vec4   skyCorners[8] = {};            // 624: skybox corner colours (bit0=x+, bit1=y+, bit2=z+)
 	                                      //      -> the ambient term is derived from them, see SkyIrradiance
 	Vec4   envParams = Vec4(0, 1, 0, 1);  // 752: x = sky IBL on, y = mip scale, z = debug, w = intensity
-}; // 768 B (buffer 1024 B)
-static_assert(sizeof(SceneConstants) == 768, "SceneConstants must match the HLSL cbuffer layout");
+	Vec4   shadowParams = Vec4(1, 0.15f, 0.002f, 2); // 768: x = PCF radius, y = cascade blend,
+	                                      //      z/w = shadow depth bias base / slope scale
+}; // 784 B (buffer 1024 B)
+static_assert(sizeof(SceneConstants) == 784, "SceneConstants must match the HLSL cbuffer layout");
 
 struct SceneMeshInfo { // 96 B (16-byte aligned; layout must match the HLSL struct)
 	Vec4   center;           // 0  mesh-local LOD0 bounding-sphere center
@@ -1772,6 +1774,7 @@ cbuffer cbSceneConstants : register(b0) {
     float4   g_CascadeSplits;
     float4   g_SkyCorners[8];   // 8 skybox corner colours, see SkyIrradiance below
     float4   g_EnvParams;       // x = sky IBL on, y = mip scale, z = debug, w = intensity
+    float4   g_ShadowParams;    // x = PCF radius, y = cascade blend, z/w = depth bias base/slope
 };
 
 // Diffuse irradiance of the analytic sky.
@@ -1855,6 +1858,61 @@ float3 SkySpecular(float3 N, float3 V, float3 F0, float roughness)
     const float3 pre = g_SkyEnv.SampleLevel(g_SkyEnvSampler, reflect(-V, N), lod).rgb;
     const float2 ab = EnvBRDFApprox(saturate(dot(N, V)), max(roughness, 0.002));
     return pre * (F0 * ab.x + ab.y) * g_EnvParams.w;
+}
+
+// Cascaded shadows: same code as the forward PBR shader's SampleShadowCascade /
+// SampleShadow (see the notes there) so both paths shadow identically.
+float SampleShadowCascade(uint c, float3 uvDepth, float radiusTexels)
+{
+    if (radiusTexels <= 0.001)
+        return g_ShadowMap.SampleCmpLevelZero(g_ShadowMapSampler, float3(uvDepth.xy, (float)c), uvDepth.z);
+
+    // Texture2DArray's GetDimensions takes (width, height, elements).
+    uint sw = 1, sh = 1, se = 1;
+    g_ShadowMap.GetDimensions(sw, sh, se);
+    const float2 texel = 1.0 / max(float2(sw, sh), 1.0);
+    static const float2 kOffsets[4] = { float2(-0.5, -0.5), float2(0.5, -0.5), float2(-0.5, 0.5), float2(0.5, 0.5) };
+
+    float acc = 0.0;
+    [unroll]
+    for (int i = 0; i < 4; ++i)
+    {
+        const float2 uv = uvDepth.xy + kOffsets[i] * radiusTexels * texel;
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { acc += 1.0; continue; }
+        acc += g_ShadowMap.SampleCmpLevelZero(g_ShadowMapSampler, float3(uv, (float)c), uvDepth.z);
+    }
+    return acc * 0.25;
+}
+
+float SampleShadow(float3 wp, float3 N, float3 Ldir)
+{
+    const float NdotL = saturate(dot(N, Ldir));
+    const float camZ = abs(mul(g_ViewProj, float4(wp, 1.0)).w);
+    uint c = 0;
+    if (camZ > g_CascadeSplits.x) c = 1;
+    if (camZ > g_CascadeSplits.y) c = 2;
+    if (camZ > g_CascadeSplits.z) c = 3;
+
+    const float slope = sqrt(saturate(1.0 - NdotL * NdotL)) / max(NdotL, 0.15);
+    const float bias = g_ShadowParams.z * (1.0 + g_ShadowParams.w * slope);
+
+    float4 sc = mul(g_ShadowMapUVDepth[c], float4(wp, 1.0));
+    sc.xyz /= max(sc.w, 1e-6);
+    float shadow = SampleShadowCascade(c, float3(sc.xy, sc.z - bias), g_ShadowParams.x);
+
+    const float splitEnd = (c == 0) ? g_CascadeSplits.x : ((c == 1) ? g_CascadeSplits.y : ((c == 2) ? g_CascadeSplits.z : 0.0));
+    if (c < 3 && splitEnd > 0.0 && g_ShadowParams.y > 0.0)
+    {
+        const float fadeStart = splitEnd * (1.0 - g_ShadowParams.y);
+        const float bw = saturate((camZ - fadeStart) / max(splitEnd - fadeStart, 1e-4));
+        if (bw > 0.0)
+        {
+            float4 sn = mul(g_ShadowMapUVDepth[c + 1], float4(wp, 1.0));
+            sn.xyz /= max(sn.w, 1e-6);
+            shadow = lerp(shadow, SampleShadowCascade(c + 1, float3(sn.xy, sn.z - bias), g_ShadowParams.x), bw);
+        }
+    }
+    return shadow;
 }
 
 // Direct lighting: the same GGX / Smith / Schlick terms as the ray tracing path and
@@ -1981,21 +2039,11 @@ float4 main(in PSInput i) : SV_TARGET {
         float3 diff = bc * (1.0 - m);
         float3 spec = DirectSpecular(N, V, Ldir, F0, r) * saturate(dot(N, Ldir));
 
-        // Cascade selection + PCF comparison, matching g_PS_Forward's DoLight.
-        // Without this every object drawn through the mesh shader path would be
-        // lit as if nothing occluded it.
+        // Cascade selection, bias, PCF and cascade blending, matching the forward
+        // PBR shader's SampleShadow. Without this every object drawn through the
+        // mesh shader path would be lit as if nothing occluded it.
         float shadow = 1.0;
-        if (g_LightColor.a > 0.0) {
-            const float camZ = abs(mul(g_ViewProj, float4(i.WorldPos, 1.0)).w);
-            uint c = 0;
-            if (camZ > g_CascadeSplits.x) c = 1;
-            if (camZ > g_CascadeSplits.y) c = 2;
-            if (camZ > g_CascadeSplits.z) c = 3;
-            float4 sc = mul(g_ShadowMapUVDepth[c], float4(i.WorldPos, 1.0));
-            sc.xyz /= max(sc.w, 1e-6);
-            const float bias = 0.005 + 0.01 * (1.0 - NdotL);
-            shadow = g_ShadowMap.SampleCmpLevelZero(g_ShadowMapSampler, float3(sc.xy, (float)c), sc.z - bias);
-        }
+        if (g_LightColor.a > 0.0) shadow = SampleShadow(i.WorldPos, N, Ldir);
 
         col += (diff * NdotL + spec) * g_LightColor.rgb * g_LightColor.a * shadow;
     }
@@ -3285,6 +3333,8 @@ Result<void, RenderError> MeshShaderSubsystem::drawSceneImpl(const Vector<MeshDr
 		// Specular IBL parameters (enable / mip scale / debug / intensity) come from
 		// the renderer so this path and the forward one are lit identically.
 		cb.envParams = p.renderer->skyEnvParams();
+		// Same for the shadow quality/bias knobs (PCF radius, cascade blend, bias).
+		cb.shadowParams = p.renderer->shadowParams();
 		Vec3 sunDir(0); Vec4 sunColor(1, 1, 1, 1);
 		if (p.renderer->getPrimaryDirectionalLight(sunDir, sunColor)) {
 			cb.lightDir = Vec4(glm::normalize(sunDir), 0.0f);

@@ -57,7 +57,7 @@ using namespace EnderEngine::Extensions::AdaptiveMusic;
 struct FlyCamera {
 	Vec3 pos = Vec3(0, 3, 4);
 	F32 yaw = -90.0f, pitch = -15.0f;
-	F32 moveSpeed = 10.0f, lookSpeed = 0.15f;
+	F32 moveSpeed = 4.0f, lookSpeed = 0.15f;
 	bool boundToBody = true;   // F5 toggles between bound / free-fly
 	Vec3 freePos = Vec3(0, 2, 4);
 
@@ -1031,6 +1031,26 @@ HALT
 			debugUI.text("Render pipeline: UNAVAILABLE (no frame is being drawn)");
 		}
 		debugUI.text("Mode: {} (F9)", hybridRT ? "Hybrid RT" : "Raster");
+		// ---- Cascaded shadows: quality and bias -------------------------------
+		// Four knobs, because the right values depend on the scene's scale and on how
+		// much the shadow map is stretched over the cascades: the PCF radius sets the
+		// penumbra width, the blend removes the visible line at a cascade boundary,
+		// and the two bias terms trade shadow acne (too little) against shadows
+		// detaching from their casters (too much).
+		{
+			const Vec4 sp = renderer.shadowParams();
+			F32 pcfRadius = sp.x, cascadeBlend = sp.y, biasBase = sp.z, biasSlope = sp.w;
+			bool changed = false;
+			changed |= debugUI.sliderFloat("Shadow PCF Radius", &pcfRadius, 0.0f, 4.0f);
+			changed |= debugUI.sliderFloat("Shadow Cascade Blend", &cascadeBlend, 0.0f, 0.5f);
+			changed |= debugUI.sliderFloat("Shadow Bias", &biasBase, 0.0f, 0.02f);
+			changed |= debugUI.sliderFloat("Shadow Bias Slope", &biasSlope, 0.0f, 8.0f);
+			if (debugUI.button("Reset shadow params")) {
+				pcfRadius = 1.0f; cascadeBlend = 0.15f; biasBase = 0.002f; biasSlope = 2.0f;
+				changed = true;
+			}
+			if (changed) renderer.setShadowParams(pcfRadius, cascadeBlend, biasBase, biasSlope);
+		}
 		if (hybridRT) {
 			static const char* rtModeNames[] = { "Shaded", "GBufferColor", "GBufferNormal", "Diffuse", "Reflections", "Fresnel", "RTAlpha", "BackFacingNormals" };
 			if (debugUI.button(fmt::format("RT View: {}", rtModeNames[rtDrawMode]).c_str())) {

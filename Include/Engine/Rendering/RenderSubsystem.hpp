@@ -572,6 +572,25 @@ public:
 	EE_NODISCARD bool skyEnvFlipU() const;
 	EE_NODISCARD bool skyEnvFlipV() const;
 	EE_NODISCARD bool skyEnvMirrorY() const;
+	/**
+	 * @brief Cascaded shadow quality and bias.
+	 *
+	 * @param pcfRadiusTexels Width of the shadow PCF kernel in shadow map texels. The
+	 *        comparison sampler already averages a 2x2 footprint (hardware PCF); this
+	 *        spreads four more taps over the given radius, so 0 means "hardware only"
+	 *        and 1..4 gives progressively softer penumbrae.
+	 * @param cascadeBlend   Fraction of a cascade's far end that fades into the next
+	 *        cascade, 0 = the hard switch this used to be. The boundary is where
+	 *        resolution, bias and PCF footprint all change at once, which shows as a
+	 *        line across the ground when it is not blended.
+	 * @param biasBase       Depth bias in shadow map depth units at normal incidence.
+	 * @param biasSlope      How much the bias grows with tan(angle between the normal
+	 *        and the light) - the angle where the depth error grows. A single constant
+	 *        bias large enough for grazing light is what detaches shadows from their
+	 *        casters, so this trades that against acne on slopes.
+	 */
+	void setShadowParams(F32 pcfRadiusTexels, F32 cascadeBlend, F32 biasBase, F32 biasSlope);
+	EE_NODISCARD Vec4 shadowParams() const;
 	/// @brief Shader parameters of the specular IBL (mirrors FrameConstants::envParams).
 	EE_NODISCARD Vec4 skyEnvParams() const;
 	/// @brief Cubemap SRV of the prefiltered environment (never null after initialize).

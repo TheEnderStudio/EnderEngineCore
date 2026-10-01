@@ -246,6 +246,7 @@ cbuffer Frame : register(b0)
     float4x4 g_ShadowMapUVDepth[4]; float4 g_CascadeSplits;
     float4   g_SkyCorners[8];   // skybox corners -> ambient irradiance, see SkyIrradiance
     float4   g_EnvParams;       // x = sky IBL on, y = mip scale, z = debug, w = intensity
+    float4   g_ShadowParams;    // x = PCF radius, y = cascade blend, z/w = depth bias base/slope
 };
 
 // Diffuse irradiance of the analytic sky (the same closed form the mesh shader and
@@ -395,6 +396,77 @@ float3 DirectSpecular(float3 N, float3 V, float3 Ldir, float3 F0, float roughnes
     return F_Schlick(F0, VdotH) * (DG / denom);
 }
 
+// ---------------------------------------------------------------------------
+// Cascaded shadows
+// ---------------------------------------------------------------------------
+// One cascade, with the PCF kernel of the configured radius. The comparison sampler
+// is a linear *comparison* filter, so a single tap already averages the 2x2 footprint
+// (hardware PCF); the taps below spread that footprint over the requested radius.
+float SampleShadowCascade(uint c, float3 uvDepth, float radiusTexels)
+{
+    if (radiusTexels <= 0.001)
+        return g_ShadowMap.SampleCmpLevelZero(g_ShadowMap_sampler, float3(uvDepth.xy, (float)c), uvDepth.z).r;
+
+    // Texture2DArray's GetDimensions takes (width, height, elements) - unlike
+    // TextureCube, whose four-argument form starts with the mip level.
+    uint sw = 1, sh = 1, se = 1;
+    g_ShadowMap.GetDimensions(sw, sh, se);
+    const float2 texel = 1.0 / max(float2(sw, sh), 1.0);
+    static const float2 kOffsets[4] = { float2(-0.5, -0.5), float2(0.5, -0.5), float2(-0.5, 0.5), float2(0.5, 0.5) };
+
+    float acc = 0.0;
+    [unroll]
+    for (int i = 0; i < 4; ++i)
+    {
+        const float2 uv = uvDepth.xy + kOffsets[i] * radiusTexels * texel;
+        // Outside the cascade the map repeats its edge texels (clamp addressing), which
+        // would shadow everything past the last cascade: treat it as lit instead.
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { acc += 1.0; continue; }
+        acc += g_ShadowMap.SampleCmpLevelZero(g_ShadowMap_sampler, float3(uv, (float)c), uvDepth.z).r;
+    }
+    return acc * 0.25;
+}
+
+// Cascaded shadow term for a directional light: cascade selection, a slope-scaled
+// depth bias, the PCF kernel and a blend into the next cascade near the split.
+float SampleShadow(float3 wp, float3 N, float3 Ldir)
+{
+    const float NdotL = saturate(dot(N, Ldir));
+    const float camZ = abs(mul(g_ViewProj, float4(wp, 1.0)).w);
+    uint c = 0;
+    if (camZ > g_CascadeSplits.x) c = 1;
+    if (camZ > g_CascadeSplits.y) c = 2;
+    if (camZ > g_CascadeSplits.z) c = 3;
+
+    // Slope-scaled bias: the depth error of a shadow lookup grows with tan(angle
+    // between the surface normal and the light), so the bias has to follow it. A
+    // constant bias big enough for the worst slope is what detaches shadows from the
+    // objects casting them (peter-panning), which is what this replaces.
+    const float slope = sqrt(saturate(1.0 - NdotL * NdotL)) / max(NdotL, 0.15);
+    const float bias = g_ShadowParams.z * (1.0 + g_ShadowParams.w * slope);
+
+    float4 sc = mul(g_ShadowMapUVDepth[c], float4(wp, 1.0));
+    sc.xyz /= sc.w;
+    float shadow = SampleShadowCascade(c, float3(sc.xy, sc.z - bias), g_ShadowParams.x);
+
+    // Cascade blend: near the far end of a cascade, fade into the next one, so the
+    // boundary - where resolution, bias and PCF footprint all change at once - is not
+    // a visible line.
+    const float splitEnd = (c == 0) ? g_CascadeSplits.x : ((c == 1) ? g_CascadeSplits.y : ((c == 2) ? g_CascadeSplits.z : 0.0));
+    if (c < 3 && splitEnd > 0.0 && g_ShadowParams.y > 0.0)
+    {
+        const float fadeStart = splitEnd * (1.0 - g_ShadowParams.y);
+        const float bw = saturate((camZ - fadeStart) / max(splitEnd - fadeStart, 1e-4));
+        if (bw > 0.0)
+        {
+            float4 sn = mul(g_ShadowMapUVDepth[c + 1], float4(wp, 1.0));
+            sn.xyz /= sn.w;
+            shadow = lerp(shadow, SampleShadowCascade(c + 1, float3(sn.xy, sn.z - bias), g_ShadowParams.x), bw);
+        }
+    }
+    return shadow;
+}
+
 float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r, float ao)
 {
     // F0 of the dielectric/metal mix, used by the direct specular lobe and by the
@@ -442,19 +514,7 @@ float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r, float
         float3 diff = bc * (1.0 - m);
         float3 spec = DirectSpecular(N, V, Ldir, F0, r) * saturate(dot(N, Ldir));
         float shadow = 1.0;
-        if (lt < 0.5) {
-            float camZ = abs(mul(g_ViewProj, float4(wp, 1.0)).w);
-            uint c = 0;
-            if (camZ > g_CascadeSplits.x) c = 1;
-            if (camZ > g_CascadeSplits.y) c = 2;
-            if (camZ > g_CascadeSplits.z) c = 3;
-            if (c < 4) {
-                float4 sc = mul(g_ShadowMapUVDepth[c], float4(wp, 1.0));
-                sc.xyz /= sc.w;
-                float bias = 0.005 + 0.01 * (1.0 - NdotL);
-                shadow = g_ShadowMap.SampleCmpLevelZero(g_ShadowMap_sampler, float3(sc.xy, c), sc.z - bias).r;
-            }
-        }
+        if (lt < 0.5) shadow = SampleShadow(wp, N, Ldir);
         col += (diff * NdotL + spec) * lc * intensity * att * shadow;
     }
     return col;
@@ -934,6 +994,8 @@ struct RenderSubsystem::RenderBackend {
 	bool envFlipU = false;      ///< Mirror every face horizontally.
 	bool envFlipV = true;       ///< Mirror every face vertically (the measured default).
 	bool envMirrorY = false;    ///< Mirror the sky about the world's up axis.
+	/// Cascaded shadow quality and bias (FrameConstants::shadowParams).
+	Vec4 shadowParams = Vec4(1.0f, 0.15f, 0.002f, 2.0f);
 
 	/// @brief Fill the frame constants the shaders derive lighting from.
 	///
@@ -945,6 +1007,7 @@ struct RenderSubsystem::RenderBackend {
 	void applyEnvironment(FrameConstants& fc) const {
 		for (int i = 0; i < 8; ++i) fc.skyCorners[i] = skyDesc.has_value() ? skyDesc->corners[i] : fc.ambient;
 		fc.envParams = Vec4(envEnabled ? 1.0f : 0.0f, envMipScale, envDebug ? 1.0f : 0.0f, envIntensity);
+		fc.shadowParams = shadowParams;
 	}
 
 	/// @brief View-projection that maps a direction onto cube face @p face.
@@ -2759,6 +2822,14 @@ void RenderSubsystem::setSkyEnvFlip(bool flipU, bool flipV, bool mirrorY) {
 bool RenderSubsystem::skyEnvFlipU() const { return m_backend->envFlipU; }
 bool RenderSubsystem::skyEnvFlipV() const { return m_backend->envFlipV; }
 bool RenderSubsystem::skyEnvMirrorY() const { return m_backend->envMirrorY; }
+void RenderSubsystem::setShadowParams(F32 pcfRadiusTexels, F32 cascadeBlend, F32 biasBase, F32 biasSlope) {
+	m_backend->shadowParams = Vec4(
+		std::clamp(pcfRadiusTexels, 0.0f, 8.0f),
+		std::clamp(cascadeBlend, 0.0f, 0.5f),
+		std::clamp(biasBase, 0.0f, 0.05f),
+		std::clamp(biasSlope, 0.0f, 16.0f));
+}
+Vec4 RenderSubsystem::shadowParams() const { return m_backend->shadowParams; }
 Vec4 RenderSubsystem::skyEnvParams() const {
 	return Vec4(m_backend->envEnabled ? 1.0f : 0.0f, m_backend->envMipScale,
 	            m_backend->envDebug ? 1.0f : 0.0f, m_backend->envIntensity);

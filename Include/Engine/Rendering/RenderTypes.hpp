@@ -245,6 +245,13 @@ struct alignas(16) FrameConstants {
 	/// environment sample), w = intensity. Appended at the end like the corners, so
 	/// shaders that do not read them keep working unchanged.
 	Vec4 envParams = Vec4(0.0f, 1.0f, 0.0f, 1.0f);
+	/// Cascaded shadow quality and bias: x = PCF radius in shadow map texels (0 = only
+	/// the hardware's own 2x2 comparison filter), y = cascade blend fraction (how much
+	/// of the far end of a cascade fades into the next one; 0 = the hard switch this
+	/// used to be), z = depth bias base, w = slope-bias scale (the bias then grows with
+	/// tan(angle between the normal and the light), which is where the depth error
+	/// grows too). Appended at the end like the fields above.
+	Vec4 shadowParams = Vec4(1.0f, 0.15f, 0.002f, 2.0f);
 };
 
 /// @brief Single light data in the light constant buffer.
