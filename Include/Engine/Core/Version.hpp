@@ -18,6 +18,11 @@ public:
 		return engineVer;
 	}
 
+	static const char* getFullEngineInfo() {
+		const static String engineInfo = std::format("Built at {}, {}, Version {}", EE_BUILD_TIME, EE_BUILD_DATE, getEngineVersion().toString());
+		return engineInfo.c_str();
+	}
+
 	/// @brief Get the major version component.
 	UInt32 major() const { return m_major; }
 	/// @brief Get the minor version component.
