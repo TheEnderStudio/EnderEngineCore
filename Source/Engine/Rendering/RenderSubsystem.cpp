@@ -2866,6 +2866,17 @@ Optional<MaterialDesc> RenderSubsystem::getMaterial(MaterialHandle material) con
 	return md->desc;
 }
 
+bool RenderSubsystem::setMaterial(MaterialHandle material, const MaterialDesc& desc) {
+	auto* md = m_backend->materials.get(material.index, material.generation);
+	if (!md) return false;
+	md->desc = desc;
+	// Nothing else to do for the raster paths: draw() packs the object constants from
+	// this descriptor on every frame, and the ray tracing path reads it when it
+	// updates its scene. The mesh shader path is the exception - it owns a GPU copy of
+	// the factors, see MeshShaderSubsystem::refreshMaterials().
+	return true;
+}
+
 TextureSRV RenderSubsystem::getTextureSRV(TextureHandle texture) const {
 	auto* td = m_backend->textures.get(texture.index, texture.generation);
 	return td ? td->srv.RawPtr() : nullptr;

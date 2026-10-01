@@ -162,6 +162,20 @@ public:
 	void setSkyEnv(TextureSRV envCube);
 
 	/**
+	 * @brief Re-upload the GPU material table after a material was edited.
+	 *
+	 * The cluster path keeps its own copy of every material's factors (base colour,
+	 * metallic/roughness, emissive) in a small structured buffer, taken when
+	 * setMeshes() built the palette. Editing a material through
+	 * RenderSubsystem::setMaterial() therefore does not reach this path until that
+	 * table is rewritten; this does exactly that and nothing else - the geometry
+	 * pools, the cluster hierarchy and the texture palettes are untouched, so it is
+	 * cheap enough to call while a slider is dragged. A *texture* change still needs
+	 * a full setMeshes().
+	 */
+	void refreshMaterials();
+
+	/**
 	 * @brief Draw the M1 test grid (animated cubes with amplification/mesh shaders).
 	 *
 	 * Renders into the currently bound render target + depth buffer of the

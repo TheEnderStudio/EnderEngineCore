@@ -319,6 +319,11 @@ constexpr UInt32 kClusterMaxBudget = 1u << 18; // upper bound accepted by setClu
 // a model with more distinct materials than this falls back to white.
 constexpr UInt32 kMaxMaterials = 32;
 
+// One entry per distinct material used by the registered meshes. Kept as subsystem
+// state (not a setMeshes() local) so a live material edit can rewrite the GPU table
+// without re-registering the geometry.
+struct MatSlot { MaterialHandle mat; MaterialDesc desc; bool valid = false; };
+
 // ===================================================================
 // Implementation
 // ===================================================================
@@ -417,6 +422,9 @@ struct MeshShaderSubsystem::Impl {
 	std::vector<D::IDeviceObject*>    normalSRVs;        // normal   (normalTexture)
 	std::vector<D::IDeviceObject*>    mrSRVs;            // metallicRoughnessTexture
 	std::vector<D::IDeviceObject*>    emissiveSRVs;      // emissiveTexture
+	/// Material slots of the registered meshes (see MatSlot), kept so the GPU material
+	/// table can be rewritten by refreshMaterials() after a live material edit.
+	std::vector<MatSlot>              materialSlots;
 	UInt32                            materialCount = 0;
 
 	// ---- Shadows (raster path only; the hybrid path uses ray traced shadows) ----
@@ -515,6 +523,7 @@ void MeshShaderSubsystem::onShutdown() {
 	p.shadowSampler.Release(); p.shadowDummyTex.Release(); p.shadowDummySRV.Release(); p.shadowMapSRV.Release();
 	p.skyEnvSampler.Release(); p.skyEnvDummyTex.Release(); p.skyEnvDummySRV.Release(); p.skyEnvSRV.Release();
 	p.materialSRVs.clear(); p.normalSRVs.clear(); p.mrSRVs.clear(); p.emissiveSRVs.clear();
+	p.materialSlots.clear();
 	p.materialCount = 0;
 	p.sceneMeshList.clear();
 }
@@ -836,6 +845,24 @@ struct MaterialGPU { // 48 B
 	                                            // w = 1 when a metallicRoughness map is bound
 };
 
+// Material factors as the cluster pixel shader wants them. Shared by the initial
+// upload and by refreshMaterials() so the two can never diverge.
+static MaterialGPU packMaterial(const MaterialDesc& md) {
+	MaterialGPU g;
+	g.baseColor = md.baseColorFactor;
+	// glTF: emission = emissiveFactor * emissiveTexture. The emissive map's fallback
+	// is white (the multiplicative identity) rather than black, so a material that
+	// carries only a factor - the Demo's lamp cube - still glows; this matches the
+	// forward path's `emissive = emissiveFactor * texture`.
+	g.emissive = Vec4(md.emissiveFactor, 1.0f);
+	g.params = Vec4(
+		md.metallicFactor,
+		md.roughnessFactor,
+		md.normalTexture.isValid() ? 1.0f : 0.0f,
+		md.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f);
+	return g;
+}
+
 // M3: vertex-clustering mesh simplification. Merges close vertices into cubic
 // cells (cell size chosen to approach ~frac of the vertex count), averages
 // positions/normals per cell and rebuilds the triangle list (degenerate or
@@ -966,6 +993,24 @@ float lodBoundingRadius(const std::vector<Vec4>& pos, const Vec3& center) {
 }
 
 } // namespace
+
+void MeshShaderSubsystem::refreshMaterials() {
+	auto& p = *m_impl;
+	if (!p.ok || !p.clMaterials || p.materialSlots.empty()) return;
+	auto* ctx = p.renderer && p.renderer->getContext() ? static_cast<D::IDeviceContext*>(p.renderer->getContext()) : nullptr;
+	if (!ctx) return;
+
+	std::vector<MaterialGPU> table(kMaxMaterials);
+	for (size_t i = 0; i < p.materialSlots.size() && i < kMaxMaterials; ++i) {
+		if (!p.materialSlots[i].valid) continue;
+		// Re-read through the handle: the descriptor may have been edited since the
+		// slot was created (RenderSubsystem::setMaterial).
+		if (auto md = p.renderer->getMaterial(p.materialSlots[i].mat)) p.materialSlots[i].desc = md.value();
+		table[i] = packMaterial(p.materialSlots[i].desc);
+	}
+	ctx->UpdateBuffer(p.clMaterials, 0, table.size() * sizeof(MaterialGPU), table.data(),
+		D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+}
 
 // Matches the structs above (also declared in the mesh shader below).
 static const char* g_SceneAS = R"(
@@ -2608,9 +2653,11 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 	// sub-meshes with different materials; each sub-mesh owns a contiguous range
 	// of the mesh's vertices, which is what lets a cluster pick the material of
 	// the region it was built from.
-	struct MatSlot  { MaterialHandle mat; MaterialDesc desc; bool valid = false; };
 	struct SubRange { UInt32 vBegin, vEnd, mat; };
-	std::vector<MatSlot> matSlots;
+	// The slot table outlives this call: refreshMaterials() rewrites the material
+	// factors from it after a live material edit (MatSlot is declared at file scope).
+	std::vector<MatSlot>& matSlots = p.materialSlots;
+	matSlots.clear();
 	std::vector<std::vector<SubRange>> meshSubs(meshes.size());
 	{
 		// Slot 0 is the white fallback so an out-of-range id is always safe.
@@ -2668,19 +2715,7 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 	std::vector<MaterialGPU> clMaterials(kMaxMaterials);
 	for (size_t i = 0; i < matSlots.size() && i < kMaxMaterials; ++i) {
 		if (!matSlots[i].valid) continue;
-		const MaterialDesc& md = matSlots[i].desc;
-		MaterialGPU& g = clMaterials[i];
-		g.baseColor = md.baseColorFactor;
-		// glTF: emission = emissiveFactor * emissiveTexture. The emissive map's
-		// fallback is white (the multiplicative identity) rather than black, so a
-		// material that carries only a factor - the Demo's lamp cube - still
-		// glows; this matches the forward path's `emissive = emissiveFactor`.
-		g.emissive = Vec4(md.emissiveFactor, 1.0f);
-		g.params = Vec4(
-			md.metallicFactor,
-			md.roughnessFactor,
-			md.normalTexture.isValid() ? 1.0f : 0.0f,
-			md.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f);
+		clMaterials[i] = packMaterial(matSlots[i].desc);
 	}
 	{
 		for (size_t mi = 0; mi < meshes.size(); ++mi) {
@@ -2917,10 +2952,27 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 		!createImmutable("MS ClusterVerts", clClusterVerts.data(), clClusterVerts.size() * sizeof(UInt32), sizeof(UInt32), p.clClusterVerts) ||
 		!createImmutable("MS ClusterTris", clClusterTris.data(), clClusterTris.size() * sizeof(UInt32), sizeof(UInt32), p.clClusterTris) ||
 		!createImmutable("MS ClusterGroups", clGroups.data(), clGroups.size() * sizeof(ClusterGroupGPU), sizeof(ClusterGroupGPU), p.clGroups) ||
-		!createImmutable("MS ClusterMeshInfo", clMeshInfo.data(), clMeshInfo.size() * sizeof(ClusterMeshInfo), sizeof(ClusterMeshInfo), p.clMeshInfo) ||
-		!createImmutable("MS ClusterMaterials", clMaterials.data(), clMaterials.size() * sizeof(MaterialGPU), sizeof(MaterialGPU), p.clMaterials)) {
+		!createImmutable("MS ClusterMeshInfo", clMeshInfo.data(), clMeshInfo.size() * sizeof(ClusterMeshInfo), sizeof(ClusterMeshInfo), p.clMeshInfo)) {
 		EError("MeshShader: failed to create cluster pool buffers");
 		return RenderError::BufferCreationFailed;
+	}
+	// The material table is the one pool that gets uploaded more than once - a live
+	// material edit only rewrites these few kilobytes - so unlike the geometry pools
+	// it is a default-usage buffer that UpdateBuffer() can rewrite in place.
+	{
+		p.clMaterials.Release();
+		D::BufferDesc bd; bd.Name = "MS ClusterMaterials";
+		bd.Size = clMaterials.size() * sizeof(MaterialGPU);
+		bd.BindFlags = D::BIND_SHADER_RESOURCE;
+		bd.Mode = D::BUFFER_MODE_STRUCTURED;
+		bd.ElementByteStride = sizeof(MaterialGPU);
+		bd.Usage = D::USAGE_DEFAULT;
+		D::BufferData bdata; bdata.pData = clMaterials.data(); bdata.DataSize = bd.Size;
+		dev->CreateBuffer(bd, &bdata, &p.clMaterials);
+		if (!p.clMaterials) {
+			EError("MeshShader: failed to create the material table");
+			return RenderError::BufferCreationFailed;
+		}
 	}
 
 	// ---- M5: material textures ----

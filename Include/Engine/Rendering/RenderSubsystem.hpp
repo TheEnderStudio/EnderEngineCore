@@ -150,6 +150,27 @@ public:
 	EE_NODISCARD Optional<MaterialDesc> getMaterial(MaterialHandle material) const;
 
 	/**
+	 * @brief Replace a material's descriptor (live material editing).
+	 *
+	 * The raster paths pack their per-object constants from the descriptor on every
+	 * draw and the ray tracing path re-reads it when it updates its scene, so a change
+	 * to the *factors* (base colour, metallic, roughness, emissive) shows up on the
+	 * next frame without any further call. The mesh shader path is the exception: it
+	 * snapshots the factors into a GPU table when the meshes are registered, so it
+	 * additionally needs MeshShaderSubsystem::refreshMaterials().
+	 *
+	 * Texture handles are stored but not re-bound: every path resolves its texture
+	 * bindings when the material is created (the raster paths' bindings live in the
+	 * material's shader resource binding, the mesh shader path's in its palettes), so
+	 * swapping a map needs those to be rebuilt. Editing factors is the supported use.
+	 *
+	 * @param material Material handle.
+	 * @param desc     New descriptor.
+	 * @return false if the handle is invalid.
+	 */
+	bool setMaterial(MaterialHandle material, const MaterialDesc& desc);
+
+	/**
 	 * @brief Get the shader resource view of a texture (Diligent ITextureView* as void*).
 	 * @param texture Texture handle.
 	 * @return The texture SRV, or nullptr if the handle is invalid.

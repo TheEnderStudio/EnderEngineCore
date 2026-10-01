@@ -1118,6 +1118,49 @@ HALT
 		}
 		debugUI.endWindow();
 
+		// ---- Lamp material: a live material editor ------------------------------
+		// One controlled object to see what the material parameters actually do. The
+		// scene's own assets barely carry maps (Terrian none, the Wall only a
+		// metallicRoughness one), so texture-driven variation is hard to judge on
+		// them; this cube has none either, which makes it the clean test case for the
+		// factors themselves - including the GGX highlight (drag Roughness from 0 to 1
+		// and watch the lobe widen) and the emissive term.
+		//
+		// The descriptor is read back every frame instead of being mirrored into a
+		// local copy, so the material stays the single source of truth. The forward
+		// path packs it into the object constants on every draw and the ray tracing
+		// path re-reads it when it updates its scene; the mesh shader path owns a GPU
+		// copy of the factors and needs MeshShaderSubsystem::refreshMaterials().
+		if (emissiveCubeMat.isValid()) {
+			debugUI.beginWindow("Emissive Lamp");
+			if (auto lamp = renderer.getMaterial(emissiveCubeMat)) {
+				MaterialDesc md = lamp.value();
+				debugUI.text("Lamp material (EmissiveLamp)");
+				float base[3] = { md.baseColorFactor.r, md.baseColorFactor.g, md.baseColorFactor.b };
+				bool changed = debugUI.colorEdit3("Base color", base);
+				float metallic = md.metallicFactor, roughness = md.roughnessFactor;
+				changed |= debugUI.sliderFloat("Metallic", &metallic, 0.0f, 1.0f);
+				changed |= debugUI.sliderFloat("Roughness", &roughness, 0.0f, 1.0f);
+				float emis[3] = { md.emissiveFactor.r, md.emissiveFactor.g, md.emissiveFactor.b };
+				// HDR: the emissive factor is an emission value, not a colour in [0,1].
+				changed |= debugUI.colorEdit3("Emissive", emis, true);
+				if (debugUI.button("Reset lamp material")) {
+					base[0] = 0.92f; base[1] = 0.92f; base[2] = 0.86f;
+					metallic = 0.0f; roughness = 0.35f;
+					emis[0] = 2.6f; emis[1] = 1.0f; emis[2] = 0.2f;
+					changed = true;
+				}
+				if (changed) {
+					md.baseColorFactor = Vec4(base[0], base[1], base[2], md.baseColorFactor.a);
+					md.metallicFactor = metallic;
+					md.roughnessFactor = roughness;
+					md.emissiveFactor = Vec3(emis[0], emis[1], emis[2]);
+					if (renderer.setMaterial(emissiveCubeMat, md)) meshShader.refreshMaterials();
+				}
+			}
+			debugUI.endWindow();
+		}
+
 		debugUI.beginWindow("Skybox");
 		static const char* skyNames[] = { "Day", "Sunset", "Night", "Texture" };
 		int totalModes = skyCubeTexHandle.isValid() ? 4 : 3;
