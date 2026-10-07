@@ -82,6 +82,8 @@
 #define EE_NAMESPACE_PHYSICS_END }
 #define EE_NAMESPACE_EDITOR_BEGIN namespace EnderEngine::Editor {
 #define EE_NAMESPACE_EDITOR_END }
+#define EE_NAMESPACE_L10N_BEGIN namespace EnderEngine::Localization {
+#define EE_NAMESPACE_L10N_END }
 
 #define EE_VERSION_MAJOR 0
 #define EE_VERSION_MINOR 2
