@@ -226,6 +226,7 @@ LanguageId LanguageRegistry::currentLanguage() {
 
 bool LanguageRegistry::setLanguage(LanguageId id) {
 	std::lock_guard<Mutex> lock(m_mutex);
+	if (id == m_currentLanguage) return true;
 	if (id < BuiltinLanguageCount) {
 		m_currentLanguage = id;
 		return true;

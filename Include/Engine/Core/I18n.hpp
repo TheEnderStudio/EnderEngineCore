@@ -87,13 +87,13 @@ inline bool removeLanguage(StringView tag) {
 
 class EE_API LocalizedString {
 public:
-	explicit LocalizedString(LanguageRegistry* reg = &LanguageRegistry::getInstance()) :
-		m_reg(reg) {}
+	explicit LocalizedString(LanguageRegistry* reg = &LanguageRegistry::getInstance()) : m_reg(reg) {}
 
 	LocalizedString(const LocalizedString& a) : m_reg(a.m_reg), m_l10n(a.m_l10n) {}
 	LocalizedString& operator=(const LocalizedString& a) {
 		LocalizedString r;
-		m_reg = r.m_reg = a.m_reg; m_l10n = r.m_l10n = a.m_l10n;
+		m_reg = r.m_reg = a.m_reg;
+		m_l10n = r.m_l10n = a.m_l10n;
 		return r;
 	}
 
@@ -112,7 +112,7 @@ public:
 	StringView get(LanguageId id) const {
 		std::shared_lock<SharedMutex> lock(m_mutex);
 		auto it = m_l10n.find(id);
-		return it == m_l10n.end() ? "???" : it->second;
+		return it == m_l10n.end() ? (m_l10n.contains(static_cast<LanguageId>(Language::English)) ? m_l10n.find(static_cast<LanguageId>(Language::English))->second : "???") : it->second;
 	}
 
 	// Get by current language hold by `m_reg`; Default to English
@@ -135,7 +135,7 @@ public:
 		return get();
 	}
 
-	operator String() {
+	operator String() /* COPY */ {
 		return String(get());
 	}
 

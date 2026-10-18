@@ -1219,6 +1219,25 @@ HALT
 			debugUI.endWindow();
 		}
 
+		debugUI.beginWindow("Game Settings");
+		{
+			static int langSelect = 0;
+			static const char* langNames[] = { "System", "Chinese Simplified", "English US" };
+			if (debugUI.button(fmt::format("Language: {}", langNames[langSelect]).c_str())) {
+				langSelect = (langSelect + 1) % 3;
+				if (langSelect == 0) {
+					LanguageRegistry::getInstance().setLanguage((LanguageId)LanguageRegistry::getInstance().getSystemLanguage());
+				}
+				else if (langSelect == 1) {
+					LanguageRegistry::getInstance().setLanguage((LanguageId)Language::ChineseSimplified);
+				}
+				else if (langSelect == 2) {
+					LanguageRegistry::getInstance().setLanguage((LanguageId)Language::EnglishUS);
+				}
+			}
+		}
+		debugUI.endWindow();
+
 		debugUI.beginWindow("Skybox");
 		static const char* skyNames[] = { "Day", "Sunset", "Night", "Texture" };
 		int totalModes = skyCubeTexHandle.isValid() ? 4 : 3;
