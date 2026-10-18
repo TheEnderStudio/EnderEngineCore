@@ -1,4 +1,4 @@
-#include <UI/UISubsystem.hpp>
+﻿#include <UI/UISubsystem.hpp>
 #include <Core/Log.hpp>
 #include <Utilities/FontLoader.hpp>
 #include <cmath>
@@ -29,7 +29,7 @@ struct UISubsystem::Impl {
 	bool hitTest(Vec2 p,Vec2 s)const{return mouseX>=p.x&&mouseX<=p.x+s.x&&mouseY>=p.y&&mouseY<=p.y+s.y;}
 
 	void drawDefault(UIControl*c){if(c->desc.visible)r2d->drawRect(resolvePos(c->desc),c->desc.size,c->desc.color);}
-	void drawDefaultB(UIButton*b, bool isActive=true){if(!b->desc.visible)return;Vec2 p=resolvePos(b->desc);bool h=isActive&&hitTest(p,b->desc.size);r2d->drawRect(p,b->desc.size,h?Vec4(b->desc.color.x*1.2f,b->desc.color.y*1.2f,b->desc.color.z*1.2f,b->desc.color.w):b->desc.color);if(!b->label.empty()&&b->fontSRV&&b->fontData)drawTxt(b->fontSRV,b->fontData,b->label,p,b->desc.size,Vec4(1));}
+	void drawDefaultB(UIButton*b, bool isActive=true){if(!b->desc.visible)return;Vec2 p=resolvePos(b->desc);bool h=isActive&&hitTest(p,b->desc.size);r2d->drawRect(p,b->desc.size,h?Vec4(b->desc.color.x*1.2f,b->desc.color.y*1.2f,b->desc.color.z*1.2f,b->desc.color.w):b->desc.color);if(!b->label.get().empty() && b->fontSRV && b->fontData)drawTxt(b->fontSRV, b->fontData, b->label, p, b->desc.size, Vec4(1)); }
 	void drawDefaultL(UILabel*l){if(!l->desc.visible||!l->fontSRV||!l->fontData)return;String t=l->text;if(t.empty())return;drawTxt(l->fontSRV,l->fontData,t,resolvePos(l->desc),l->desc.size,l->desc.color);}
 	void drawDefaultP(UIPicture*p){if(!p->desc.visible||!p->textureSRV)return;Vec2 pos=resolvePos(p->desc);r2d->drawSprite({pos,p->desc.size,p->desc.color,0,p->textureSRV});}
 	void drawDefaultTI(UITextInput*ti){

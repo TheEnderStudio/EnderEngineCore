@@ -13,12 +13,12 @@ public:
 		m_major(major), m_minor(minor), m_patch(patch), Object(guid) {}
 
 	/// @brief Get the engine's compile-time version.
-	static const Version& getEngineVersion() {
+	EE_NO_INLINE static const Version& getEngineVersion() {
 		const static Version engineVer(EE_VERSION_MAJOR, EE_VERSION_MINOR, EE_VERSION_PATCH, Guid(UUIDv4::UUID::fromStrFactory(EE_VERSION_GUID)));
 		return engineVer;
 	}
 
-	static const char* getFullEngineInfo() {
+	EE_NO_INLINE static const char* getFullEngineInfo() {
 		const static String engineInfo = std::format("Built at {}, {}, Version {}", EE_BUILD_TIME, EE_BUILD_DATE, getEngineVersion().toString());
 		return engineInfo.c_str();
 	}

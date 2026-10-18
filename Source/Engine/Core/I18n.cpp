@@ -4,37 +4,37 @@
 EE_NAMESPACE_BEGIN
 
 namespace {
-    static inline String trim(StringView sv) {
-        Size start = 0;
-        while (start < sv.size() &&
-            std::isspace(static_cast<unsigned char>(sv[start]))) {
-            ++start;
-        }
-        Size end = sv.size();
-        while (end > start &&
-            std::isspace(static_cast<unsigned char>(sv[end - 1]))) {
-            --end;
-        }
-        return String(sv.substr(start, end - start));
-    }
+	static inline String trim(StringView sv) {
+		Size start = 0;
+		while (start < sv.size() &&
+			std::isspace(static_cast<unsigned char>(sv[start]))) {
+			++start;
+		}
+		Size end = sv.size();
+		while (end > start &&
+			std::isspace(static_cast<unsigned char>(sv[end - 1]))) {
+			--end;
+		}
+		return String(sv.substr(start, end - start));
+	}
 
-    static inline String normalizeTag(StringView tag) {
-        String result;
-        result.reserve(tag.size());
+	static inline String normalizeTag(StringView tag) {
+		String result;
+		result.reserve(tag.size());
 
-        for (char c : tag) {
-            if (c == '_') c = '-';
-            if (c >= 'A' && c <= 'Z') {
-                c = static_cast<char>(c - 'A' + 'a');
-            }
-            result.push_back(c);
-        }
+		for (char c : tag) {
+			if (c == '_') c = '-';
+			if (c >= 'A' && c <= 'Z') {
+				c = static_cast<char>(c - 'A' + 'a');
+			}
+			result.push_back(c);
+		}
 
-        Size start = result.find_first_not_of(" \t\n\r");
-        if (start == String::npos) return {};
-        Size end = result.find_last_not_of(" \t\n\r");
-        return result.substr(start, end - start + 1);
-    }
+		Size start = result.find_first_not_of(" \t\n\r");
+		if (start == String::npos) return {};
+		Size end = result.find_last_not_of(" \t\n\r");
+		return result.substr(start, end - start + 1);
+	}
 }
 
 // --------------------------------------------------------
@@ -42,137 +42,201 @@ namespace {
 // --------------------------------------------------------
 
 LanguageRegistry::LanguageRegistry() : m_nextDynamicId(BuiltinLanguageCount) {
-    struct Builtin {
-        LanguageId id;
-        const char* tag;
-        const char* en;
-        const char* native;
-    };
+	struct Builtin {
+		LanguageId id;
+		const char* tag;
+		const char* en;
+		const char* native;
+	};
 
-    static const Builtin builtins[] = {
+	static const Builtin builtins[] = {
 #define LANGUAGE(ID, TAG, EN, NATIVE, WIN32MACRO) \
-    { static_cast<LanguageId>(Language::ID), TAG, EN, NATIVE },
+	{ static_cast<LanguageId>(Language::ID), TAG, EN, NATIVE },
 #include <Core/Languages.def>
 #undef LANGUAGE
-    };
+	};
 
-    for (const auto& b : builtins) {
-        LanguageInfo info;
-        info.id = b.id;
-        info.tag = b.tag;
-        info.englishName = b.en;
-        info.nativeName = b.native;
-        info.builtin = true;
+	for (const auto& b : builtins) {
+		LanguageInfo info;
+		info.id = b.id;
+		info.tag = b.tag;
+		info.englishName = b.en;
+		info.nativeName = b.native;
+		info.builtin = true;
 
-        m_idToInfo.emplace(info.id, info);
-        m_tagToId.emplace(normalizeTag(info.tag), info.id);
-    }
+		m_idToInfo.emplace(info.id, info);
+		m_tagToId.emplace(normalizeTag(info.tag), info.id);
+	}
+
+	m_currentLanguage = (LanguageId)getSystemLanguage();
 }
 
 String LanguageRegistry::toString(LanguageId id) const {
-    std::lock_guard<Mutex> lock(m_mutex);
-    auto it = m_idToInfo.find(id);
-    return it == m_idToInfo.end() ? "und" : it->second.tag;
+	std::lock_guard<Mutex> lock(m_mutex);
+	auto it = m_idToInfo.find(id);
+	return it == m_idToInfo.end() ? "und" : it->second.tag;
 }
 
 LanguageId LanguageRegistry::fromString(const StringView tag) const {
-    String key = normalizeTag(tag);
-    if (key.empty()) return InvalidLanguageId;
+	String key = normalizeTag(tag);
+	if (key.empty()) return InvalidLanguageId;
 
-    std::lock_guard<Mutex> lock(m_mutex);
+	std::lock_guard<Mutex> lock(m_mutex);
 
-    // fallbacks: zh-Hant-HK -> zh-Hant -> zh
-    while (!key.empty()) {
-        auto it = m_tagToId.find(key);
-        if (it != m_tagToId.end()) return it->second;
+	// fallbacks: zh-Hant-HK -> zh-Hant -> zh
+	while (!key.empty()) {
+		auto it = m_tagToId.find(key);
+		if (it != m_tagToId.end()) return it->second;
 
-        auto pos = key.rfind('-');
-        if (pos == String::npos) break;
-        key.resize(pos);
-    }
-    return InvalidLanguageId;
+		auto pos = key.rfind('-');
+		if (pos == String::npos) break;
+		key.resize(pos);
+	}
+	return InvalidLanguageId;
 }
 
 Optional<LanguageInfo> LanguageRegistry::get(LanguageId id) const {
-    std::lock_guard<Mutex> lock(m_mutex);
-    auto it = m_idToInfo.find(id);
-    if (it == m_idToInfo.end()) return std::nullopt;
-    return it->second;
+	std::lock_guard<Mutex> lock(m_mutex);
+	auto it = m_idToInfo.find(id);
+	if (it == m_idToInfo.end()) return std::nullopt;
+	return it->second;
 }
 
 Optional<LanguageId> LanguageRegistry::add(const StringView tag, const StringView englishName, const StringView nativeName) {
-    String originalTag = trim(tag);
-    String key = normalizeTag(originalTag);
-    if (key.empty()) return std::nullopt;
+	String originalTag = trim(tag);
+	String key = normalizeTag(originalTag);
+	if (key.empty()) return std::nullopt;
 
-    std::lock_guard<Mutex> lock(m_mutex);
+	std::lock_guard<Mutex> lock(m_mutex);
 
-    if (m_tagToId.find(key) != m_tagToId.end()) {
-        return std::nullopt;
-    }
+	if (m_tagToId.find(key) != m_tagToId.end()) {
+		return std::nullopt;
+	}
 
-    LanguageId id = m_nextDynamicId++;
-    LanguageInfo info;
-    info.id = id;
-    info.tag = originalTag;
-    info.englishName = String(englishName);
-    info.nativeName = String(nativeName);
-    info.builtin = false;
+	LanguageId id = m_nextDynamicId++;
+	LanguageInfo info;
+	info.id = id;
+	info.tag = originalTag;
+	info.englishName = String(englishName);
+	info.nativeName = String(nativeName);
+	info.builtin = false;
 
-    m_idToInfo.emplace(id, info);
-    m_tagToId.emplace(key, id);
-    return id;
+	m_idToInfo.emplace(id, info);
+	m_tagToId.emplace(key, id);
+	return id;
 }
 
 bool LanguageRegistry::remove(LanguageId id) {
-    std::lock_guard<Mutex> lock(m_mutex);
+	std::lock_guard<Mutex> lock(m_mutex);
 
-    auto it = m_idToInfo.find(id);
-    if (it == m_idToInfo.end()) return false;
-    if (it->second.builtin) return false;
+	auto it = m_idToInfo.find(id);
+	if (it == m_idToInfo.end()) return false;
+	if (it->second.builtin) return false;
 
-    String key = normalizeTag(it->second.tag);
-    m_tagToId.erase(key);
-    m_idToInfo.erase(it);
-    return true;
+	String key = normalizeTag(it->second.tag);
+	m_tagToId.erase(key);
+	m_idToInfo.erase(it);
+	return true;
 }
 
 bool LanguageRegistry::remove(const StringView tag) {
-    String key = normalizeTag(tag);
-    if (key.empty()) return false;
+	String key = normalizeTag(tag);
+	if (key.empty()) return false;
 
-    std::lock_guard<Mutex> lock(m_mutex);
+	std::lock_guard<Mutex> lock(m_mutex);
 
-    auto it = m_tagToId.find(key);
-    if (it == m_tagToId.end()) return false;
+	auto it = m_tagToId.find(key);
+	if (it == m_tagToId.end()) return false;
 
-    LanguageId id = it->second;
-    auto infoIt = m_idToInfo.find(id);
-    if (infoIt == m_idToInfo.end() || infoIt->second.builtin) {
-        return false;
-    }
+	LanguageId id = it->second;
+	auto infoIt = m_idToInfo.find(id);
+	if (infoIt == m_idToInfo.end() || infoIt->second.builtin) {
+		return false;
+	}
 
-    m_tagToId.erase(it);
-    m_idToInfo.erase(infoIt);
-    return true;
+	m_tagToId.erase(it);
+	m_idToInfo.erase(infoIt);
+	return true;
 }
 
 Vector<LanguageInfo> LanguageRegistry::snapshot() const {
-    std::lock_guard<Mutex> lock(m_mutex);
+	std::lock_guard<Mutex> lock(m_mutex);
 
-    Vector<LanguageInfo> result;
-    result.reserve(m_idToInfo.size());
+	Vector<LanguageInfo> result;
+	result.reserve(m_idToInfo.size());
 
-    for (const auto& kv : m_idToInfo) {
-        result.push_back(kv.second);
-    }
+	for (const auto& kv : m_idToInfo) {
+		result.push_back(kv.second);
+	}
 
-    std::sort(result.begin(), result.end(),
-        [](const LanguageInfo& a, const LanguageInfo& b) {
-            return a.id < b.id;
-        });
+	std::sort(result.begin(), result.end(),
+		[](const LanguageInfo& a, const LanguageInfo& b) {
+			return a.id < b.id;
+		});
 
-    return result;
+	return result;
+}
+
+namespace {
+#ifdef EE_WINDOWS
+	static inline Language win32ToLanguage(LANGID id) {
+		static HashMap<LANGID, Language> map = {
+#define LANGUAGE(ID, TAG, EN, NATIVE, WIN32MACRO) \
+	{ LANG_##WIN32MACRO, Language::ID },
+#include <Core/Languages.def>
+#undef LANGUAGE
+		};
+
+		// The map has multiple pairs that key is LANG_ENGLISH (N/A), that is undefined
+		// Handle it manually
+		if (PRIMARYLANGID(id) == LANG_ENGLISH) return Language::English;
+
+		if (auto it = map.find(PRIMARYLANGID(id)); it != map.end()) {
+			return it->second;
+		}
+
+		// Default to English
+		return Language::English;
+	}
+#endif // EE_WINDOWS
+}
+
+Language LanguageRegistry::getSystemLanguage() const {
+#ifdef EE_WINDOWS
+	LANGID langId = GetUserDefaultUILanguage(); // No need to use GetUserPreferredUILanguages
+	return win32ToLanguage(langId);
+#endif // EE_WINDOWS
+
+	// TODO: Linux implementation
+	EWarn("Not implemented for Linux! Default to English");
+	return Language::English;
+}
+
+LanguageId LanguageRegistry::currentLanguage() {
+	std::lock_guard<Mutex> lock(m_mutex);
+	if (m_currentLanguage == 0) [[unlikely]] {
+		EWarn("m_currentLanguage == 0: Try to get system language");
+		if ((m_currentLanguage = (LanguageId)getSystemLanguage()) == 0) [[unlikely]] {
+			return (LanguageId)Language::English;
+		}
+		EDebug("System Language: {}", toString((LanguageId)getSystemLanguage()));
+	}
+	return m_currentLanguage;
+}
+
+bool LanguageRegistry::setLanguage(LanguageId id) {
+	std::lock_guard<Mutex> lock(m_mutex);
+	if (id < BuiltinLanguageCount) {
+		m_currentLanguage = id;
+		return true;
+	}
+	else {
+		if (m_idToInfo.contains(id)) {
+			m_currentLanguage = id;
+			return true;
+		}
+		return false;
+	}
 }
 
 EE_NAMESPACE_END

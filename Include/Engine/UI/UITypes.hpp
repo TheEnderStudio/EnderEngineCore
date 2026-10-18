@@ -1,7 +1,8 @@
-#pragma once
+﻿#pragma once
 
-#include <Core/Types.hpp>
-#include <Core/Object.hpp>
+#include <Engine/Core/Types.hpp>
+#include <Engine/Core/Object.hpp>
+#include <Engine/Core/I18n.hpp>
 
 EE_NAMESPACE_UI_BEGIN
 
@@ -39,7 +40,7 @@ class UIRect : public UIControl { public: UIRect() { ctrlType = Type::Rect; } };
 class UIButton : public UIControl {
 public:
 	UIButton() { ctrlType = Type::Button; }
-	String label;
+	LocalizedString label;
 	void* fontSRV = nullptr;     ///< Font atlas texture SRV for label rendering.
 	void* fontData = nullptr;    ///< Pointer to FontData for glyph metrics.
 };
@@ -50,7 +51,7 @@ public:
 class UILabel : public UIControl {
 public:
 	UILabel() { ctrlType = Type::Label; }
-	String text;                 ///< Display text.
+	LocalizedString text;        ///< Display text.
 	void* fontSRV = nullptr;     ///< Font atlas texture SRV.
 	void* fontData = nullptr;    ///< Pointer to FontData for glyph metrics.
 	F32   fontSize = 16.0f;      ///< Font size.
@@ -72,7 +73,7 @@ class UITextInput : public UIControl {
 public:
 	UITextInput() { ctrlType = Type::TextInput; }
 	String  buffer;              ///< Current text content.
-	size_t  cursorPos = 0;        ///< Cursor position in bytes (English-only, 1 byte = 1 char).
+	Size    cursorPos = 0;        ///< Cursor position in bytes (English-only, 1 byte = 1 char).
 	void*   fontSRV = nullptr;    ///< Font atlas texture SRV.
 	void*   fontData = nullptr;   ///< Pointer to FontData for glyph metrics.
 	F32     fontSize = 20.0f;

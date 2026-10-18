@@ -408,6 +408,24 @@ target("ResourcePacker")
 target_end()
 
 -- ---------------------------------------------------------------------------
+-- LocalizationGenerator (Convert all localization jsons to .hpp headers)
+-- ---------------------------------------------------------------------------
+target("L10nGenerator")
+	set_kind("binary")
+	add_files("Tools/LocalizationGenerator/*.cpp")
+	add_includedirs("Tools/LocalizationGenerator")
+	add_headerfiles("Tools/LocalizationGenerator/*.hpp")
+	add_includedirs("ThirdParty/cxxopts/include")
+	add_deps("EnderEngineCore")
+	
+	-- Dependency: simdjson
+	add_files("ThirdParty/simdjson/simdjson.cpp")
+	add_headerfiles("ThirdParty/simdjson/simdjson.h")
+	add_includedirs("ThirdParty/simdjson")
+
+target_end()
+
+-- ---------------------------------------------------------------------------
 -- dxcreflect (Offline tool: reflect DXBC/DXIL shader containers via DXC's
 -- IDxcContainerReflection - used by Tools/nrd/nrd_compile_shaders.ps1 to
 -- generate the per-shader resource name tables for the NRD subsystem)
@@ -417,27 +435,6 @@ target("dxcreflect")
 	add_files("Tools/nrd/dxcreflect/*.cpp")
 	if is_plat("windows") then
 		add_syslinks("kernel32", "dxguid")
-	end
-
-target_end()
-
--- ---------------------------------------------------------------------------
--- EnderEditor (based on Qt 6, need Qt SDK)
--- ---------------------------------------------------------------------------
-target("EnderEditor")
-	add_rules("qt.widgetapp")
-	set_kind("binary")
-	add_headerfiles("Include/Editor/**/*.h")
-	add_files("Source/Editor/**/*.cpp")
-	add_files("Source/Editor/**/*.ui")
-	add_files("Include/Editor/**/*.h") -- For qt.moc
-
-	add_files("Source/Editor/Version.rc")
-	
-	add_deps("EnderEngineCore")
-
-	if is_plat("windows") then
-		add_cxflags("/permissive-", { force = true })
 	end
 
 target_end()

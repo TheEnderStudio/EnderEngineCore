@@ -328,3 +328,13 @@ dependencies:
       - {configs: ["Release"], from: "bin/z.dll", to: "bin/z.dll", source: stage}
       - {configs: ["Debug"], from: "lib/zd.lib", to: "lib/zd.lib", source: stage}
       - {configs: ["Release"], from: "lib/z.lib", to: "lib/z.lib", source: stage}
+
+  - name: simdjson
+    kind: archive
+    url: https://github.com/simdjson/simdjson/releases/download/v5.0.2/singleheader.zip
+    archiveFile: singleheader.zip
+    build: none
+    target: ThirdParty/simdjson
+    layout:
+      - { configs: ["*"], from: "simdjson.h", to: "simdjson.h", source: stage}
+      - { configs: ["*"], from: "simdjson.cpp", to: "simdjson.cpp", source: stage}

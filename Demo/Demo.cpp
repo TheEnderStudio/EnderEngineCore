@@ -1,4 +1,4 @@
-#include <Engine/Core/Core.hpp>
+﻿#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Platform/Window.hpp>
@@ -13,6 +13,7 @@
 #include <Engine/UI/UISubsystem.hpp>
 #include <Engine/Utilities/FontLoader.hpp>
 #include <Engine/Utilities/ImageLoader.hpp>
+#include <Engine/Utilities/StringPool.hpp>
 #include <Engine/Physics/PhysicsBodySubsystem.hpp>
 #include <Engine/Physics/PhysicsWorldSubsystem.hpp>
 #include <Engine/Audio/AudioSubsystem.hpp>
@@ -36,6 +37,8 @@
 #include <filesystem>
 #include <random>
 #include <ranges>
+
+#include "LocalizationGenerated.hpp"
 
 using namespace EnderEngine;
 using namespace EnderEngine::Platform;
@@ -171,6 +174,9 @@ int WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int)
 
 	// --- Load Extension ---
 	auto* extension = ExtensionLoader::load("HelloWorldExt");
+
+	// --- Localizations ---
+	::Localization::Generated::setup();
 
 	// --- Jobs ---
 	JobSubsystem jobs;
@@ -801,6 +807,7 @@ HALT
 	menu.afterPostProcess = true;
 
 	// --- UI ---
+	using namespace ::Localization::Generated;
 	UIButton button;
 	UIButton button2;
 	UIPicture picture;
@@ -818,13 +825,13 @@ HALT
 	btndesc.position = Vec2(-10.0f, 10.0f);
 	btndesc.size = Vec2(150.0f, 100.0f);
 	button.desc = btndesc;
-	button.label = "退出";
+	button.label = Ui::Hud::ExitButton;
 	button.fontSRV = font.atlasSRV;
 	button.fontData = &font;
 	ui.subscribe<UIClickEvent>(button, [&](const UIClickEvent& e) {
 		if (!e.pressed) {
 			if (e.control->guid() == button2.guid()) {
-				button.label = "按下ESC退出！";
+				button.label = Ui::Hud::ChangedExitButton;
 				ui.popLayer();
 			}
 			else if (e.control->guid() == button.guid()) {
@@ -840,7 +847,7 @@ HALT
 	btn2desc.size = Vec2(150.0f, 100.0f);
 	btn2desc.afterPostProcess = true;
 	button2.desc = btn2desc;
-	button2.label = "真的要退出吗？";
+	button2.label = Ui::Menu::ConfirmButton;
 	button2.fontSRV = font.atlasSRV;
 	button2.fontData = &font;
 	menu.addControl(&picture);

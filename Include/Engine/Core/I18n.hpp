@@ -32,20 +32,28 @@ struct LanguageInfo {
 class EE_API LanguageRegistry {
 public:
 	static LanguageRegistry& getInstance() {
-		static LanguageRegistry instance;
+		static LanguageRegistry instance{};
 		return instance;
 	}
 
 	String toString(LanguageId id) const;
 	LanguageId fromString(const StringView tag) const;
 	Optional<LanguageInfo> get(LanguageId id) const;
-	Size size() const { std::lock_guard<Mutex> lock(m_mutex); return m_idToInfo.size(); }
+	Size size() const { return m_idToInfo.size(); }
 
 	Optional<LanguageId> add(const StringView tag, const StringView englishName, const StringView nativeName);
 	bool remove(LanguageId id);
 	bool remove(const StringView tag);
 
 	Vector<LanguageInfo> snapshot() const; // COPY
+
+	Language getSystemLanguage() const;
+	// When m_currentLanguage == 0, it will try to get system language as
+	// the result to return; If get is failed, it will set the language
+	// to English and return.
+	LanguageId currentLanguage();
+	// Return false when the language does not exist or is invalid
+	bool setLanguage(LanguageId id);
 
 private:
 	LanguageRegistry();
@@ -54,13 +62,14 @@ private:
 	HashMap<LanguageId, LanguageInfo> m_idToInfo;
 	HashMap<String, LanguageId> m_tagToId;
 	LanguageId m_nextDynamicId;
+	LanguageId m_currentLanguage;
 };
 
 inline String toString(Language lang) {
 	return LanguageRegistry::getInstance().toString(static_cast<LanguageId>(lang));
 }
 
-inline LanguageId fromString(std::string_view tag) {
+inline LanguageId fromString(const StringView tag) {
 	return LanguageRegistry::getInstance().fromString(tag);
 }
 
@@ -76,27 +85,64 @@ inline bool removeLanguage(StringView tag) {
 	return LanguageRegistry::getInstance().remove(tag);
 }
 
-class LocalizedString {
+class EE_API LocalizedString {
 public:
-	void flush(); // Implemented in `LocalizationManager.cpp`
-	const StringView get_f() const { // FAST PATH
-		return m_current;
+	explicit LocalizedString(LanguageRegistry* reg = &LanguageRegistry::getInstance()) :
+		m_reg(reg) {}
+
+	LocalizedString(const LocalizedString& a) : m_reg(a.m_reg), m_l10n(a.m_l10n) {}
+	LocalizedString& operator=(const LocalizedString& a) {
+		LocalizedString r;
+		m_reg = r.m_reg = a.m_reg; m_l10n = r.m_l10n = a.m_l10n;
+		return r;
 	}
-	const StringView get() {
-		flush(); // The mutex is locked in this call
-		return m_current;
+
+	void set(LanguageId id, StringView ptr) {
+		std::unique_lock<SharedMutex> lock(m_mutex);
+		m_l10n[id] = ptr;
+	}
+
+	void set(const HashMap<LanguageId, StringView>& ptrs) {
+		std::unique_lock<SharedMutex> lock(m_mutex);
+		for (const auto& [id, ptr] : ptrs) {
+			m_l10n[id] = ptr;
+		}
+	}
+
+	StringView get(LanguageId id) const {
+		std::shared_lock<SharedMutex> lock(m_mutex);
+		auto it = m_l10n.find(id);
+		return it == m_l10n.end() ? "???" : it->second;
+	}
+
+	// Get by current language hold by `m_reg`; Default to English
+	StringView get() const {
+		return get(m_reg ? m_reg->currentLanguage() : static_cast<LanguageId>(Language::English));
+	}
+
+	LanguageRegistry* registry() { return m_reg; }
+	const LanguageRegistry* registry() const { return m_reg; }
+	void clear() {
+		std::unique_lock<SharedMutex> lock(m_mutex);
+		m_l10n.clear();
+	}
+	void reserve(Size size) {
+		std::unique_lock<SharedMutex> lock(m_mutex);
+		m_l10n.reserve(size);
+	}
+
+	operator StringView() {
+		return get();
+	}
+
+	operator String() {
+		return String(get());
 	}
 
 private:
-	mutable Mutex m_mutex;
-
-	String m_current;
-	LanguageId m_cachedLang;
-	Guid m_guid;
-	Sptr<Array<String, BuiltinLanguageCount>> m_l10n;
-	Sptr<HashMap<LanguageId, String>> m_nonBuiltinL10n;
-
-	friend class Localization::LocalizationManager;
+	mutable SharedMutex m_mutex;
+	LanguageRegistry* m_reg;
+	HashMap<LanguageId, StringView> m_l10n;
 };
 
 EE_NAMESPACE_END

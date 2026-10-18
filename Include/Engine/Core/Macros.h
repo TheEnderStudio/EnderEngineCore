@@ -50,6 +50,12 @@
 # define EE_UNLIKELY(x) (x)
 #endif
 
+#ifdef _MSC_VER
+# define EE_NO_INLINE __declspec(noinline)
+#else
+# define EE_NO_INLINE __attribute__((noinline))
+#endif
+
 #define EE_FILE __FILE__
 #define EE_LINE __LINE__
 #define EE_FUNCTION __FUNCTION__
