@@ -56,6 +56,12 @@
 # define EE_NO_INLINE __attribute__((noinline))
 #endif
 
+#ifdef _MSC_VER
+# define EE_FORCE_INLINE __forceinline
+#else
+# define EE_FORCE_INLINE __attribute__((always_inline)) inline
+#endif
+
 #define EE_FILE __FILE__
 #define EE_LINE __LINE__
 #define EE_FUNCTION __FUNCTION__

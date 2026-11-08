@@ -2,6 +2,7 @@
 #include <Core/Log.hpp>
 #include <Core/Crash.h>
 #include <Core/Subsystem.hpp>
+#include <Core/Allocation.hpp>
 #include <Core/Extension.hpp>
 
 #include <algorithm>
@@ -35,6 +36,7 @@ Result<void, CoreError> Engine::initialize() {
 	ExtensionLoader::initialize();
 
 	g_initialized = true;
+	EInfo("Global allocator: {}", engineUsesPoolGlobalAllocator() ? "engine pools (EE_POOL_GLOBAL_NEW)" : "CRT heap");
 	EInfo("Engine core initialized successfully.");
 	EInfo("Engine version: {}", getVersion().toString());
 	return {};

@@ -1,6 +1,7 @@
 ﻿#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
+#include <Engine/Core/Crash.h>
 #include <Engine/Platform/Window.hpp>
 #include <Engine/Rendering/RenderSubsystem.hpp>
 #include <Engine/Rendering/DebugUISubsystem.hpp>
@@ -52,6 +53,17 @@ using namespace EnderEngine::Physics;
 using namespace EnderEngine::Audio;
 using namespace EnderEngine::Extensions;
 using namespace EnderEngine::Extensions::AdaptiveMusic;
+
+static Vector<UInt8> readBinaryFile(const String& path) {
+	namespace fs = std::filesystem;
+	auto size = fs::file_size(path);
+	std::ifstream file(path, std::ios::binary);
+	if (!file) throw std::runtime_error("Cannot open file");
+	Vector<UInt8> data(size);
+	file.read(reinterpret_cast<char*>(data.data()), size);
+	if (!file) throw std::runtime_error("Read failed");
+	return data;
+}
 
 // ===================================================================
 // FlyCamera
@@ -169,8 +181,8 @@ int WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int)
 	Engine::initialize();
 
 	// --- Resources Manager ---
-	auto& resManager = ResourcesManager::getInstance();
-	resManager.mount("GameData2.index", "mypassword");
+	//auto& resManager = ResourcesManager::getInstance();
+	//resManager.mount("GameData2.index", "mypassword");
 
 	// --- Load Extension ---
 	auto* extension = ExtensionLoader::load("HelloWorldExt");
@@ -582,12 +594,12 @@ float4 main(PSIn i) : SV_TARGET {
 	};
 	{
 		RenderSubsystem::CubemapFace skyFaces[6] = {
-			{loadImage(ERes("skybox/right.png")), false, true},
-			{loadImage(ERes("skybox/back.png")), false, true},
-			{loadImage(ERes("skybox/top.png")), false, true},
-			{loadImage(ERes("skybox/bottom.png")), false, true},
-			{loadImage(ERes("skybox/front.png")), false, true},
-			{loadImage(ERes("skybox/left.png")), false, true},
+			{loadImage(("Assets/skybox/right.png")), false, true},
+			{loadImage(("Assets/skybox/back.png")), false, true},
+			{loadImage(("Assets/skybox/top.png")), false, true},
+			{loadImage(("Assets/skybox/bottom.png")), false, true},
+			{loadImage(("Assets/skybox/front.png")), false, true},
+			{loadImage(("Assets/skybox/left.png")), false, true},
 		};
 		auto cr = renderer.createCubemapTexture(skyFaces);
 		if (cr.isOk()) {
@@ -617,7 +629,7 @@ float4 main(PSIn i) : SV_TARGET {
 		}
 		EError("Model loaded failed!");
 		});
-	auto mh = renderer.loadModelAsync(ERes("Furina.glb"), modelObj, jobs);
+	auto mh = renderer.loadModelAsync(("Assets/Furina.glb"), modelObj, jobs);
 	if (mh.isErr()) {
 		EError("Model load failed.");
 	}
@@ -641,7 +653,7 @@ float4 main(PSIn i) : SV_TARGET {
 	auto subId = physicsWorld.subscribe<PhysicsContactEvent>(physicsObj, [&](const PhysicsContactEvent& e) {
 		if (!e.pair.aIsStatic && !e.pair.bIsStatic) return;
 		if (e.pair.aIsStatic && e.pair.bIsStatic) return;
-		audio.playFile(ERes("Collision.wav"), e.pair.position, 1.0f);
+		audio.playFile(("Assets/Collision.wav"), e.pair.position, 1.0f);
 		});
 
 	audio.bindScene(physicsWorld.scene());
@@ -689,9 +701,9 @@ HALT
 
 	TrackHandle introH = InvalidTrackHandle, midH = InvalidTrackHandle,
 		c1H = InvalidTrackHandle, c2H = InvalidTrackHandle, c3H = InvalidTrackHandle, endH = InvalidTrackHandle;
-	auto bindClip = [&](const char* name, const ResPath& path, TrackHandle& out) {
+	auto bindClip = [&](const char* name, const String& path, TrackHandle& out) {
 		auto clip = audio.decode(path);
-		if (clip.isErr()) { EError("Failed to decode {}: {}", path.string(), ToString(clip.error())); return; }
+		if (clip.isErr()) { EError("Failed to decode {}: {}", path, ToString(clip.error())); return; }
 		out = musicPlayer.addTrack(clip.value());
 		musicCtl.bindTrack(name, out);
 		const auto& ac = clip.value();
@@ -699,12 +711,12 @@ HALT
 			? (F32)ac.samples.size() / (F32)(ac.channels * ac.sampleRate) : 0.0f;
 		EInfo("Track '{}' bound as {} ({}s)", name, out, dur);
 		};
-	bindClip("intro", ERes("bgm/Intro.wav"), introH);
-	bindClip("mid", ERes("bgm/Mid.wav"), midH);
-	bindClip("climax1", ERes("bgm/Climax1.wav"), c1H);
-	bindClip("climax2", ERes("bgm/Climax2.wav"), c2H);
-	bindClip("climax3", ERes("bgm/Climax3.wav"), c3H);
-	bindClip("end", ERes("bgm/End.wav"), endH);
+	bindClip("intro", ("Assets/bgm/Intro.wav"), introH);
+	bindClip("mid", ("Assets/bgm/Mid.wav"), midH);
+	bindClip("climax1", ("Assets/bgm/Climax1.wav"), c1H);
+	bindClip("climax2", ("Assets/bgm/Climax2.wav"), c2H);
+	bindClip("climax3", ("Assets/bgm/Climax3.wav"), c3H);
+	bindClip("end", ("Assets/bgm/End.wav"), endH);
 
 	HighLevelController::CompileError amErr;
 	if (!musicCtl.compile(g_AdaptiveScript, &amErr)) {
@@ -769,7 +781,7 @@ HALT
 	jobs.subscribe<JobFailedEvent>(terrianObj, [&](const JobFailedEvent& e) {
 		EError("Terrian loaded failed!");
 		});
-	auto terrianmh = renderer.loadModelAsync(ERes("Terrian.glb"), terrianObj, jobs);
+	auto terrianmh = renderer.loadModelAsync(("Assets/Terrian.glb"), terrianObj, jobs);
 	if (terrianmh.isErr()) {
 		EError("Terrian loaded failed!");
 	}
@@ -787,14 +799,14 @@ HALT
 		if (wallObj.guid() != e.owner) { return; }
 		EError("Model wall loaded failed: {}", ToString(e.error));
 		});
-	auto wallmh = renderer.loadModelAsync(ERes("Wall.glb"), wallObj, jobs);
+	auto wallmh = renderer.loadModelAsync(("Assets/Wall.glb"), wallObj, jobs);
 	if (wallmh.isErr()) {
 		EError("Model wall loaded failed: {}", ToString(wallmh.error()));
 	}
 	Vector<MeshHandle> wall;
 
 	// --- Font ---
-	FontData font = loadFont(ERes("msyh.ttc"), 24.0f, renderer.getDevice(), CharSet::ASCII | CharSet::CJK);
+	FontData font = loadFont(("Assets/msyh.ttc"), 24.0f, renderer.getDevice(), CharSet::ASCII | CharSet::CJK);
 
 	// --- Layers ---
 	UILayer hud;
@@ -857,7 +869,7 @@ HALT
 	picdesc.position = Vec2(10.0f, -10.0f);
 	picdesc.afterPostProcess = true;
 	picture.desc = picdesc;
-	picture.textureSRV = loadTexture(ERes("14.jpg"), renderer.getDevice());
+	picture.textureSRV = loadTexture(("Assets/14.jpg"), renderer.getDevice());
 
 	UITextInput textInput;
 	textInput.fontSRV = font.atlasSRV;
@@ -1298,32 +1310,41 @@ HALT
 
 		if (modelLoadCompleted.load(std::memory_order_acquire) && model.size() == 0) {
 			model = renderer.getModelMeshes(mh.value());
+
+			ResData res = readBinaryFile("Assets/cooked/Furina.sdf");
+
 			// Load pre-cooked SDF mesh for camera
-			auto r = ResourcesManager::getInstance().readFile(ERes("cooked/Furina.sdf"));
-			if (r.isOk()) {
+			//auto r = ResourcesManager::getInstance().readFile(ERes("cooked/Furina.sdf"));
+			//if (r.isOk()) {
 				if (fly.cameraBody != InvalidRigidBody) physicsBodies.destroyRigidBody(fly.cameraBody);
-				fly.cameraBody = physicsBodies.createDynamicMeshFromCooked(r->data(), r->size(),
+				fly.cameraBody = physicsBodies.createDynamicMeshFromCooked(res.data(), res.size(),
 					fly.pos, Quat(1, 0, 0, 0), 70.0f);
 				physicsBodies.setAngularLock(fly.cameraBody, AngularLockFlag::LockX | AngularLockFlag::LockZ);
-				EInfo("Loaded cooked SDF mesh for camera ({} bytes)", r->size());
-			}
+				EInfo("Loaded cooked SDF mesh for camera ({} bytes)", res.size());
+			//}
 		}
 		if (terrianLoadCompleted.load(std::memory_order_acquire) && terrian.size() == 0) {
 			terrian = renderer.getModelMeshes(terrianmh.value());
+
+			ResData res = readBinaryFile("Assets/cooked/Terrian.tri");
+
 			// Load pre-cooked triangle mesh for terrain
-			auto r = ResourcesManager::getInstance().readFile(ERes("cooked/Terrian.tri"));
-			if (r.isOk()) {
-				physicsBodies.createStaticMeshFromCooked(r->data(), r->size(), Vec3(0), Quat(1, 0, 0, 0));
-				EInfo("Loaded cooked terrain mesh ({} bytes)", r->size());
-			}
+			//auto r = ResourcesManager::getInstance().readFile(ERes("cooked/Terrian.tri"));
+			//if (r.isOk()) {
+				physicsBodies.createStaticMeshFromCooked(res.data(), res.size(), Vec3(0), Quat(1, 0, 0, 0));
+				EInfo("Loaded cooked terrain mesh ({} bytes)", res.size());
+			//}
 		}
 		if (wallLoadCompleted.load(std::memory_order_acquire) && wall.size() == 0) {
 			wall = renderer.getModelMeshes(wallmh.value());
-			auto r = ResourcesManager::getInstance().readFile(ERes("cooked/Wall.tri"));
-			if (r.isOk()) {
-				physicsBodies.createStaticMeshFromCooked(r->data(), r->size(), Vec3(20.0f, -19.0f, 20.0f), Quat(1, 0, 0, 0));
-				EInfo("Loaded cooked wall mesh ({} bytes)", r->size());
-			}
+
+			ResData res = readBinaryFile("Assets/cooked/Wall.tri");
+
+			//auto r = ResourcesManager::getInstance().readFile(ERes("cooked/Wall.tri"));
+			//if (r.isOk()) {
+				physicsBodies.createStaticMeshFromCooked(res.data(), res.size(), Vec3(20.0f, -19.0f, 20.0f), Quat(1, 0, 0, 0));
+				EInfo("Loaded cooked wall mesh ({} bytes)", res.size());
+			//}
 		}
 
 		// ---- Mesh shader scene registration -----------------------------

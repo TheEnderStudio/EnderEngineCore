@@ -1,5 +1,6 @@
-﻿#pragma once
+#pragma once
 #include <Engine/Core/Types.hpp>
+#include <Engine/Core/Allocation.hpp>
 
 #include <memory_resource>
 #include <span>
@@ -46,6 +47,9 @@ public:
             }
 
             StringView r = intern_slow(sv, h);
+            // The cached pointer stays valid until clear() bumps m_gen. Callers must not
+            // call clear() while other threads are inside intern(): the generation check
+            // above and the memcmp below are not atomic with respect to the free.
             e = Entry{ r.data(),
                        m_id,
                        static_cast<UInt32>(r.size()),
@@ -69,6 +73,9 @@ public:
         m_gen.fetch_add(1, std::memory_order_release);
         for (Shard& s : shards()) {
             std::lock_guard<Mutex> lk(s.mutex);
+            // Safe in this order: the container's own storage does not come from `mem`
+            // (see Shard::set), so dropping the elements and then the character chunks
+            // leaves a valid, empty shard behind.
             s.set.clear();
             s.mem.release();
         }
@@ -108,10 +115,24 @@ private:
         }
     };
 
+    using BucketSet = std::pmr::unordered_set<StringView, TransparentHash, std::equal_to<>>;
+
     struct Shard {
         mutable Mutex mutex;
-        std::pmr::unsynchronized_pool_resource mem;
-        std::pmr::unordered_set<StringView, TransparentHash, std::equal_to<>> set{ &mem };
+        // Interning keeps every string forever, so the chunk allocator is only asked for
+        // more memory, never given any back. Its upstream is the engine pool: the
+        // characters come from the same allocator as the rest of the engine instead of
+        // the CRT, which is one allocation source less to profile and keeps the interning
+        // path off the global heap entirely.
+        std::pmr::unsynchronized_pool_resource mem{ PoolMemoryResource::get() };
+        // The set itself deliberately does *not* use `mem`: clear() releases that pool, and
+        // an unordered_set keeps its bucket array (and its size bookkeeping) across
+        // clear(). Sharing the pool meant the shard was left with a bucket array inside a
+        // released chunk, and the next find()/insert() walked into freed memory - an
+        // access violation on the first intern() after a clear(). With the default
+        // resource (the global allocator, i.e. the pools when EE_POOL_GLOBAL_NEW is on)
+        // the container's own storage always outlives the character pool.
+        BucketSet set;
     };
 
     static constexpr Size round_up_pow2(Size n) {
@@ -132,9 +153,11 @@ private:
             return *it;
         }
         char* p = static_cast<char*>(shard.mem.allocate(sv.size() + 1, 1));
-        std::memcpy(p, sv.data(), sv.size());
+        if (!sv.empty()) std::memcpy(p, sv.data(), sv.size());
         p[sv.size()] = '\0';
         StringView r(p, sv.size());
+        // insert() keeps the view we hand out: the pool owns the characters, and the
+        // caller's input buffer is not retained.
         s.insert(r);
         return r;
     }
@@ -148,9 +171,21 @@ private:
     alignas(64) std::atomic<UInt32> m_gen{ 0 };
 };
 
-inline static StringPool<>& sharedStringPool() {
-    static StringPool<> shared;
-    return shared;
+/// @brief The process-wide pool every localized string is interned into.
+///
+/// Never destroyed, and a single instance for the whole program:
+///  - `inline static` gave this internal linkage, so every translation unit including
+///    this header got its *own* pool (the "shared" pool was not shared at all);
+///  - as an ordinary static it was destroyed during exit, at which point the shards free
+///    their memory through the engine pool - which lives in another module with its own
+///    static destruction order.
+inline StringPool<>& sharedStringPool() {
+    // Static storage and placement new: no allocation (with the global pool allocator an
+    // allocating singleton would call straight back into the interning path), and no
+    // destructor at exit.
+    alignas(StringPool<>) static unsigned char storage[sizeof(StringPool<>)];
+    static StringPool<>* const shared = ::new (static_cast<void*>(storage)) StringPool<>{};
+    return *shared;
 }
 
 EE_NAMESPACE_UTILITIES_END

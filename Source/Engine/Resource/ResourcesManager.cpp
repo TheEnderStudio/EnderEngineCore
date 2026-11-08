@@ -30,11 +30,10 @@ Result<void, ResourceError> ResourcesManager::mount(const Path& indexPath, const
 		return ResourceError::FileNotFound;
 	}
 
-	auto key = EnderGenerateKey(password);
 	EnderCacheConfig cc; cc.m_maxSize = 256 * 1024 * 1024; cc.m_maxEntries = 4096;
 
 	auto* vfs = new EnderVirtualFileSystem();
-	if (!vfs->initialize(indexPath.string(), key, cc)) {
+	if (!vfs->initialize(indexPath.string(), EnderGenerateKey(password), cc)) {
 		EError("Resource: mount failed for {}", indexPath.string());
 		delete vfs;
 		return ResourceError::MountFailed;

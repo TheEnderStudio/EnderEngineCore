@@ -1,4 +1,4 @@
-﻿#include <Core/I18n.hpp>
+#include <Core/I18n.hpp>
 #include <Core/Log.hpp>
 
 EE_NAMESPACE_BEGIN
@@ -69,6 +69,10 @@ LanguageRegistry::LanguageRegistry() : m_nextDynamicId(BuiltinLanguageCount) {
 	}
 
 	m_currentLanguage = (LanguageId)getSystemLanguage();
+	if (m_currentLanguage == 0) m_currentLanguage = (LanguageId)Language::English;
+	// Publish it for currentLanguageFast(), so the first LocalizedString::get() does not
+	// have to take the registry lock just to learn the language.
+	m_currentLanguageAtomic.store(m_currentLanguage, std::memory_order_release);
 }
 
 String LanguageRegistry::toString(LanguageId id) const {
@@ -213,27 +217,42 @@ Language LanguageRegistry::getSystemLanguage() const {
 }
 
 LanguageId LanguageRegistry::currentLanguage() {
+	// Lock-free fast path: the language only changes through setLanguage()/this lazy
+	// resolution, both of which publish to the atomic.
+	if (const LanguageId fast = m_currentLanguageAtomic.load(std::memory_order_acquire); fast != 0)
+		return fast;
+
 	std::lock_guard<Mutex> lock(m_mutex);
 	if (m_currentLanguage == 0) [[unlikely]] {
-		EWarn("m_currentLanguage == 0: Try to get system language");
-		if ((m_currentLanguage = (LanguageId)getSystemLanguage()) == 0) [[unlikely]] {
-			return (LanguageId)Language::English;
-		}
-		EDebug("System Language: {}", toString((LanguageId)getSystemLanguage()));
+		// Resolve once. Do NOT call toString()/get() here: they take m_mutex too and
+		// std::mutex is not recursive, so this path used to self-deadlock.
+		LanguageId resolved = (LanguageId)getSystemLanguage();
+		if (resolved == 0) resolved = (LanguageId)Language::English;
+		m_currentLanguage = resolved;
+		EDebug("System language resolved to id {}", (UInt64)m_currentLanguage);
 	}
+	m_currentLanguageAtomic.store(m_currentLanguage, std::memory_order_release);
 	return m_currentLanguage;
 }
 
 bool LanguageRegistry::setLanguage(LanguageId id) {
 	std::lock_guard<Mutex> lock(m_mutex);
-	if (id == m_currentLanguage) return true;
+	// `Unknown` is the enum's zero and doubles as the "not resolved yet" sentinel that
+	// currentLanguage() watches for, so it cannot be selected.
+	if (id == static_cast<LanguageId>(Language::Unknown)) return false;
+	if (id == m_currentLanguage) {
+		m_currentLanguageAtomic.store(m_currentLanguage, std::memory_order_release);
+		return true;
+	}
 	if (id < BuiltinLanguageCount) {
 		m_currentLanguage = id;
+		m_currentLanguageAtomic.store(m_currentLanguage, std::memory_order_release);
 		return true;
 	}
 	else {
 		if (m_idToInfo.contains(id)) {
 			m_currentLanguage = id;
+			m_currentLanguageAtomic.store(m_currentLanguage, std::memory_order_release);
 			return true;
 		}
 		return false;

@@ -1,4 +1,4 @@
-#include <Jobs/JobSubsystem.hpp>
+﻿#include <Jobs/JobSubsystem.hpp>
 #include <Jobs/JobEvents.hpp>
 
 #include <Core/Log.hpp>

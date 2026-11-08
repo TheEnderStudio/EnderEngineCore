@@ -74,10 +74,28 @@ else
 end
 
 -- ---------------------------------------------------------------------------
+-- Optional: engine pool allocator for the global heap
+--
+-- `xmake f --pool_allocator=y` routes every plain new/delete (all std:: containers,
+-- make_unique/make_shared, ...) through the engine's pool allocator instead of the CRT.
+-- Process-wide: it must be set for every target, which is why it is a project option and
+-- not a per-target define.
+-- ---------------------------------------------------------------------------
+option("pool_allocator")
+	set_default(true)
+	set_showmenu(true)
+	set_description("Route the global operator new/delete through Memorizer's pools")
+option_end()
+
+if has_config("pool_allocator") then
+	add_defines("EE_POOL_GLOBAL_NEW")
+end
+
+-- ---------------------------------------------------------------------------
 -- Platform System Links
 -- ---------------------------------------------------------------------------
 if is_plat("windows") then
-	add_syslinks("user32", "dbghelp", "kernel32", "gdi32", "shell32", "comdlg32", "d3d11", "d3d12", "dxgi", "dxguid", "d3dcompiler")
+	add_syslinks("user32", "dbghelp", "kernel32", "gdi32", "shell32", "comdlg32", "d3d11", "d3d12", "dxgi", "dxguid", "d3dcompiler", "onecore")
 	add_cxflags("/W4", "/utf-8", "/permissive", {force = true})
 elseif is_plat("linux") then
 	add_syslinks("pthread", "dl")
@@ -152,6 +170,9 @@ target("EnderEngineCore")
 
 	-- Macros
 	add_defines("EE_PHYSICS_BACKEND_PHYSX5")
+
+	-- Library: Memorizer
+	add_deps("Memorizer")
 
 	-- Third-party libraries
 	if is_mode("debug") then
@@ -254,6 +275,11 @@ target("TestCore")
 	set_kind("binary")
 	add_deps("EnderEngineCore")
 	add_files("Tests/*.cpp")
+	-- The global operator new replacement has to exist in every module that allocates
+	-- (see Source/Engine/Core/PoolNew.cpp); it forwards to the engine's pools.
+	if has_config("pool_allocator") then
+		add_files("Source/Engine/Core/PoolNew.cpp")
+	end
 	-- Mirrors EnderEngineCore/Demo: some engine headers include each other as
 	-- <Core/...>, which resolves relative to Include/Engine.
 	add_includedirs("Include/Engine", { private = true })
@@ -275,6 +301,11 @@ target("Demo")
 	set_kind("binary")
 	add_deps("EnderEngineCore", "EnderEngine.Extension.HelloWorld", "EnderEngine.Extension.AdaptiveMusic")
 	add_files("Demo/*.cpp")
+	-- The global operator new replacement has to exist in every module that allocates
+	-- (see Source/Engine/Core/PoolNew.cpp); it forwards to the engine's pools.
+	if has_config("pool_allocator") then
+		add_files("Source/Engine/Core/PoolNew.cpp")
+	end
 
 	-- Inherit include paths from EnderEngineCore
 	add_includedirs("Include/Engine")
@@ -360,6 +391,9 @@ target("EnderEngine.Extension.HelloWorld")
 	add_deps("EnderEngineCore")
 	add_headerfiles("Extensions/HelloWorld/HelloWorldExt.hpp")
 	add_files("Extensions/HelloWorld/HelloWorldExt.cpp")
+	if has_config("pool_allocator") then
+		add_files("Source/Engine/Core/PoolNew.cpp")
+	end
 target_end()
 
 target("EnderEngine.Extension.AdaptiveMusic")
@@ -369,6 +403,9 @@ target("EnderEngine.Extension.AdaptiveMusic")
 	add_includedirs("Extensions/AdaptiveMusic/include")
 	add_headerfiles("Extensions/AdaptiveMusic/include/EngineExt/AdaptiveMusic.hpp")
 	add_files("Extensions/AdaptiveMusic/src/*.cpp")
+	if has_config("pool_allocator") then
+		add_files("Source/Engine/Core/PoolNew.cpp")
+	end
 target_end()
 
 -- ---------------------------------------------------------------------------
@@ -443,3 +480,4 @@ target_end()
 -- Libraries
 -- ---------------------------------------------------------------------------
 includes("Libraries/EnderVFiles2") -- EnderVFiles2
+includes("Libraries/Memorizer") -- Memorizer and Benchmark
