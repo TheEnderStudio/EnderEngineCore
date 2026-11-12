@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "Macros.h"
 #include "Types.hpp"
@@ -74,3 +74,18 @@ public:
 };
 
 EE_NAMESPACE_END
+
+#define EE_CHECK_VERSION() do { \
+const Version& ver = ::EnderEngine::Engine::getVersion(); \
+if (!((ver.major() == EE_VERSION_MAJOR) && \
+	(ver.minor() == EE_VERSION_MINOR) && \
+	(ver.patch() == EE_VERSION_PATCH) && \
+	(ver.guid() == Guid(UUIDv4::UUID::fromStrFactory(EE_VERSION_GUID))))) { \
+	fprintf(stderr, "Version check FAILED. Current Version: %s; Target Version: %s\n", \
+		ver.toString().c_str(), \
+		Version(EE_VERSION_MAJOR, EE_VERSION_MINOR, EE_VERSION_PATCH, Guid(UUIDv4::UUID::fromStrFactory(EE_VERSION_GUID))).toString().c_str()); \
+} \
+else { \
+	fprintf(stdout, "Version check done: %s\n", ver.toString().c_str()); \
+} \
+} while (0)

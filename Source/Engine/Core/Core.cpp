@@ -28,21 +28,6 @@ Result<void, CoreError> Engine::initialize() {
 		return CoreError::OperationFailed;
 	}
 
-	EInfo("Checking version...");
-
-	const Version& ver = getVersion();
-	if (!((ver.major() == EE_VERSION_MAJOR) &&
-		(ver.minor() == EE_VERSION_MINOR) &&
-		(ver.patch() == EE_VERSION_PATCH) &&
-		(ver.guid() == Guid(UUIDv4::UUID::fromStrFactory(EE_VERSION_GUID))))) {
-		EWarn("Version check FAILED. Current Version: {}; Target Version: {}", 
-			ver.toString(),
-			Version(EE_VERSION_MAJOR, EE_VERSION_MINOR, EE_VERSION_PATCH, Guid(UUIDv4::UUID::fromStrFactory(EE_VERSION_GUID))).toString());
-	}
-	else {
-		EInfo("Version check done: {}", ver.toString());
-	}
-
 	EInfo("Engine core initialization started.");
 
 	eeCrashHandlerInstall();
@@ -53,7 +38,7 @@ Result<void, CoreError> Engine::initialize() {
 	g_initialized = true;
 	EInfo("Global allocator: {}", engineUsesPoolGlobalAllocator() ? "engine pools (EE_POOL_GLOBAL_NEW)" : "CRT heap");
 	EInfo("Engine core initialized successfully.");
-	EInfo("Engine version: {}", ver.getFullEngineInfo());
+	EInfo("Engine version: {}", getVersion().getFullEngineInfo());
 	return {};
 }
 
