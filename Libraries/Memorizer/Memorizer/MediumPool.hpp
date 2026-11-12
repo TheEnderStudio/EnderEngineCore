@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "Common.hpp"
 
@@ -354,7 +354,7 @@ public:
 	}
 
 #ifdef EE_MEMORIZER_DEBUG
-	static void dumpStats();
+	static String dumpStats();
 	static void resetStats();
 #endif
 };
@@ -380,7 +380,7 @@ void mediumDelete(T* ptr) {
 }
 
 #ifdef EE_MEMORIZER_DEBUG
-inline void MediumPool::dumpStats() {
+inline String MediumPool::dumpStats() {
 	auto& s = MDetail::getStats();
 	String table;
 	for (UInt32 i = 0; i < MDetail::NumSizeClasses; ++i) {
@@ -388,7 +388,7 @@ inline void MediumPool::dumpStats() {
 		const UInt64 f = s.perClassFrees[i].load();
 		table = fmt::format("{}{:<12}|{:<12}|{:<12}|{:<12}\n", table, MDetail::SizeClasses[i], a, f, a - f);
 	}
-	fmt::println(R"(
+	return fmt::format(R"(
 === MediumPool Statistics ===
 Total allocations : {}
 Total frees       : {}

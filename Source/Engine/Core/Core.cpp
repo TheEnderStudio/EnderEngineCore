@@ -1,4 +1,4 @@
-#include <Core/Core.hpp>
+﻿#include <Core/Core.hpp>
 #include <Core/Log.hpp>
 #include <Core/Crash.h>
 #include <Core/Subsystem.hpp>
@@ -24,8 +24,23 @@ Result<void, CoreError> Engine::initialize() {
 	}
 
 	if (!Log::initialize()) {
-		EError("Failed to initialize logging subsystem.");
+		fprintf(stderr, "FAILED to initialize logging subsystem!");
 		return CoreError::OperationFailed;
+	}
+
+	EInfo("Checking version...");
+
+	const Version& ver = getVersion();
+	if (!((ver.major() == EE_VERSION_MAJOR) &&
+		(ver.minor() == EE_VERSION_MINOR) &&
+		(ver.patch() == EE_VERSION_PATCH) &&
+		(ver.guid() == Guid(UUIDv4::UUID::fromStrFactory(EE_VERSION_GUID))))) {
+		EWarn("Version check FAILED. Current Version: {}; Target Version: {}", 
+			ver.toString(),
+			Version(EE_VERSION_MAJOR, EE_VERSION_MINOR, EE_VERSION_PATCH, Guid(UUIDv4::UUID::fromStrFactory(EE_VERSION_GUID))).toString());
+	}
+	else {
+		EInfo("Version check done: {}", ver.toString());
 	}
 
 	EInfo("Engine core initialization started.");
@@ -38,7 +53,7 @@ Result<void, CoreError> Engine::initialize() {
 	g_initialized = true;
 	EInfo("Global allocator: {}", engineUsesPoolGlobalAllocator() ? "engine pools (EE_POOL_GLOBAL_NEW)" : "CRT heap");
 	EInfo("Engine core initialized successfully.");
-	EInfo("Engine version: {}", getVersion().toString());
+	EInfo("Engine version: {}", ver.getFullEngineInfo());
 	return {};
 }
 
@@ -59,6 +74,8 @@ void Engine::shutdown() {
 		}
 		g_subsystems.clear();
 	}
+
+	printAllocationStatistics();
 
 	ExtensionLoader::shutdown();
 	eeCrashHandlerUninstall();

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "Common.hpp"
 
@@ -379,7 +379,7 @@ public:
     }
 
 #ifdef EE_MEMORIZER_DEBUG
-    static void dumpStats();
+    static String dumpStats();
     static void resetStats();
 #endif
 };
@@ -410,7 +410,7 @@ void smallDelete(T* ptr) {
 }
 
 #ifdef EE_MEMORIZER_DEBUG
-inline void SmallPool::dumpStats() {
+inline String SmallPool::dumpStats() {
     auto& s = SDetail::getStats();
     String table;
     for (UInt32 i = 0; i < SDetail::NumSizeClasses; ++i) {
@@ -418,7 +418,7 @@ inline void SmallPool::dumpStats() {
         const UInt64 f = s.perClassFrees[i].load();
         table = fmt::format("{}{:<12}|{:<12}|{:<12}|{:<12}\n", table, SDetail::SizeClasses[i], a, f, a - f);
     }
-    fmt::println(R"(
+    return fmt::format(R"(
 === SmallPool Statistics ===
 Total allocations : {}
 Total frees       : {}

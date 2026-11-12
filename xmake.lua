@@ -171,8 +171,8 @@ target("EnderEngineCore")
 	-- Macros
 	add_defines("EE_PHYSICS_BACKEND_PHYSX5")
 
-	-- Library: Memorizer
-	add_deps("Memorizer")
+	-- Libraries: Memorizer, EnderVFiles2
+	add_deps("Memorizer", "EnderVFiles2")
 
 	-- Third-party libraries
 	if is_mode("debug") then
@@ -481,3 +481,24 @@ target_end()
 -- ---------------------------------------------------------------------------
 includes("Libraries/EnderVFiles2") -- EnderVFiles2
 includes("Libraries/Memorizer") -- Memorizer and Benchmark
+
+-- ---------------------------------------------------------------------------
+-- Packer2 (Offline EnderVFiles2 package builder)
+-- ---------------------------------------------------------------------------
+target("Packer2")
+	set_kind("binary")
+	add_files("Tools/Packer2/*.cpp")
+	add_includedirs("ThirdParty/cxxopts/include")
+	add_includedirs("Libraries/EnderVFiles2/include")
+	add_defines("CXXOPTS_NO_EXCEPTIONS", "CXXOPTS_NO_RTTI")
+	add_deps("EnderVFiles2")
+	add_linkdirs("ThirdParty/OpenSSL/lib")
+	add_linkdirs("ThirdParty/zlib/lib")
+	add_links("libcrypto")
+	if is_mode("debug") then
+		add_links("zd")
+	else
+		add_links("z")
+	end
+
+target_end()

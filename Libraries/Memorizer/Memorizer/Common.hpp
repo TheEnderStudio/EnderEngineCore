@@ -12,7 +12,7 @@
 #define EE_NAMESPACE_MEMORIZER_BEGIN namespace EnderEngine::Memorizer {
 #define EE_NAMESPACE_MEMORIZER_END }
 
-#define EE_MEMORIZER_NO_STATS
+// #define EE_MEMORIZER_NO_STATS
 
 // The statistics are useful but expensive (one atomic RMW per allocation), so they
 // follow the engine's debug switch. The guard name used to be misspelled

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "Macros.h"
 
@@ -132,5 +132,7 @@ private:
 		return this == &other;
 	}
 };
+
+EE_API void printAllocationStatistics();
 
 EE_NAMESPACE_END

@@ -1,6 +1,7 @@
-#include <Core/Allocation.hpp>
+﻿#include <Core/Allocation.hpp>
 #include <Core/Crash.h>
 #include <Core/Types.hpp>
+#include <Core/Log.hpp>
 
 #include <Memorizer/SmallPool.hpp>
 #include <Memorizer/MediumPool.hpp>
@@ -246,6 +247,32 @@ void engineFree(void* ptr) {	if (!ptr) [[unlikely]] return;
         //ECrash("Try to free an unknown pointer (%p)", ptr);
         break;
     }
+}
+
+void printAllocationStatistics() {
+#ifdef EE_MEMORIZER_DEBUG
+    String smallStats = SmallPool::dumpStats();
+    String mediumStats = MediumPool::dumpStats();
+    LargeAllocStats largeAllocStats = getSharedLargeAllocator().getStats();
+    String largeStats = fmt::format(R"(
+=== LargeAllocator Statistics ===
+Reserved Bytes  : {}
+Committed Bytes : {}
+Block Count     : {}
+Huge Blocks     : {}
+Large Blocks    : {}
+Normal Blocks   : {})",
+largeAllocStats.reservedBytes,
+largeAllocStats.committedBytes,
+largeAllocStats.blockCount,
+largeAllocStats.hugeBlocks,
+largeAllocStats.largeBlocks,
+largeAllocStats.normalBlocks);
+
+    EInfo("Memory Pools Statistics:\n{}\n{}\n{}", smallStats, mediumStats, largeStats);
+#else
+    EWarn("Statistics of Memory Pools is unavailable");
+#endif
 }
 
 EE_NAMESPACE_END
