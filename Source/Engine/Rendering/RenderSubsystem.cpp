@@ -235,6 +235,11 @@ SamplerState g_SkyEnv_sampler : register(s5);
 // The same shadow map again, read as a typed texture: the contact shadow march needs
 // the stored depth value itself, which a comparison sampler cannot give.
 Texture2DArray<float> g_ShadowMapDepth : register(t6);
+// Material ambient occlusion. Bound to the material's occlusion texture, or to a 1x1
+// white texture when it has none, so the sample below is neutral by default. glTF keeps
+// occlusion in its own texture, but many exporters pack it into the metallic-roughness
+// texture's R channel (the ORM convention), which g_MetallicRough.z selects per draw.
+Texture2D    t_AO         : register(t7);
 
 
 cbuffer Frame : register(b0)
@@ -663,13 +668,15 @@ float4 main(PSIn i) : SV_TARGET
     float4 orm = t_MR.Sample(t_BC_sampler, i.UV);
     float m  = saturate(g_MetallicRough.x * orm.b);
     float r  = saturate(g_MetallicRough.y * orm.g);
-    // Occlusion is *not* orm.r. glTF references the occlusion map separately
-    // (occlusionTexture), and a material can well have a metallicRoughness texture
-    // without one - the Demo's Wall does exactly that - in which case the R channel
-    // holds whatever the exporter put there and using it would black out the ambient
-    // light. Wiring up real occlusion needs its own binding (the loader already
-    // resolves the reference), which is why this stays neutral for now.
-    float ao = 1.0;
+    // Material occlusion. glTF references it separately (occlusionTexture), but many
+    // exporters instead pack it into the metallic-roughness texture's R channel (the ORM
+    // convention) - and a material can equally have an MR texture whose R holds something
+    // else entirely, which is why the ORM choice is a per-draw flag decided on the CPU
+    // (z), only ever set for materials without an occlusion texture of their own, and
+    // never on by default. w is an explicit override the DebugUI drives, so the ambient
+    // occlusion path can be exercised on assets that carry no AO at all.
+    float ao = (g_MetallicRough.z > 0.5) ? orm.r : t_AO.Sample(t_BC_sampler, i.UV).r;
+    ao = saturate(g_MetallicRough.w < 0.999 ? g_MetallicRough.w : ao);
     // glTF emissive = factor * texture (w carries the strength).
     float3 emis = g_Emissive.rgb * g_Emissive.w * t_EmissiveMap.Sample(t_BC_sampler, i.UV).rgb;
 
@@ -695,6 +702,8 @@ SamplerComparisonState g_ShadowMap_sampler : register(s4);
 TextureCube  g_SkyEnv     : register(t5);
 SamplerState g_SkyEnv_sampler : register(s5);
 Texture2DArray<float> g_ShadowMapDepth : register(t6);
+// Material occlusion; see the note on the forward shader's t_AO.
+Texture2D    t_AO         : register(t7);
 
 cbuffer Frame : register(b0)
 {
@@ -786,6 +795,12 @@ PSOut main(PSIn i)
     o.Norm  = float4(N, saturate(g_MetallicRough.y * orm.g));
     o.Emis  = float4(g_Emissive.rgb * g_Emissive.w * t_EmissiveMap.Sample(t_BC_sampler, i.UV).rgb,
                      saturate(g_MetallicRough.x * orm.b));
+    // The albedo target's alpha carries the material occlusion (its RGB is the albedo and
+    // nothing else reads the alpha); the hybrid compose multiplies its environment term by
+    // it. Same source selection as the forward shader: an explicit occlusion map, else the
+    // ORM convention's R channel, else neutral.
+    float ao = (g_MetallicRough.z > 0.5) ? orm.r : t_AO.Sample(t_BC_sampler, i.UV).r;
+    o.Color.a = saturate(g_MetallicRough.w < 0.999 ? g_MetallicRough.w : ao);
     return o;
 }
 )";
@@ -1074,6 +1089,12 @@ struct RenderSubsystem::RenderBackend {
 	F32  envMipScale = 1.0f;    ///< Roughness -> mip scale (envParams.y).
 	bool envDebug = false;      ///< Shade with the raw environment sample (envParams.z).
 	F32  envIntensity = 1.0f;   ///< Specular IBL intensity (envParams.w).
+	/// Material ambient occlusion (see objectMetallicRough). useOrmAsAo reads occlusion
+	/// from the metallic-roughness texture's R channel for materials without an occlusion
+	/// texture; aoOverride < 1 replaces the sampled occlusion outright, which is how the
+	/// ambient occlusion path can be checked on assets that carry none.
+	bool useOrmAsAo = false;
+	F32  aoOverride = 1.0f;
 	/// Cube-map orientation fixes (see envFaceMatrix): which mirrors the built
 	/// environment needs so that it matches the visible sky. Kept as data rather than
 	/// as a correction baked into the face table, so the convention can be re-dialled
@@ -1444,6 +1465,7 @@ struct RenderSubsystem::RenderBackend {
 					{D::SHADER_TYPE_PIXEL, "t_NormalMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					{D::SHADER_TYPE_PIXEL, "t_MR", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					{D::SHADER_TYPE_PIXEL, "t_EmissiveMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+					{D::SHADER_TYPE_PIXEL, "t_AO", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					{D::SHADER_TYPE_VERTEX | D::SHADER_TYPE_PIXEL, "Object", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					{D::SHADER_TYPE_PIXEL, "g_ShadowMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 					{D::SHADER_TYPE_PIXEL, "g_ShadowMapDepth", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
@@ -1850,6 +1872,12 @@ struct RenderSubsystem::RenderBackend {
 			{D::SHADER_TYPE_PIXEL, "t_NormalMap",   D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 			{D::SHADER_TYPE_PIXEL, "t_MR",          D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 			{D::SHADER_TYPE_PIXEL, "t_EmissiveMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+			// Material occlusion. It has to be listed here for the same reason as the
+			// other maps: anything left to DefaultVariableType (STATIC) is owned by the
+			// PSO, so the per-material Set() in mkMat() would silently do nothing (and
+			// SRB creation reports "No resource is assigned to static shader variable
+			// 't_AO'").
+			{D::SHADER_TYPE_PIXEL, "t_AO",          D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 			{D::SHADER_TYPE_VERTEX | D::SHADER_TYPE_PIXEL, "Object", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 			{D::SHADER_TYPE_PIXEL, "g_ShadowMap", D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 			// The same shadow map, readable as a depth texture for the contact shadow
@@ -2015,6 +2043,10 @@ struct RenderSubsystem::RenderBackend {
 			bindTex("t_NormalMap",   d.normalTexture,            flatNormalSRV.RawPtr());
 			bindTex("t_MR",          d.metallicRoughnessTexture, whiteSRV.RawPtr());
 			bindTex("t_EmissiveMap", d.emissiveTexture,          whiteSRV.RawPtr());
+			// Occlusion is white when the material has none: t_AO is always sampled, and
+			// the ORM-convention fallback (see g_MetallicRough.z) is decided per draw.
+			bindTex("t_AO",          d.aoTexture,                 whiteSRV.RawPtr());
+
 			// The G-buffer shader declares (but does not use) the shadow map; bind a dummy
 			// so the mutable variables are never left unbound when committing the G-buffer
 			// SRB. The regular PBR SRB leaves them unbound here - draw() binds the real
@@ -2029,6 +2061,18 @@ struct RenderSubsystem::RenderBackend {
 		return MaterialHandle{ a.index, a.generation };
 	}
 
+// Metallic/roughness constants for one draw, plus the two occlusion controls that ride in
+// the free channels of the same vec4 (see the forward shader's t_AO):
+//   z = read occlusion from the metallic-roughness texture's R channel (the ORM
+//       convention). Only ever set for materials without an occlusion texture of their
+//       own - a material can have an MR map whose R holds something else entirely - and
+//       only when the renderer's ORM fallback is enabled.
+//   w = an explicit occlusion override, 1 = use the sampled value. Lets the ambient
+//       occlusion path be exercised on assets that carry no AO data at all.
+static Vec4 objectMetallicRough(const MaterialDesc& d, bool useOrmAsAo, F32 aoOverride) {
+	const bool useOrm = useOrmAsAo && !d.aoTexture.isValid();
+	return Vec4(d.metallicFactor, d.roughnessFactor, useOrm ? 1.0f : 0.0f, aoOverride);
+}
 	// --------------------------------------------------------------
 	// Drawing
 	// --------------------------------------------------------------
@@ -2065,7 +2109,7 @@ struct RenderSubsystem::RenderBackend {
 		for (UInt32 si = 0; si < (UInt32)md->sub.size(); si++) {
 			auto& s = md->sub[si];
 			auto* mt = materials.get(s.material.index, s.material.generation);
-			if (mt && mt->objCB) { ObjectConstants oc; oc.world = wm; oc.normalMat = nm; oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.nmSign = nmSign; oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
+			if (mt && mt->objCB) { ObjectConstants oc; oc.world = wm; oc.normalMat = nm; oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = objectMetallicRough(mt->desc, useOrmAsAo, aoOverride); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.nmSign = nmSign; oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
 			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
 			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
 			if (mt && srb) {
@@ -2145,7 +2189,7 @@ struct RenderSubsystem::RenderBackend {
 
 		for (auto& s : md->sub) {
 			auto* mt = materials.get(s.material.index, s.material.generation);
-			if (mt && mt->objCB) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.nmSign = nmSign; oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
+			if (mt && mt->objCB) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = objectMetallicRough(mt->desc, useOrmAsAo, aoOverride); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.nmSign = nmSign; oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
 			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
 			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
 			if (mt && srb) {
@@ -2182,9 +2226,9 @@ struct RenderSubsystem::RenderBackend {
 			// same neutral fallbacks mkMat() uses, so this path shades the same textures
 			// as the regular draw() path.
 			{
-				const char* mapNames[4] = { "t_BC", "t_NormalMap", "t_MR", "t_EmissiveMap" };
-				D::IDeviceObject* fallbacks[4] = { whiteSRV.RawPtr(), flatNormalSRV.RawPtr(), whiteSRV.RawPtr(), whiteSRV.RawPtr() };
-				for (int mi = 0; mi < 4; ++mi) {
+				const char* mapNames[5] = { "t_BC", "t_NormalMap", "t_MR", "t_EmissiveMap", "t_AO" };
+				D::IDeviceObject* fallbacks[5] = { whiteSRV.RawPtr(), flatNormalSRV.RawPtr(), whiteSRV.RawPtr(), whiteSRV.RawPtr(), whiteSRV.RawPtr() };
+				for (int mi = 0; mi < 5; ++mi) {
 					auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, mapNames[mi]);
 					if (!v) continue;
 					D::IDeviceObject* obj = fallbacks[mi];
@@ -2200,7 +2244,7 @@ struct RenderSubsystem::RenderBackend {
 
 			if (mt) {
 				void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
-				if (m) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = Vec4(mt->desc.metallicFactor, mt->desc.roughnessFactor, 0, 0); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.nmSign = nmSign; oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); }
+				if (m) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = objectMetallicRough(mt->desc, useOrmAsAo, aoOverride); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.nmSign = nmSign; oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); }
 				if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_VERTEX, "Object"))
 					v->Set(mt->objCB, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 			}
@@ -2942,7 +2986,10 @@ void RenderSubsystem::setContactShadows(F32 normalOffsetTexels, F32 lengthTexels
 		std::max(fadeDistance, 0.0f));
 }
 Vec4 RenderSubsystem::contactShadowParams() const { return m_backend->contactParams; }
-void RenderSubsystem::setDiffuseWrap(F32 wrap) { m_backend->diffuseWrap = std::clamp(wrap, 0.0f, 1.0f); }
+void RenderSubsystem::setUseOrmAsAo(bool enable) { m_backend->useOrmAsAo = enable; }
+bool RenderSubsystem::useOrmAsAo() const { return m_backend->useOrmAsAo; }
+void RenderSubsystem::setAoOverride(F32 value) { m_backend->aoOverride = std::clamp(value, 0.0f, 1.0f); }
+F32 RenderSubsystem::aoOverride() const { return m_backend->aoOverride; }void RenderSubsystem::setDiffuseWrap(F32 wrap) { m_backend->diffuseWrap = std::clamp(wrap, 0.0f, 1.0f); }
 F32 RenderSubsystem::diffuseWrap() const { return m_backend->diffuseWrap; }
 Vec4 RenderSubsystem::skyEnvParams() const {
 	return Vec4(m_backend->envEnabled ? 1.0f : 0.0f, m_backend->envMipScale,

@@ -422,6 +422,7 @@ struct MeshShaderSubsystem::Impl {
 	std::vector<D::IDeviceObject*>    normalSRVs;        // normal   (normalTexture)
 	std::vector<D::IDeviceObject*>    mrSRVs;            // metallicRoughnessTexture
 	std::vector<D::IDeviceObject*>    emissiveSRVs;      // emissiveTexture
+	std::vector<D::IDeviceObject*>    aoSRVs;            // occlusion (aoTexture, or the ORM R channel)
 	/// Material slots of the registered meshes (see MatSlot), kept so the GPU material
 	/// table can be rewritten by refreshMaterials() after a live material edit.
 	std::vector<MatSlot>              materialSlots;
@@ -527,7 +528,7 @@ void MeshShaderSubsystem::onShutdown() {
 	p.flatMRTex.Release(); p.flatMRSRV.Release();
 	p.shadowSampler.Release(); p.shadowDummyTex.Release(); p.shadowDummySRV.Release(); p.shadowMapSRV.Release();
 	p.skyEnvSampler.Release(); p.skyEnvDummyTex.Release(); p.skyEnvDummySRV.Release(); p.skyEnvSRV.Release();
-	p.materialSRVs.clear(); p.normalSRVs.clear(); p.mrSRVs.clear(); p.emissiveSRVs.clear();
+	p.materialSRVs.clear(); p.normalSRVs.clear(); p.mrSRVs.clear(); p.emissiveSRVs.clear(); p.aoSRVs.clear();
 	p.materialSlots.clear();
 	p.materialCount = 0;
 	p.sceneMeshList.clear();
@@ -1826,6 +1827,10 @@ Texture2D    g_Albedo[MAX_MATERIALS]   : register(t0);
 Texture2D    g_NormalMap[MAX_MATERIALS] : register(t32);
 Texture2D    g_MetalRough[MAX_MATERIALS] : register(t64);
 Texture2D    g_EmissiveMap[MAX_MATERIALS] : register(t96);
+// Material occlusion (white when the material has none); the palette is filled on the CPU
+// from the material's occlusion texture, or from the metal/rough texture's R channel for
+// assets that follow the ORM convention (see RenderSubsystem::setUseOrmAsAo).
+Texture2D    g_AmbientOcclusion[MAX_MATERIALS] : register(t160);
 // Cascaded shadow map, exactly as the forward PBR shader declares it (t4/s4
 // there; here the material palettes already own t0..t127).
 Texture2DArray g_ShadowMap : register(t128);
@@ -2070,7 +2075,9 @@ float4 main(in PSInput i) : SV_TARGET {
     float4 orm = g_MetalRough[id].Sample(g_AlbedoSampler, i.UV);
     float  m = saturate(orm.b * mat.params.x);
     float  r = saturate(orm.g * mat.params.y);
-    float  ao = 1.0;
+    // Material occlusion: its own map, or (for assets without one) the ORM convention's R
+    // channel - the palette is filled accordingly on the CPU.
+    float  ao = saturate(g_AmbientOcclusion[id].Sample(g_AlbedoSampler, i.UV).r);
 
     float3 N = normalize(i.Normal);
     float3 sn = g_NormalMap[id].Sample(g_AlbedoSampler, i.UV).xyz * 2.0 - 1.0;
@@ -2165,6 +2172,10 @@ Texture2D    g_Albedo[MAX_MATERIALS]      : register(t0);
 Texture2D    g_NormalMap[MAX_MATERIALS]   : register(t32);
 Texture2D    g_MetalRough[MAX_MATERIALS]  : register(t64);
 Texture2D    g_EmissiveMap[MAX_MATERIALS] : register(t96);
+// Material occlusion (white when the material has none); the palette is filled on the CPU
+// from the material's occlusion texture, or from the metal/rough texture's R channel for
+// assets that follow the ORM convention (see RenderSubsystem::setUseOrmAsAo).
+Texture2D    g_AmbientOcclusion[MAX_MATERIALS] : register(t160);
 SamplerState g_AlbedoSampler : register(s0);
 StructuredBuffer<MaterialGPU> Materials;
 
@@ -2218,6 +2229,9 @@ PSOut main(in PSInput i) {
     N = NormalMapped(N, i.WorldPos, i.UV, sn);
 
     o.Norm = float4(N, r);
+    // The albedo alpha carries the material occlusion for the hybrid compose; the albedo
+    // RGB is the only part that compose reads otherwise.
+    o.Color.a = saturate(g_AmbientOcclusion[id].Sample(g_AlbedoSampler, i.UV).r);
     // Metallic rides in the emissive target's alpha (rgb is the emissive itself): the
     // compose pass needs it for F0 = lerp(0.04, albedo, metallic), and there is no
     // spare channel left - roughness already owns the normal target's alpha.
@@ -2501,6 +2515,7 @@ Result<void, RenderError> MeshShaderSubsystem::ensureClusterPipeline(Impl& p, UI
 			bindArray("g_NormalMap", p.normalSRVs);
 			bindArray("g_MetalRough", p.mrSRVs);
 			bindArray("g_EmissiveMap", p.emissiveSRVs);
+		bindArray("g_AmbientOcclusion", p.aoSRVs);
 		}
 		if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_AlbedoSampler"))
 			if (p.materialSampler) v->Set(p.materialSampler);
@@ -3175,6 +3190,7 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 		p.normalSRVs.assign(kMaxMaterials, p.whiteTexSRV.RawPtr());
 		p.mrSRVs.assign(kMaxMaterials, p.whiteTexSRV.RawPtr());
 		p.emissiveSRVs.assign(kMaxMaterials, p.whiteTexSRV.RawPtr());
+		p.aoSRVs.assign(kMaxMaterials, p.whiteTexSRV.RawPtr());
 		p.materialCount = (UInt32)matSlots.size();
 
 		auto mkFlat = [&](const UInt8 rgba[4], D::RefCntAutoPtr<D::ITexture>& tex, D::RefCntAutoPtr<D::ITextureView>& srv) {
@@ -3195,7 +3211,7 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 		if (p.flatNormalSRV) p.normalSRVs.assign(kMaxMaterials, p.flatNormalSRV.RawPtr());
 		if (p.flatMRSRV)     p.mrSRVs.assign(kMaxMaterials, p.flatMRSRV.RawPtr());
 
-		UInt32 boundAlbedo = 0, boundNormal = 0, boundMR = 0, boundEmissive = 0;
+		UInt32 boundAlbedo = 0, boundNormal = 0, boundMR = 0, boundEmissive = 0, boundAO = 0;
 		auto resolve = [&](TextureHandle h, std::vector<D::IDeviceObject*>& dst, UInt32 i, UInt32& counter) {
 			if (!h.isValid()) return;
 			if (auto* srv = static_cast<D::IDeviceObject*>(p.renderer->getTextureSRV(h))) { dst[i] = srv; ++counter; }
@@ -3208,6 +3224,11 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 			resolve(md.normalTexture,             p.normalSRVs,   i, boundNormal);
 			resolve(md.metallicRoughnessTexture,  p.mrSRVs,       i, boundMR);
 			resolve(md.emissiveTexture,           p.emissiveSRVs, i, boundEmissive);
+			resolve(md.aoTexture,                 p.aoSRVs,       i, boundAO);
+			// ORM convention: an asset without an occlusion texture can take it from the
+			// metal/rough texture's R channel (the flat fallback there is white, i.e. neutral).
+			if (p.renderer->useOrmAsAo() && !md.aoTexture.isValid() && p.mrSRVs[i] != p.whiteTexSRV.RawPtr())
+				p.aoSRVs[i] = p.mrSRVs[i];
 		}
 		EInfo("MeshShader: {} material slot(s); textures bound - albedo {}, normal {}, metalRough {}, emissive {}",
 			p.materialCount, boundAlbedo, boundNormal, boundMR, boundEmissive);

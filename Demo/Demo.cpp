@@ -985,6 +985,16 @@ HALT
 					renderer.setNormalMapSign(Vec2(nmFlipX ? -1.0f : 1.0f, nmFlipY ? -1.0f : 1.0f));
 				}
 			}
+			// Material ambient occlusion. The Demo's assets carry no occlusion maps, so
+			// there are two ways to see the path work: take occlusion from the
+			// metallic-roughness texture's R channel (only meaningful if the asset was
+			// exported with the ORM convention packed that way), or force a constant.
+			{
+				bool useOrm = renderer.useOrmAsAo();
+				if (debugUI.checkbox("AO from ORM R", &useOrm)) renderer.setUseOrmAsAo(useOrm);
+				F32 aoOverride = renderer.aoOverride();
+				if (debugUI.sliderFloat("AO Override (1 = sampled)", &aoOverride, 0.0f, 1.0f)) renderer.setAoOverride(aoOverride);
+			}
 			// Specular IBL: the prefiltered sky environment. Off falls back to the
 			// diffuse-only ambient, which is the quickest way to see what it adds
 			// (metals and polished dielectrics are the obvious ones).
@@ -1103,9 +1113,9 @@ HALT
 			}
 		}
 		if (hybridRT) {
-			static const char* rtModeNames[] = { "Shaded", "GBufferColor", "GBufferNormal", "Diffuse", "Reflections", "Fresnel", "RTAlpha", "BackFacingNormals", "Metallic", "AmbientOcclusion" };
+			static const char* rtModeNames[] = { "Shaded", "GBufferColor", "GBufferNormal", "Diffuse", "Reflections", "Fresnel", "RTAlpha", "BackFacingNormals", "Metallic", "AmbientOcclusion", "MaterialAO" };
 			if (debugUI.button(fmt::format("RT View: {}", rtModeNames[rtDrawMode]).c_str())) {
-				rtDrawMode = (rtDrawMode + 1) % 10;
+				rtDrawMode = (rtDrawMode + 1) % 11;
 			}
 			static const char* rtResNames[] = { "Auto", "Full", "Half" };
 			// Auto(0) / Full(1) / Half(2) cycle.

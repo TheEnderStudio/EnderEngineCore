@@ -1,4 +1,4 @@
-set_project("EnderEngine")
+﻿set_project("EnderEngine")
 set_xmakever("2.8.0")
 add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate")
@@ -433,6 +433,23 @@ target("MeshCooking")
 target_end()
 
 -- ---------------------------------------------------------------------------
+-- AOBaker (Offline ambient occlusion baker for glTF/GLB models)
+-- ---------------------------------------------------------------------------
+target("AOBaker")
+	set_kind("binary")
+	add_files("Tools/AOBaker/*.cpp")
+	add_includedirs("ThirdParty/fastgltf/include")
+	add_includedirs("ThirdParty/cxxopts/include")
+	add_includedirs("ThirdParty/glm")
+	add_includedirs("ThirdParty/stb")
+	add_linkdirs("ThirdParty/fastgltf/lib")
+	if is_mode("debug") then
+		add_links("fastgltfd")
+	else
+		add_links("fastgltf")
+	end
+target_end()
+-- ---------------------------------------------------------------------------
 -- ResourcePacker (Pack all resources to publish)
 -- ---------------------------------------------------------------------------
 target("ResourcePacker")
@@ -481,6 +498,7 @@ target_end()
 -- ---------------------------------------------------------------------------
 includes("Libraries/EnderVFiles2") -- EnderVFiles2
 includes("Libraries/Memorizer") -- Memorizer and Benchmark
+includes("Libraries/EnderGameFramework") -- EGF
 
 -- ---------------------------------------------------------------------------
 -- Packer2 (Offline EnderVFiles2 package builder)

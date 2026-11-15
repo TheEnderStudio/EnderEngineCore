@@ -960,6 +960,7 @@ struct PSIn { float4 Pos : SV_POSITION; float2 UV : TEXCOORD0; };
 #define RENDER_MODE_BACK_FACING      7
 #define RENDER_MODE_METALLIC         8
 #define RENDER_MODE_AO               9
+#define RENDER_MODE_AO_MATERIAL      10
 
 float3 ScreenPosToWorldPos(float2 uv, float depth, float4x4 vpInv)
 {
@@ -1116,7 +1117,11 @@ float4 main(PSIn i) : SV_Target
     g_RTAlbedo.GetDimensions(rtDim.x, rtDim.y);
     const int2 rtTc = clamp(int2(UV * float2(rtDim)), int2(0, 0), int2(rtDim) - 1);
     const float ao = saturate(g_RTAlbedo.Load(int3(rtTc, 0)).a);
-    const float3 indirectDiffuse  = SkyIrradiance(FaceNormal) * g_Ambient.a * Color.rgb * DiffuseWeight * ao;
+    // Material occlusion rides in the G-buffer albedo alpha (see g_PS_GBuffer): that is the
+    // texture-based term, while ao above is the traced one. Both scale the environment.
+    const float aoMaterial = saturate(Color.a);
+    const float aoTotal = ao * aoMaterial;
+    const float3 indirectDiffuse  = SkyIrradiance(FaceNormal) * g_Ambient.a * Color.rgb * DiffuseWeight * aoTotal;
 
     switch (g_DrawMode)
     {
@@ -1138,8 +1143,10 @@ float4 main(PSIn i) : SV_Target
         // Diagnostic: the metallic channel itself (white = metal), for checking that
         // the G-buffer producer writes what the material says.
         case RENDER_MODE_METALLIC:         return float4(Metallic, Metallic, Metallic, 1.0);
-        // Diagnostic: the ambient occlusion that scales both environment terms.
+        // Diagnostic: the ambient occlusion that scales the environment terms - the traced
+        // one in mode 9, the material map in mode 10 (white = the asset carries none).
         case RENDER_MODE_AO:               return float4(ao, ao, ao, 1.0);
+        case RENDER_MODE_AO_MATERIAL:      return float4(aoMaterial, aoMaterial, aoMaterial, 1.0);
         case RENDER_MODE_SHADED:
         default:
         {

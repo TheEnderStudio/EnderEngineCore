@@ -498,6 +498,27 @@ public:
 	EE_NODISCARD bool normalMapDebug() const;
 
 	/**
+	 * @brief Read material occlusion from the metallic-roughness texture's R channel.
+	 *
+	 * glTF references occlusion separately (occlusionTexture), but many exporters pack it
+	 * into the metallic-roughness texture as R = occlusion, G = roughness, B = metallic.
+	 * A material that does have an occlusion texture always uses it; this only decides the
+	 * fallback for materials that do not. Off by default, because the R channel is
+	 * meaningless on assets exported without occlusion and would then darken the ambient.
+	 */
+	void setUseOrmAsAo(bool enable);
+	EE_NODISCARD bool useOrmAsAo() const;
+
+	/**
+	 * @brief Replace the sampled material occlusion with a constant (1 = use the sample).
+	 *
+	 * Exists so the ambient occlusion path can be exercised on assets that carry no AO
+	 * data: set it below 1 and the environment terms darken uniformly.
+	 */
+	void setAoOverride(F32 value);
+	EE_NODISCARD F32 aoOverride() const;
+
+	/**
 	 * @brief Sign applied to the classic path's decoded tangent-space normal map.
 	 *
 	 * The classic (raster) path builds its tangent frame from screen-space
