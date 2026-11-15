@@ -1,4 +1,4 @@
-﻿#include <Core/Core.hpp>
+#include <Core/Core.hpp>
 #include <Core/Log.hpp>
 #include <Core/Crash.h>
 #include <Core/Subsystem.hpp>

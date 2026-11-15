@@ -1,4 +1,4 @@
-﻿#include <Engine/Core/Core.hpp>
+#include <Engine/Core/Core.hpp>
 #include <Engine/Core/Log.hpp>
 #include <Engine/Core/Extension.hpp>
 #include <Engine/Core/Crash.h>
@@ -364,7 +364,7 @@ float4 main(PSIn i) : SV_TARGET {
 	MeshShaderSubsystem meshShader;
 	meshShader.attachToRenderer(&renderer);
 	bool hybridRT = false; // F9 toggles between rasterization and hybrid ray tracing
-	UInt32 rtDrawMode = 0; // compose debug mode (0=shaded ... 5=Fresnel)
+	UInt32 rtDrawMode = 0; // compose debug mode (0=shaded ... 8=metallic)
 	UInt32 rtShadowPCF = 4; // PCF shadow samples (1..16)
 	F32 rtAoRadius = 1.5f;   // AO ray length
 	UInt32 rtAoSamples = 4;  // AO rays per pixel (0 = off)
@@ -1103,9 +1103,9 @@ HALT
 			}
 		}
 		if (hybridRT) {
-			static const char* rtModeNames[] = { "Shaded", "GBufferColor", "GBufferNormal", "Diffuse", "Reflections", "Fresnel", "RTAlpha", "BackFacingNormals" };
+			static const char* rtModeNames[] = { "Shaded", "GBufferColor", "GBufferNormal", "Diffuse", "Reflections", "Fresnel", "RTAlpha", "BackFacingNormals", "Metallic", "AmbientOcclusion" };
 			if (debugUI.button(fmt::format("RT View: {}", rtModeNames[rtDrawMode]).c_str())) {
-				rtDrawMode = (rtDrawMode + 1) % 8;
+				rtDrawMode = (rtDrawMode + 1) % 10;
 			}
 			static const char* rtResNames[] = { "Auto", "Full", "Half" };
 			// Auto(0) / Full(1) / Half(2) cycle.

@@ -736,7 +736,7 @@ struct PSOut
 {
     float4 Color : SV_Target0; ///< Albedo (RGBA8_SRGB).
     float4 Norm  : SV_Target1; ///< World normal in rgb, roughness in alpha (RGBA16_FLOAT).
-    float4 Emis  : SV_Target2; ///< Emissive color * intensity (RGBA16_FLOAT, rgb used).
+    float4 Emis  : SV_Target2; ///< Emissive in rgb, metallic in alpha (RGBA16_FLOAT).
 };
 
 // Same note as in the forward shader: the sign belongs to the derivative-built
@@ -767,7 +767,9 @@ PSOut main(PSIn i)
     if (g_MapFlags.w > 0.5) {
         float4 raw = float4(t_NormalMap.Sample(t_BC_sampler, i.UV).xyz, 1.0);
         o.Norm = raw;
-        o.Emis = raw;
+        // Metallic 0: the diagnostic is about seeing the raw sample, so shade it as a
+        // dielectric instead of turning every pixel into a mirror.
+        o.Emis = float4(raw.rgb, 0.0);
         return o;
     }
     float3 N = normalize(i.N);
@@ -775,15 +777,15 @@ PSOut main(PSIn i)
         float3 sn = t_NormalMap.Sample(t_BC_sampler, i.UV).xyz * 2.0 - 1.0;
         N = NormalMapped(N, i.WP, i.UV, sn);
     }
-    // The hybrid path takes its shading from the ray trace, but it does read two
-    // things from here: the reflection lobe's roughness (the normal target's alpha)
-    // and the emissive. Both now come from the material's maps, so a textured
-    // roughness - the Wall has one - actually reaches the traced reflections instead
-    // of every material being equally rough. Metallic is not in the G-buffer yet, so
-    // the compose still assumes a dielectric F0 (see the note in the compose shader).
+    // The hybrid path takes its shading from the ray trace, but it reads three things
+    // from here: the reflection lobe's roughness (the normal target's alpha), the
+    // emissive, and the metallic (the emissive target's alpha) that becomes the
+    // reflection's F0. A textured metallic therefore reaches the traced reflections -
+    // previously every surface was shaded as a dielectric with F0 = 0.04.
     float4 orm = t_MR.Sample(t_BC_sampler, i.UV);
     o.Norm  = float4(N, saturate(g_MetallicRough.y * orm.g));
-    o.Emis  = float4(g_Emissive.rgb * g_Emissive.w * t_EmissiveMap.Sample(t_BC_sampler, i.UV).rgb, 1.0);
+    o.Emis  = float4(g_Emissive.rgb * g_Emissive.w * t_EmissiveMap.Sample(t_BC_sampler, i.UV).rgb,
+                     saturate(g_MetallicRough.x * orm.b));
     return o;
 }
 )";

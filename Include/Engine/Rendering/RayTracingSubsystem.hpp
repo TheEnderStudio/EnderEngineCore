@@ -20,6 +20,23 @@ struct alignas(16) RayTraceConstants {
 	Vec4 lightColor = Vec4(1.0f, 1.0f, 1.0f, 0.0f); ///< Light color (rgb; w unused).
 	Vec4 discPoints[8];   ///< 16 packed float2 disc samples (soft shadow cone, xy/zw pairs).
 	Vec4 skyCorners[8];   ///< Skybox corner colors (bit0=x+, bit1=y+, bit2=z+), matches SkyboxDesc::corners.
+	/**
+	 * @brief How the environment contributes to the reflection lobe.
+	 *
+	 * The reflection rays sample the prefiltered sky themselves, so this only scales the
+	 * lookup (see RenderSubsystem::skyEnvParams): x = sky IBL enabled (0 removes the
+	 * environmental reflection entirely, the same switch the raster path uses), y = mip
+	 * scale, z = radiance scale (IBL intensity times the ambient strength - what the
+	 * raster path multiplies its analytic specular IBL by), w unused.
+	 *
+	 * Deliberately placed here, right after a 16-byte-aligned block and never at the end
+	 * of the struct: HLSL aligns a float4 in a cbuffer to 16 bytes and inserts padding
+	 * silently, while this struct (alignof 4 members) would place it directly after the
+	 * previous float. Putting it after skyCorners keeps both layouts identical - at the
+	 * end of the struct the shader read it 4 bytes later and saw zeros, which turned the
+	 * sky IBL off for every reflection.
+	 */
+	Vec4 envParams = Vec4(1.0f, 1.0f, 1.0f, 0.0f);
 	UInt32 skyMode = 0;   ///< 0 = corner gradient, 1 = cubemap texture.
 	UInt32 _padSky[3] = { 0, 0, 0 };
 	F32  aoRadius = 1.5f;      ///< AO ray length (world units).
@@ -36,6 +53,12 @@ struct alignas(16) RayTraceConstants {
 	F32  diffuseWrap = 0.0f;      ///< Direct light falloff: 0 = Lambert, 1 = half-Lambert (RenderSubsystem::setDiffuseWrap).
 	F32  _padWrap0 = 0.0f, _padWrap1 = 0.0f, _padWrap2 = 0.0f; ///< Keep the constant buffer 16-byte aligned.
 };
+
+// The shader's cbuffer packs a float4 to a 16-byte boundary, so every Vec4 in the struct
+// has to start at one as well; a mismatch is silent (the shader just reads zeros) and was
+// exactly how the environment reflection ended up disabled.
+static_assert(offsetof(RayTraceConstants, envParams) % 16 == 0,
+	"RayTraceConstants::envParams must be 16-byte aligned to match the shader's cbuffer");
 
 /// @brief A ray-traced scene object (mesh + material + world transform).
 struct RayTracedObject {
@@ -207,15 +230,25 @@ public:
 	/**
 	 * @brief Compose G-buffer + ray traced results over the scene.
 	 *
-	 * Draws a fullscreen triangle that blends the shaded albedo with the
-	 * reflection (Schlick Fresnel) into outputRTV. Background pixels (depth
-	 * == 1) are emitted with alpha 0 so the previously rendered skybox is
-	 * preserved (the compose PSO uses alpha blending).
+	 * Draws a fullscreen triangle that shades the G-buffer with the same model the
+	 * forward PBR shader uses: direct diffuse (the trace's lighting factor) + direct
+	 * specular (the traced scene radiance, Fresnel-weighted) + indirect diffuse (sky
+	 * irradiance, coloured and AO-scaled) + indirect specular (prefiltered sky, split
+	 * sum, weighted by the share of the reflection lobe that missed geometry) + emissive.
+	 * Background pixels (depth == 1) are emitted with alpha 0 so the
+	 * previously rendered skybox is preserved (the compose PSO uses alpha blending).
+	 * The environment (ambient colour/strength, IBL knobs, sky corners, prefiltered
+	 * cube) is read from the attached RenderSubsystem, so both paths agree.
 	 * @param gBufferColor  SRV of the G-buffer albedo.
-	 * @param gBufferNormal SRV of the G-buffer world normal.
+	 * @param gBufferNormal SRV of the G-buffer world normal (alpha = roughness).
 	 * @param gBufferDepth  SRV of the G-buffer depth.
-	 * @param gBufferEmissive SRV of the G-buffer emissive (added untinted after
-	 *                        the Fresnel blend).
+	 * @param gBufferEmissive SRV of the G-buffer emissive (rgb) and metallic (alpha).
+	 * @param rtAlbedo      SRV of the RT-res albedo; its alpha is the ambient occlusion
+	 *                      the trace measured (the environment terms scale by it).
+	 * @param rtNormal      SRV of the RT-res world normal; its alpha is the share of the
+	 *                      reflection lobe that saw only sky (0 = fully occluded by
+	 *                      geometry). It weights the prefiltered specular IBL, so a
+	 *                      reflected object is not washed out by the sky behind it.
 	 * @param rtTex         SRV of the ray traced output (from trace()).
 	 * @param outputRTV     RTV to compose into (e.g. the HDR target).
 	 * @param depthDSV      Optional DSV to keep bound after composing (pass the
@@ -223,14 +256,16 @@ public:
 	 *                      expect a D32 depth stay consistent); nullptr unbinds it.
 	 * @param drawMode      Debug render mode: 0=shaded, 1=G-buffer color,
 	 *                      2=G-buffer normal, 3=diffuse lighting, 4=reflections, 5=Fresnel,
-	 *                      6=RT alpha (lighting factor), 7=back-facing normal mask.
+	 *                      6=RT alpha (lighting factor), 7=back-facing normal mask,
+	 *                      8=G-buffer metallic, 9=ambient occlusion, 10=reflection lobe's
+	 *                      environment share (how much of it missed geometry).
 	 * @param viewProjInv   Inverse view-projection (column-major).
 	 * @param cameraPos     World-space camera position.
 	 * @param lightColor    Light color (applied to the diffuse term).
 	 * @param width,height  Target dimensions.
 	 */
 	Result<void, RenderError> compose(void* gBufferColor, void* gBufferNormal, void* gBufferDepth,
-		void* gBufferEmissive, void* rtTex, void* outputRTV, void* depthDSV, UInt32 drawMode,
+		void* gBufferEmissive, void* rtAlbedo, void* rtTex, void* outputRTV, void* depthDSV, UInt32 drawMode,
 		const Mat4& viewProjInv, const Vec3& cameraPos, const Vec3& lightColor,
 		UInt32 width, UInt32 height);
 

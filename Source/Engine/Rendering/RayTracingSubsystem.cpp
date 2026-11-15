@@ -98,6 +98,7 @@ struct RTConstants {
     float4   LightColor;
     float4   DiscPoints[8];
     float4   SkyCorners[8];
+    float4   EnvParams;          // x = sky IBL on, y = mip scale, z = radiance scale
     uint     SkyMode;
     uint     _padSky0;
     uint     _padSky1;
@@ -223,34 +224,6 @@ float ReflectionShadow(float3 Origin, float3 LightDir, float MaxRayLength, float
         return CastShadow(Origin + Norm * bias + LightDir * (bias * 0.5), LightDir, MaxRayLength);
     }
     return CastShadowPCF(Origin, LightDir, MaxRayLength, Norm, DistToCam);
-}
-
-// Diffuse irradiance of the analytic sky gradient.
-//
-// The 8-corner sky is trilinear in the direction, so to first order it is
-// A + dot(B, l) (A = mean of the corners, B_i = mean of the corners with the i-th
-// bit set minus A), and its cosine-weighted average around n is A + (2/3) dot(B, n).
-// Returning the ratio to the sky's mean keeps the ambient *level* exactly where the
-// caller's AmbientLight puts it and only adds the direction - bright from the sky,
-// ground bounce from below - which is what the flat scalar ambient was missing.
-float SkyIrradianceRatio(float3 n)
-{
-    float3 A = float3(0, 0, 0);
-    float3 B[3] = { float3(0, 0, 0), float3(0, 0, 0), float3(0, 0, 0) };
-    [unroll]
-    for (int j = 0; j < 8; ++j)
-    {
-        const float3 c = g_RTConstants.SkyCorners[j].rgb;
-        A += c * 0.125;
-        [unroll]
-        for (int i = 0; i < 3; ++i)
-            if (((j >> i) & 1) != 0) B[i] += c * 0.25;
-    }
-    [unroll]
-    for (int i = 0; i < 3; ++i) B[i] -= A;
-    const float3 irr = max(A + (2.0 / 3.0) * (B[0] * n.x + B[1] * n.y + B[2] * n.z), 0.0);
-    const float3 luma = float3(0.2126, 0.7152, 0.0722);
-    return dot(irr, luma) / max(dot(A, luma), 1e-3);
 }
 
 // Screen-space-style ambient occlusion: short rays in a hemisphere around the
@@ -853,7 +826,11 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
         float lobeAngle = a;
         float coneAngle = lobeAngle + pixelAngle;
         float coneWidth0 = DisToCam * pixelAngle;
-        float skyLod = SkyLodForLobe(lobeAngle) * g_RTConstants.ReflectionCone;
+        // Mip level of the prefiltered sky for a ray that misses the scene: a wide lobe
+        // must read an already blurred sky, otherwise every ray picks a different sky
+        // texel and the reflection sparkles. EnvParams.y dials the level the same way the
+        // raster path's specular IBL does.
+        float skyLod = SkyLodForLobe(lobeAngle) * g_RTConstants.ReflectionCone * max(g_RTConstants.EnvParams.y, 0.0);
         float3 lightColor = g_RTConstants.LightColor.rgb;
         float3 acc = float3(0, 0, 0);
         for (uint i = 0; i < ns; ++i)
@@ -878,7 +855,7 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
                                             g_RTConstants.MaxRayLength,
                                             g_RTConstants.CameraPos.xyz, LightDir, 0,
                                             coneAngle, coneWidth0);
-            float3 rad;
+            float3 rad = float3(0, 0, 0);
             if (refl.Found)
             {
                 // Reflection point lighting: ambient and direct tinted by the light
@@ -888,27 +865,40 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
                 rad = refl.BaseColor.rgb * lit + refl.Emissive.rgb + refl.Specular;
             }
             else
-                rad = GetSkyColorLod(L, skyLod).rgb;
+            {
+                // A ray that hits nothing sees the environment. It is sampled here, inside
+                // the reflection lobe, instead of being added analytically by the compose:
+                // the per-ray hit/miss already occludes the sky behind geometry (an
+                // analytic term added on top washed reflected objects out to a silhouette),
+                // and this radiance goes through the same denoiser as everything else - an
+                // occlusion mask carried alongside it would have to be denoised on its own.
+                // Scaled by the renderer's IBL settings (enabled, intensity, ambient
+                // strength): the same factors the raster path multiplies its analytic
+                // specular IBL by.
+                rad = (g_RTConstants.EnvParams.x > 0.5)
+                    ? GetSkyColorLod(L, skyLod).rgb * g_RTConstants.EnvParams.z
+                    : float3(0, 0, 0);
+            }
 
             acc += rad * VndfWeight(NdotV, NdotL, a);
         }
         Color = float4(acc / (float)ns, 1.0);
     }
 
-    // Lighting factor: direct (shadowed, intensity-scaled) + ambient.
-    // Compose uses Color * RT.a for the diffuse term.
-    //
-    // The ambient is the sky's irradiance along the surface normal (the same
-    // closed form the raster paths use), so it now darkens on downward faces and
-    // brightens on upward ones instead of being one flat number, and AO still
-    // scales it. It is expressed relative to the sky's mean so that the ambient
-    // level stays exactly where AmbientLight puts it.
+    // AO is mapped to 0.5..1 so a fully occluded pixel keeps half of the ambient, the
+    // same curve the ambient terms used to use.
     const float ao01 = 0.5 + 0.5 * ao;
-    Color.a = g_RTConstants.AmbientLight * SkyIrradianceRatio(WNormal) * ao01
-            + NdotL * g_RTConstants.LightIntensity;
+    // Direct only. The environment's contribution - sky irradiance for the diffuse and
+    // the prefiltered sky a reflection ray picks up when it misses - is handled by the
+    // compose pass (which has the sky's colour and the IBL knobs) and by the reflection
+    // loop above respectively: this float alone could only ever carry the mean-normalized
+    // *scalar* ambient, i.e. an ambient tinted by the sun's colour instead of the sky's.
+    Color.a = NdotL * g_RTConstants.LightIntensity;
     // RT-res albedo/normal for the denoiser (OIDN consumes these at the RT
-    // resolution; they match the depth-guided fpBest texel used for lighting).
-    g_OutAlbedo[DTid] = g_GBufferColor.Load(int3(fpBest, 0));
+    // resolution; they match the depth-guided fpBest texel used for lighting). The
+    // albedo's alpha carries the ambient occlusion, a channel the denoiser ignores (OIDN
+    // reads albedo as RGB) and that the compose pass cannot recover from Color.
+    g_OutAlbedo[DTid] = float4(g_GBufferColor.Load(int3(fpBest, 0)).rgb, ao01);
     g_OutNormal[DTid] = g_GBufferNormal.Load(int3(fpBest, 0));
     g_OutRT[DTid] = Color;
 }
@@ -916,6 +906,22 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
 
 // ===================================================================
 // Compose pass (fullscreen triangle, alpha blend preserves the skybox).
+//
+// The shading model is the same one the forward PBR shader uses, so a hybrid frame and
+// a raster frame agree:
+//   direct   diffuse  = albedo * (1 - metallic) * NdotL * shadow * lightColor   (RT.a)
+//   direct   specular = reflected radiance * Fresnel                           (RT.rgb)
+//   indirect diffuse  = sky irradiance * ambient * albedo * (1 - metallic) * ao
+//   + emissive
+// "Reflected radiance" is the whole reflection lobe: scene hits and, where a ray misses,
+// the prefiltered sky, all sampled inside the trace at the lobe-matched mip. It is kept
+// in one channel on purpose - the denoiser filters radiance, so the environment travels
+// through it too. Adding an analytic environment term on top of the traced radiance
+// instead washed reflected objects out (a mirror lobe's environment lookup is the sky
+// *behind* the object), and carrying an occlusion mask alongside it re-injected
+// un-denoised sampling noise.
+// Only the diffuse environment lives here: the trace's single lighting factor cannot
+// carry the sky's colour.
 // ===================================================================
 static const char* g_ComposeVS = R"(
 struct PSIn { float4 Pos : SV_POSITION; float2 UV : TEXCOORD0; };
@@ -931,6 +937,7 @@ Texture2D<float4> g_GBufferNormal   : register(t1);
 Texture2D<float>  g_GBufferDepth    : register(t2);
 Texture2D<float4> g_RayTracedTex    : register(t3);
 Texture2D<float4> g_GBufferEmissive : register(t4);
+Texture2D<float4> g_RTAlbedo        : register(t6);   // rgb = albedo, a = ambient occlusion
 SamplerState      g_Sampler         : register(s0);
 cbuffer ComposeCB : register(b0) {
     float4x4 g_ViewProjInv;
@@ -938,6 +945,8 @@ cbuffer ComposeCB : register(b0) {
     uint     g_DrawMode;
     float3   g_Pad;
     float4   g_LightColor;
+    float4   g_Ambient;        // rgb = ambient colour (used when there is no sky), a = strength
+    float4   g_SkyCorners[8];  // skybox corners -> ambient irradiance, see SkyIrradiance
 };
 struct PSIn { float4 Pos : SV_POSITION; float2 UV : TEXCOORD0; };
 
@@ -949,6 +958,8 @@ struct PSIn { float4 Pos : SV_POSITION; float2 UV : TEXCOORD0; };
 #define RENDER_MODE_FRESNEL_TERM     5
 #define RENDER_MODE_RT_ALPHA         6
 #define RENDER_MODE_BACK_FACING      7
+#define RENDER_MODE_METALLIC         8
+#define RENDER_MODE_AO               9
 
 float3 ScreenPosToWorldPos(float2 uv, float depth, float4x4 vpInv)
 {
@@ -957,8 +968,7 @@ float3 ScreenPosToWorldPos(float2 uv, float depth, float4x4 vpInv)
     return w.xyz / w.w;
 }
 
-// Normalize without ever producing a NaN (see the same helper in the trace
-// shader): a degenerate G-buffer normal would make the Fresnel term - and with it
+// Normalize without ever producing a NaN (see the same helper in the trace// shader): a degenerate G-buffer normal would make the Fresnel term - and with it
 // the whole composed pixel - NaN, i.e. black.
 float3 SafeNormalize(float3 n, float3 fallback)
 {
@@ -1018,6 +1028,32 @@ float4 SampleRayTraced(float2 uv, float depth, float depthTol)
     return acc / wsum;
 }
 
+// ---------------------------------------------------------------------------
+// Environment lighting - the same model the raster PBR shader uses.
+// ---------------------------------------------------------------------------
+// Diffuse irradiance of the analytic sky. The 8 corners are trilinear in the
+// direction, so to first order the sky is A + dot(B, l) with A the corner mean and B_i
+// the mean of the corners carrying the i-th bit minus A; its cosine-weighted average
+// around n is A + (2/3) dot(B, n). That gives the ambient an environment colour and
+// direction instead of one flat number (see the identical helper in RenderSubsystem).
+float3 SkyIrradiance(float3 n)
+{
+    float3 A = float3(0, 0, 0);
+    float3 B[3] = { float3(0, 0, 0), float3(0, 0, 0), float3(0, 0, 0) };
+    [unroll]
+    for (int j = 0; j < 8; ++j)
+    {
+        const float3 c = g_SkyCorners[j].rgb;
+        A += c * 0.125;
+        [unroll]
+        for (int i = 0; i < 3; ++i)
+            if (((j >> i) & 1) != 0) B[i] += c * 0.25;
+    }
+    [unroll]
+    for (int i = 0; i < 3; ++i) B[i] -= A;
+    return max(A + (2.0 / 3.0) * (B[0] * n.x + B[1] * n.y + B[2] * n.z), 0.0);
+}
+
 float4 main(PSIn i) : SV_Target
 {
     float2 Dim;
@@ -1042,8 +1078,10 @@ float4 main(PSIn i) : SV_Target
     // The ray traced texture runs at a lower resolution; upsample it with a depth
     // test so that background/behind-the-edge texels cannot bleed in.
     float4 RT     = SampleRayTraced(UV, Depth, depthTol);
-    // Emissive comes from the (full-resolution) G-buffer emissive target.
-    float3 Emissive = g_GBufferEmissive.Load(tc).rgb;
+    // Emissive (rgb) and metallic (alpha) come from the full-resolution emissive target.
+    const float4 EmissiveSample = g_GBufferEmissive.Load(tc);
+    const float3 Emissive = EmissiveSample.rgb;
+    const float  Metallic = saturate(EmissiveSample.w);
 
     float3 WPos    = ScreenPosToWorldPos(UV, Depth, g_ViewProjInv);
     float3 ViewDir = normalize(g_CameraPos.xyz - WPos);
@@ -1058,15 +1096,38 @@ float4 main(PSIn i) : SV_Target
     float3 FaceNormal = BackFacing ? -Normal : Normal;
 
     float  NdotV   = saturate(dot(FaceNormal, ViewDir));
-    float  R       = lerp(0.04, 1.0, pow(1.0 - NdotV, 5.0));
+    // Fresnel with the material's F0. Dielectrics sit at 0.04 (the old hardcoded
+    // value), metals reflect their own albedo; lerping between the two is the
+    // standard metal/roughness split, and it is what the G-buffer's metallic
+    // channel (emissive target alpha) is carried for. Per channel, because a metal
+    // tints its reflection: a gold surface must reflect gold.
+    const float3 F0 = lerp(float3(0.04, 0.04, 0.04), Color.rgb, Metallic);
+    const float3 F  = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
+    // A metal has no diffuse lobe: both the direct and the indirect diffuse terms
+    // shrink with metallic.
+    const float  DiffuseWeight = 1.0 - Metallic;
+
+    // Environment term (same model as the forward PBR shader; see the note at the top of
+    // this shader). The AO is the RT-res albedo's alpha. Read with a nearest tap instead
+    // of a filtered one: the trace clears the alpha to 0 on background pixels, so
+    // bilinear filtering would bleed that zero into silhouette pixels and put a dark rim
+    // around every object. AO is low frequency, so a hard tap is invisible.
+    uint2 rtDim = uint2(1, 1);
+    g_RTAlbedo.GetDimensions(rtDim.x, rtDim.y);
+    const int2 rtTc = clamp(int2(UV * float2(rtDim)), int2(0, 0), int2(rtDim) - 1);
+    const float ao = saturate(g_RTAlbedo.Load(int3(rtTc, 0)).a);
+    const float3 indirectDiffuse  = SkyIrradiance(FaceNormal) * g_Ambient.a * Color.rgb * DiffuseWeight * ao;
 
     switch (g_DrawMode)
     {
         case RENDER_MODE_G_BUFFER_COLOR:   return Color;
         case RENDER_MODE_G_BUFFER_NORMAL:  return float4(abs(Normal), 1.0);
-        case RENDER_MODE_DIFFUSE_LIGHTING: return float4(Color.rgb * RT.a + Emissive, 1.0);
+        case RENDER_MODE_DIFFUSE_LIGHTING:
+            return float4(Color.rgb * RT.a * g_LightColor.rgb * DiffuseWeight + indirectDiffuse + Emissive, 1.0);
+        // The whole reflection lobe: scene hits plus the prefiltered sky wherever a ray
+        // missed (the trace samples both), before the Fresnel weighting.
         case RENDER_MODE_REFLECTIONS:      return float4(RT.rgb, 1.0);
-        case RENDER_MODE_FRESNEL_TERM:     return float4(R, R, R, 1.0);
+        case RENDER_MODE_FRESNEL_TERM:     return float4(F, 1.0);
         case RENDER_MODE_RT_ALPHA:         return float4(RT.a, RT.a, RT.a, 1.0);
         // Diagnostic: 1 = the stored G-buffer normal faces away from the eye, i.e.
         // the pixels that used to render black because their reflection lobe was
@@ -1074,15 +1135,22 @@ float4 main(PSIn i) : SV_Target
         // shader). Handy for telling an asset/normal-map problem from a shading
         // one.
         case RENDER_MODE_BACK_FACING:      return float4(BackFacing ? 1.0 : 0.0, 0, 0, 1.0);
+        // Diagnostic: the metallic channel itself (white = metal), for checking that
+        // the G-buffer producer writes what the material says.
+        case RENDER_MODE_METALLIC:         return float4(Metallic, Metallic, Metallic, 1.0);
+        // Diagnostic: the ambient occlusion that scales both environment terms.
+        case RENDER_MODE_AO:               return float4(ao, ao, ao, 1.0);
         case RENDER_MODE_SHADED:
         default:
         {
-            // Diffuse: albedo * lighting factor * light color.
-            float3 Shaded = Color.rgb * RT.a * g_LightColor.rgb;
-            // Reflection (RT.rgb) blended by Fresnel, then self-emission added
-            // untinted (it is not lit by the sun).
-            float3 Final  = lerp(Shaded, RT.rgb, R) + Emissive;
-            return float4(Final, 1.0);
+            // Direct diffuse: albedo * lighting factor (shadowed NdotL) * light color.
+            const float3 directDiffuse = Color.rgb * RT.a * g_LightColor.rgb * DiffuseWeight;
+            // Direct specular: the traced scene radiance, weighted by Fresnel. The
+            // trace's samples are already the VNDF-corrected lobe (no Fresnel in them),
+            // so this is the missing half of the BRDF.
+            const float3 directSpecular = RT.rgb * F;
+            // Self-emission is not lit by anything: added last, untinted.
+            return float4(directDiffuse + indirectDiffuse + directSpecular + Emissive, 1.0);
         }
     }
 }
@@ -1771,22 +1839,44 @@ Result<void, RenderError> RayTracingSubsystem::trace(const RayTraceConstants& c,
 }
 
 Result<void, RenderError> RayTracingSubsystem::compose(void* gBufferColor, void* gBufferNormal, void* gBufferDepth,
-	void* gBufferEmissive, void* rtTex, void* outputRTV, void* depthDSV, UInt32 drawMode,
+	void* gBufferEmissive, void* rtAlbedo, void* rtTex, void* outputRTV, void* depthDSV, UInt32 drawMode,
 	const Mat4& viewProjInv, const Vec3& cameraPos, const Vec3& lightColor,
 	UInt32 width, UInt32 height) {
 	auto& p = *m_impl;
 	auto* ctx = p.ctx(); if (!ctx) return RenderError::NotInitialized;
 	if (!p.ok || !p.composePSO || !p.composeSRB) return RenderError::OperationFailed;
-	if (!gBufferColor || !gBufferNormal || !gBufferDepth || !gBufferEmissive || !rtTex || !outputRTV) return RenderError::InvalidArgument;
+	if (!gBufferColor || !gBufferNormal || !gBufferDepth || !gBufferEmissive || !rtAlbedo || !rtTex || !outputRTV) return RenderError::InvalidArgument;
+
+	// The environment comes from the renderer, so a hybrid frame uses the same sky
+	// colour, corner irradiance and IBL knobs as the forward PBR path.
+	RenderSubsystem* renderer = p.renderer;
 
 	{
-		// ComposeCB: float4x4 + float4 + uint + 3 floats padding + lightColor (16-byte aligned).
-		struct { Mat4 viewProjInv; Vec4 cameraPos; UInt32 drawMode; UInt32 _pad[3]; Vec4 lightColor; } cb;
+		// Must match the shader's cbuffer ComposeCB member for member.
+		struct ComposeConstants {
+			Mat4 viewProjInv;
+			Vec4 cameraPos;
+			UInt32 drawMode;
+			UInt32 _pad[3];
+			Vec4 lightColor;
+			Vec4 ambient;       ///< rgb = ambient colour, a = strength
+			Vec4 skyCorners[8]; ///< sky irradiance for the ambient (same layout as the raster path)
+		} cb;
 		cb.viewProjInv = viewProjInv;
 		cb.cameraPos = Vec4(cameraPos, 1.0f);
 		cb.drawMode = drawMode;
 		cb._pad[0] = cb._pad[1] = cb._pad[2] = 0;
 		cb.lightColor = Vec4(lightColor, 0.0f);
+
+		// The environment comes from the renderer, so a hybrid frame uses the same sky
+		// colour, corner irradiance and IBL knobs as the forward PBR path.
+		RenderSubsystem* renderer = p.renderer;
+		const Vec4 ambient = renderer ? renderer->getAmbientLight() : Vec4(0.0f);
+		cb.ambient = ambient;
+		Vec4 corners[8];
+		const bool hasCorners = renderer && renderer->getSkyboxCorners(corners);
+		for (int i = 0; i < 8; ++i) cb.skyCorners[i] = hasCorners ? corners[i] : ambient;
+
 		void* m = nullptr;
 		ctx->MapBuffer(p.composeCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
 		if (m) { memcpy(m, &cb, sizeof(cb)); ctx->UnmapBuffer(p.composeCB, D::MAP_WRITE); }
@@ -1797,6 +1887,9 @@ Result<void, RenderError> RayTracingSubsystem::compose(void* gBufferColor, void*
 	if (auto* v = p.composeSRB->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_GBufferDepth")) v->Set(static_cast<D::ITextureView*>(gBufferDepth), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	if (auto* v = p.composeSRB->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_GBufferEmissive")) v->Set(static_cast<D::ITextureView*>(gBufferEmissive), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	if (auto* v = p.composeSRB->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_RayTracedTex")) v->Set(static_cast<D::ITextureView*>(rtTex), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	// Ambient occlusion rides in the albedo's alpha, the environment share of the
+	// reflection lobe in the normal's (see the trace shader); the RGB is unused here.
+	if (auto* v = p.composeSRB->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_RTAlbedo")) v->Set(static_cast<D::ITextureView*>(rtAlbedo), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 
 	D::ITextureView* rtv = static_cast<D::ITextureView*>(outputRTV);
 	D::ITextureView* dsv = depthDSV ? static_cast<D::ITextureView*>(depthDSV) : nullptr;
@@ -2492,11 +2585,17 @@ Result<void, CoreError> RayTracingSubsystem::onInitialize() {
 
 	// Compose constant buffer.
 	{
-		D::BufferDesc bd; bd.Name = "RT Compose CB"; bd.Size = sizeof(Mat4) + sizeof(Vec4) + 16 + 16; // + drawMode/padding + lightColor
+		D::BufferDesc bd; bd.Name = "RT Compose CB";
+		// Matches the shader's ComposeCB: matrices/camera/draw mode/light colour, then the
+		// environment (ambient colour + strength), the IBL knobs and the 8 sky corners.
+		// Rounded up to a multiple of 256, the size a D3D12 constant buffer view needs.
+		bd.Size = 512;
 		bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DYNAMIC; bd.CPUAccessFlags = D::CPU_ACCESS_WRITE;
 		dev->CreateBuffer(bd, nullptr, &p.composeCB);
 		if (p.composeSRB) {
 			if (auto* v = p.composeSRB->GetVariableByName(D::SHADER_TYPE_PIXEL, "ComposeCB")) v->Set(p.composeCB);
+			// g_Sampler is an immutable sampler in this PSO (see the PSO above): the compose
+			// only Load()s from the G-buffer, so it needs no sampler binding of its own.
 		}
 	}
 

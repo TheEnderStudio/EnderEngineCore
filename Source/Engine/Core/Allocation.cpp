@@ -1,4 +1,4 @@
-﻿#include <Core/Allocation.hpp>
+#include <Core/Allocation.hpp>
 #include <Core/Crash.h>
 #include <Core/Types.hpp>
 #include <Core/Log.hpp>

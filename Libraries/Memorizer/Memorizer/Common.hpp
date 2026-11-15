@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <Engine/Core/Types.hpp>
 #include <spdlog/fmt/fmt.h>

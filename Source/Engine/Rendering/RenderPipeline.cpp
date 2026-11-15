@@ -431,6 +431,8 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 		const Result<void, RenderError> result = c->rayTracing->compose(
 			renderer.getTextureSRV(frame.sourceColor), renderer.getTextureSRV(frame.sourceNormal),
 			renderer.getTextureSRV(frame.sourceDepth), renderer.getTextureSRV(frame.sourceEmissive),
+			// RT-res albedo: its alpha is the traced ambient occlusion (see compose()).
+			renderer.getTextureSRV(frame.rtAlbedo),
 			rtSRV, c->postProcess->getHDRRTV(), renderer.getDepthStencil(), frame.rtDrawMode,
 			glm::inverse(viewProj), frame.cameraPos, frame.lightColor, frame.width, frame.height);
 		if (result.isErr()) {
@@ -530,6 +532,17 @@ Result<void, CoreError> RenderPipeline::render(RenderFrame& frame) {
 	// scene with the same parameter (RenderSubsystem::setDiffuseWrap); otherwise the
 	// two modes disagree on where the terminator sits.
 	frame.rtConstants.diffuseWrap = m_impl->context.renderer->diffuseWrap();
+	// A reflection ray that misses the scene samples the prefiltered sky, and that lookup
+	// uses the same knobs the raster path applies to its analytic specular IBL: the sky
+	// IBL switch, its mip scale and its intensity (times the ambient strength, which is
+	// what the raster path multiplies the term by). Filled here so every user of the
+	// pipeline gets the hybrid and the raster paths agreeing on the environmental
+	// reflection without wiring anything by hand.
+	{
+		const Vec4 env = m_impl->context.renderer->skyEnvParams();
+		const Vec4 ambient = m_impl->context.renderer->getAmbientLight();
+		frame.rtConstants.envParams = Vec4(env.x, env.y, env.w * ambient.w, 0.0f);
+	}
 
 	PipelineFrameContext context;
 	context.frameIndex = m_impl->frameIndex++;

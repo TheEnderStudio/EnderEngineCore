@@ -2180,7 +2180,7 @@ struct PSInput {
 struct PSOut {
     float4 Color : SV_Target0;  // albedo (RGBA8_SRGB)
     float4 Norm  : SV_Target1;  // world normal, roughness in alpha (RGBA16_FLOAT)
-    float4 Emis  : SV_Target2;  // emissive (RGBA16_FLOAT)
+    float4 Emis  : SV_Target2;  // emissive in rgb, metallic in alpha (RGBA16_FLOAT)
 };
 
 // See the note on kNormalMapSign in the cluster G-buffer shader above: the sign
@@ -2210,6 +2210,7 @@ PSOut main(in PSInput i) {
     o.Color = g_Albedo[id].Sample(g_AlbedoSampler, i.UV) * mat.baseColor;
 
     float4 orm = g_MetalRough[id].Sample(g_AlbedoSampler, i.UV);
+    float  m = saturate(orm.b * mat.params.x);
     float  r = saturate(orm.g * mat.params.y);
 
     float3 N = normalize(i.Normal);
@@ -2217,7 +2218,10 @@ PSOut main(in PSInput i) {
     N = NormalMapped(N, i.WorldPos, i.UV, sn);
 
     o.Norm = float4(N, r);
-    o.Emis = float4(g_EmissiveMap[id].Sample(g_AlbedoSampler, i.UV).rgb * mat.emissive.rgb * mat.emissive.a, 1.0);
+    // Metallic rides in the emissive target's alpha (rgb is the emissive itself): the
+    // compose pass needs it for F0 = lerp(0.04, albedo, metallic), and there is no
+    // spare channel left - roughness already owns the normal target's alpha.
+    o.Emis = float4(g_EmissiveMap[id].Sample(g_AlbedoSampler, i.UV).rgb * mat.emissive.rgb * mat.emissive.a, m);
     return o;
 }
 )";

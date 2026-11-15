@@ -1,4 +1,4 @@
-﻿set_project("EnderEngine")
+set_project("EnderEngine")
 set_xmakever("2.8.0")
 add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate")
