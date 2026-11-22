@@ -378,10 +378,6 @@ float4 main(PSIn i) : SV_TARGET {
 	int  rtDenoiserSel = 0;      // 0 = Auto, 1 = NRD, 2 = OIDN, 3 = Temporal
 	bool msTestGrid = false;     // M1 mesh shader test grid (GPU-driven AS/MS pipeline)
 	bool msFrustumCull = true;   // toggle frustum culling in the test amplification shader
-	// Sign applied to the classic path's tangent-space normal map (see
-	// RenderSubsystem::setNormalMapSign). Defaults to glTF's +Y-up / +V-down.
-	bool nmFlipX = false;
-	bool nmFlipY = true;
 	bool msFurinaScene = true;  // M2: draw the 1000 Furina bodies through the mesh shader path
 	bool msMeshesRegistered = false;
 	// Index ranges into the registered mesh list, one per scene object type.
@@ -987,18 +983,6 @@ HALT
 			// a recognisable normal map = the binding is right, noise = it is not.
 			if (debugUI.button(fmt::format("Classic NM Debug: {}", renderer.normalMapDebug() ? "On" : "Off").c_str())) {
 				renderer.setNormalMapDebug(!renderer.normalMapDebug());
-			}
-			// The classic path's tangent frame comes from screen-space derivatives, so
-			// which sign maps an asset's tangent-space normal into it is a convention.
-			// Flip these live while looking at the Wall's normal map: the relief must be
-			// lit on the side that faces the light, not on the side away from it.
-			{
-				bool flip = false;
-				flip |= debugUI.checkbox("NM Flip X", &nmFlipX);
-				flip |= debugUI.checkbox("NM Flip Y", &nmFlipY);
-				if (flip) {
-					renderer.setNormalMapSign(Vec2(nmFlipX ? -1.0f : 1.0f, nmFlipY ? -1.0f : 1.0f));
-				}
 			}
 			// Material ambient occlusion. The Demo's assets carry no occlusion maps, so
 			// there are two ways to see the path work: take occlusion from the

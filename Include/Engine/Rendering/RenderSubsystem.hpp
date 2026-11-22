@@ -535,10 +535,6 @@ public:
 	 * requiring a rebuild per guess. Defaults to (1,-1), the glTF (+Y up / +V down)
 	 * convention.
 	 *
-	 * @param sign x = tangent axis sign, y = bitangent axis sign.
-	 */
-	void setNormalMapSign(Vec2 sign);
-	EE_NODISCARD Vec2 normalMapSign() const;
 
 	/**
 	 * @brief Specular image-based lighting from the sky (prefiltered environment).

@@ -364,6 +364,7 @@ struct MeshShaderSubsystem::Impl {
 	D::RefCntAutoPtr<D::IBuffer> sceneInstances;   // StructuredBuffer<float4x4>
 	D::RefCntAutoPtr<D::IBuffer> scenePos;         // StructuredBuffer<float4>
 	D::RefCntAutoPtr<D::IBuffer> sceneNorm;
+	D::RefCntAutoPtr<D::IBuffer> sceneTan;         // StructuredBuffer<float4> per-vertex tangent
 	D::RefCntAutoPtr<D::IBuffer> sceneMeshlets;    // StructuredBuffer<SceneMeshlet>
 	D::RefCntAutoPtr<D::IBuffer> sceneMeshletVerts;// uint pool
 	D::RefCntAutoPtr<D::IBuffer> sceneMeshletTris; // uint pool
@@ -379,7 +380,7 @@ struct MeshShaderSubsystem::Impl {
 	std::vector<SceneTask> sceneTaskScratch;  // per-frame (mesh x instance) list
 
 	// ---- M4: meshoptimizer cluster-LOD pools ----
-	D::RefCntAutoPtr<D::IBuffer> clPos, clNorm, clUV;    // pooled original vertices
+	D::RefCntAutoPtr<D::IBuffer> clPos, clNorm, clUV, clTan;    // pooled original vertices
 	D::RefCntAutoPtr<D::IBuffer> clClusters;             // StructuredBuffer<ClusterGPU>
 	D::RefCntAutoPtr<D::IBuffer> clClusterVerts;         // uint pool
 	D::RefCntAutoPtr<D::IBuffer> clClusterTris;          // uint pool (3 per triangle)
@@ -516,14 +517,14 @@ void MeshShaderSubsystem::onShutdown() {
 	p.pso.Release(); p.srb.Release(); p.constantsCB.Release(); p.cubeDataCB.Release();
 	p.drawTasks.Release(); p.statsBuf.Release(); p.statsStaging.Release(); p.statsFence.Release();
 	p.scenePso.Release(); p.sceneSrb.Release(); p.sceneCB.Release(); p.sceneInstances.Release();
-	p.scenePos.Release(); p.sceneNorm.Release(); p.sceneMeshlets.Release();
+	p.scenePos.Release(); p.sceneNorm.Release(); p.sceneTan.Release(); p.sceneMeshlets.Release();
 	p.sceneMeshletVerts.Release(); p.sceneMeshletTris.Release(); p.sceneMeshInfo.Release();
 	p.sceneTasks.Release(); p.sceneStatsBuf.Release(); p.sceneStatsStaging.Release(); p.sceneStatsFence.Release();
 	p.clPos.Release(); p.clNorm.Release(); p.clClusters.Release(); p.clClusterVerts.Release();
 	p.clClusterTris.Release(); p.clGroups.Release(); p.clMeshInfo.Release(); p.clCounter.Release();
 	p.clMaterials.Release(); p.clGroupBounds.Release(); p.meshBounds.clear();
 	p.clusterGBufferPso.Release(); p.clusterGBufferSrb.Release();
-	p.clUV.Release(); p.whiteTex.Release(); p.whiteTexSRV.Release(); p.materialSampler.Release();
+	p.clUV.Release(); p.clTan.Release(); p.whiteTex.Release(); p.whiteTexSRV.Release(); p.materialSampler.Release();
 	p.flatNormalTex.Release(); p.flatNormalSRV.Release();
 	p.flatMRTex.Release(); p.flatMRSRV.Release();
 	p.shadowSampler.Release(); p.shadowDummyTex.Release(); p.shadowDummySRV.Release(); p.shadowMapSRV.Release();
@@ -890,7 +891,7 @@ static void applyAoOverride(MaterialGPU& g, const RenderSubsystem* renderer) {
 // positions/normals per cell and rebuilds the triangle list (degenerate or
 // flipped triangles dropped / fixed). Operates in local mesh space.
 void buildClusteredLOD(const Vector<Vertex>& verts, const Vector<UInt32>& idxs,
-	float frac, std::vector<Vec4>& outPos, std::vector<Vec4>& outNorm, std::vector<UInt32>& outIdx) {
+	float frac, std::vector<Vec4>& outPos, std::vector<Vec4>& outNorm, std::vector<Vec4>& outTan, std::vector<UInt32>& outIdx) {
 	const size_t nV = verts.size();
 	if (nV == 0 || idxs.size() < 3) return;
 	Vec3 mn(1e30f), mx(-1e30f);
@@ -903,6 +904,7 @@ void buildClusteredLOD(const Vector<Vertex>& verts, const Vector<UInt32>& idxs,
 	// Quantization: cell index keyed per axis over a packed grid.
 	std::vector<UInt32> cellOf(nV, 0xFFFFFFFF); // filled below on the accepted pass
 	std::vector<Vec3> cellSumP, cellSumN;
+	std::vector<Vec4> cellSumT; // xyz = tangent sum, w = handedness sum
 	std::vector<UInt32> cellCount;
 	std::vector<Vec3> cellP; // centroid (final)
 
@@ -913,8 +915,8 @@ void buildClusteredLOD(const Vector<Vertex>& verts, const Vector<UInt32>& idxs,
 		const UInt32 NZ = std::max<UInt32>(1, (UInt32)(ext.z / s) + 2);
 		const UInt64 step = (UInt64)NX * NY;
 		std::unordered_map<UInt64, UInt32> cellIdx;
-		cellSumP.clear(); cellSumN.clear(); cellCount.clear();
-		cellSumP.reserve(nV); cellSumN.reserve(nV); cellCount.reserve(nV);
+		cellSumP.clear(); cellSumN.clear(); cellSumT.clear(); cellCount.clear();
+		cellSumP.reserve(nV); cellSumN.reserve(nV); cellSumT.reserve(nV); cellCount.reserve(nV);
 		std::vector<UInt32> localCell(nV);
 		for (size_t i = 0; i < nV; ++i) {
 			const Vec3 q = (verts[i].position - mn) / s;
@@ -926,10 +928,11 @@ void buildClusteredLOD(const Vector<Vertex>& verts, const Vector<UInt32>& idxs,
 			if (it == cellIdx.end()) {
 				c = (UInt32)cellIdx.size();
 				cellIdx.emplace(key, c);
-				cellSumP.push_back(Vec3(0)); cellSumN.push_back(Vec3(0)); cellCount.push_back(0);
+				cellSumP.push_back(Vec3(0)); cellSumN.push_back(Vec3(0)); cellSumT.push_back(Vec4(0)); cellCount.push_back(0);
 			} else c = it->second;
 			cellSumP[c] += verts[i].position;
 			cellSumN[c] += verts[i].normal;
+			cellSumT[c] += verts[i].tangent;
 			cellCount[c]++;
 			localCell[i] = c;
 		}
@@ -962,7 +965,7 @@ void buildClusteredLOD(const Vector<Vertex>& verts, const Vector<UInt32>& idxs,
 		const UInt32 NZ = std::max<UInt32>(1, (UInt32)(ext.z / s) + 2);
 		const UInt64 step = (UInt64)NX * NY;
 		std::unordered_map<UInt64, UInt32> cellIdx;
-		cellSumP.assign(nC, Vec3(0)); cellSumN.assign(nC, Vec3(0)); cellCount.assign(nC, 0);
+		cellSumP.assign(nC, Vec3(0)); cellSumN.assign(nC, Vec3(0)); cellSumT.assign(nC, Vec4(0)); cellCount.assign(nC, 0);
 		for (size_t i = 0; i < nV; ++i) {
 			const Vec3 q = (verts[i].position - mn) / s;
 			UInt32 ix = (UInt32)q.x, iy = (UInt32)q.y, iz = (UInt32)q.z;
@@ -974,6 +977,7 @@ void buildClusteredLOD(const Vector<Vertex>& verts, const Vector<UInt32>& idxs,
 			else c = it->second;
 			cellSumP[c] += verts[i].position;
 			cellSumN[c] += verts[i].normal;
+			cellSumT[c] += verts[i].tangent;
 			cellCount[c]++;
 			cellOf[i] = c;
 		}
@@ -982,12 +986,18 @@ void buildClusteredLOD(const Vector<Vertex>& verts, const Vector<UInt32>& idxs,
 		cellP[c] = cellSumP[c] / (float)std::max<UInt32>(1, cellCount[c]);
 	}
 
-	outPos.clear(); outNorm.clear(); outIdx.clear();
-	outPos.reserve(nC); outNorm.reserve(nC);
+	outPos.clear(); outNorm.clear(); outTan.clear(); outIdx.clear();
+	outPos.reserve(nC); outNorm.reserve(nC); outTan.reserve(nC);
 	for (size_t c = 0; c < nC; ++c) {
 		const Vec3 nn = glm::normalize(cellSumN[c]);
 		outPos.push_back(Vec4(cellP[c], 1.0f));
 		outNorm.push_back(Vec4(nn, 0.0f));
+		// Averaging the tangents of a cell flattens them onto the cell's surface; the
+		// handedness is the sign of the summed w, which keeps mirrored clusters mirrored.
+		const Vec3 tSum = Vec3(cellSumT[c]);
+		const float tLen2 = glm::dot(tSum, tSum);
+		const Vec3 tt = tLen2 > 1e-12f ? tSum / std::sqrt(tLen2) : Vec3(1.0f, 0.0f, 0.0f);
+		outTan.push_back(Vec4(tt, cellSumT[c].w < 0.0f ? -1.0f : 1.0f));
 	}
 
 	const UInt32 triN = (UInt32)(idxs.size() / 3);
@@ -1653,6 +1663,7 @@ StructuredBuffer<uint>            ClusterTris;
 StructuredBuffer<float4>          ScenePositions;
 StructuredBuffer<float4>          SceneNormals;
 StructuredBuffer<float4>          SceneUVs;
+StructuredBuffer<float4>          SceneTangents;   // xyz = tangent, w = handedness
 StructuredBuffer<MaterialGPU>     Materials;
 
 cbuffer cbSceneConstants : register(b0) {
@@ -1686,6 +1697,7 @@ struct PSInput {
     float3 Normal : NORMAL;
     float4 Color  : COLOR;
     float2 UV     : TEXCOORD0;
+    float4 Tangent : TEXCOORD3;   // xyz = tangent, w = handedness
     nointerpolation uint MatId : TEXCOORD1;
 };
 // Must match the payload built by g_ClusterAS (see CLUSTER_PER_GROUP there).
@@ -1735,6 +1747,7 @@ void main(in uint I   : SV_GroupIndex,
             verts[i].Normal = float3(0, 0, -1);
             verts[i].Color  = float4(1, 0, 1, 1);
             verts[i].UV     = float2(0, 0);
+            verts[i].Tangent = float4(1, 0, 0, 1);
             verts[i].MatId  = 0u;
             verts[i].WorldPos = float3(0, 0, 0);
         }
@@ -1751,6 +1764,11 @@ void main(in uint I   : SV_GroupIndex,
         verts[v].Normal = wn;
         verts[v].Color  = col;
         verts[v].UV     = SceneUVs[gv].xy;
+        // The tangent goes through the same instance matrix as the normal, and a mirrored
+        // instance flips the handedness with it.
+        const float4 tanLocal = SceneTangents[gv];
+        verts[v].Tangent = float4(mul((float3x3)M, tanLocal.xyz),
+                                  tanLocal.w * (determinant((float3x3)M) < 0.0 ? -1.0 : 1.0));
         verts[v].MatId  = cl.materialId;
         verts[v].WorldPos = wp.xyz;
     }
@@ -2029,46 +2047,29 @@ struct PSInput {
     float3 Normal   : NORMAL;
     float4 Color    : COLOR;
     float2 UV       : TEXCOORD0;
+    float4 Tangent  : TEXCOORD3;   // xyz = tangent, w = handedness
     nointerpolation uint MatId : TEXCOORD1;
 };
 
-// Tangent frame from screen-space derivatives (no TANGENT attribute is loaded
-// by the glTF importer, and this is robust across the whole mesh).
-// Tangent-frame sign for the normal map, one factor per tangent axis:
-//   x -> the red channel (tangent / +u), y -> the green channel (bitangent).
+// Normal mapping with the mesh's own tangent.
 //
-// This is NOT an asset-format quirk that can be reasoned away: the frame below is
-// built from screen-space derivatives (a cotangent frame) instead of the glTF
-// TANGENT attribute - which this loader does not use yet, it writes a dummy
-// tangent - and the resulting handedness depends on the screen/UV orientation, so
-// the conversion from the asset's tangent-space convention into *this* frame is a
-// sign that has to be verified once, visually:
-//
-//   put a directional normal map (bricks, rock, tiles) on a surface, light it from
-//   the side, and check that the bumps are lit on the side facing the light. If
-//   the relief looks inverted left/right, flip kNormalMapSign.x; if it is inverted
-//   up/down, flip kNormalMapSign.y. Current setting matches the glTF (+Y up /
-//   OpenGL-style) maps that the loader feeds in.
-//
-// Loading the real glTF TANGENT_0 attribute (or generating MikkTSpace tangents, as
-// the spec asks when they are absent) removes the ambiguity entirely: the frame
-// would then come from the asset exactly as the spec defines it.
-static const float2 kNormalMapSign = float2(1.0, -1.0);
-
-float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
-    float3 dp1 = ddx(wp);
-    float3 dp2 = ddy(wp);
-    float2 duv1 = ddx(uv);
-    float2 duv2 = ddy(uv);
-    float3 dp2perp = cross(dp2, N);
-    float3 dp1perp = cross(N, dp1);
-    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
-    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
-    // Epsilon: degenerate UVs (or the debug triangle) give a zero frame, and
-    // rsqrt(0) would produce NaN normals.
-    float invmax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
-    float3 n = sampledNormal * float3(kNormalMapSign, 1.0);
-    return normalize(mul(n, float3x3(T * invmax, B * invmax, N)));
+// The frame used to be rebuilt from screen-space derivatives (a cotangent frame), which
+// has no defined handedness: the sign that maps the asset's tangent space into it had to
+// be guessed per asset (kNormalMapSign, then the DebugUI's "NM Flip X/Y"). The tangent now
+// comes from the vertex stream - the glTF TANGENT_0 attribute, or one generated from the
+// UV layout when the asset has none - so the frame is the asset's own and no sign is
+// needed: mirrored UVs, back faces and grazing angles are all correct.
+float3 NormalMapped(float3 N, float3 tangent, float handedness, float3 sampledNormal) {
+    // Interpolation does not preserve orthogonality; re-orthogonalize like the CPU
+    // tangent generator does.
+    float3 T = tangent - N * dot(N, tangent);
+    const float len2 = dot(T, T);
+    if (len2 < 1e-8)
+        T = normalize(cross(abs(N.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0), N));
+    else
+        T *= rsqrt(len2);
+    const float3 B = cross(N, T) * (handedness < 0.0 ? -1.0 : 1.0);
+    return normalize(T * sampledNormal.x + B * sampledNormal.y + N * sampledNormal.z);
 }
 
 float4 main(in PSInput i) : SV_TARGET {
@@ -2097,7 +2098,7 @@ float4 main(in PSInput i) : SV_TARGET {
 
     float3 N = normalize(i.Normal);
     float3 sn = g_NormalMap[id].Sample(g_AlbedoSampler, i.UV).xyz * 2.0 - 1.0;
-    N = NormalMapped(N, i.WorldPos, i.UV, sn);
+    N = NormalMapped(N, i.Tangent.xyz, i.Tangent.w, sn);
     float3 V = normalize(g_CameraPos.xyz - i.WorldPos);
 
     // Same shading model as the forward PBR shader: ambient + one directional light
@@ -2227,6 +2228,7 @@ struct PSInput {
     float3 Normal   : NORMAL;
     float4 Color    : COLOR;
     float2 UV       : TEXCOORD0;
+    float4 Tangent  : TEXCOORD3;   // xyz = tangent, w = handedness
     nointerpolation uint MatId : TEXCOORD1;
 };
 
@@ -2236,23 +2238,16 @@ struct PSOut {
     float4 Emis  : SV_Target2;  // emissive in rgb, metallic in alpha (RGBA16_FLOAT)
 };
 
-// See the note on kNormalMapSign in the cluster G-buffer shader above: the sign
-// belongs to the derivative-built tangent frame, not to the asset, and is meant to
-// be verified visually once (flip x for a left/right inversion, y for up/down).
-static const float2 kNormalMapSign = float2(1.0, -1.0);
-
-float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
-    float3 dp1 = ddx(wp);
-    float3 dp2 = ddy(wp);
-    float2 duv1 = ddx(uv);
-    float2 duv2 = ddy(uv);
-    float3 dp2perp = cross(dp2, N);
-    float3 dp1perp = cross(N, dp1);
-    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
-    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
-    float invmax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
-    float3 n = sampledNormal * float3(kNormalMapSign, 1.0);
-    return normalize(mul(n, float3x3(T * invmax, B * invmax, N)));
+// Same frame as the shaded cluster variant above: the mesh's own tangent, no sign knob.
+float3 NormalMapped(float3 N, float3 tangent, float handedness, float3 sampledNormal) {
+    float3 T = tangent - N * dot(N, tangent);
+    const float len2 = dot(T, T);
+    if (len2 < 1e-8)
+        T = normalize(cross(abs(N.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0), N));
+    else
+        T *= rsqrt(len2);
+    const float3 B = cross(N, T) * (handedness < 0.0 ? -1.0 : 1.0);
+    return normalize(T * sampledNormal.x + B * sampledNormal.y + N * sampledNormal.z);
 }
 
 PSOut main(in PSInput i) {
@@ -2268,7 +2263,7 @@ PSOut main(in PSInput i) {
 
     float3 N = normalize(i.Normal);
     float3 sn = g_NormalMap[id].Sample(g_AlbedoSampler, i.UV).xyz * 2.0 - 1.0;
-    N = NormalMapped(N, i.WorldPos, i.UV, sn);
+    N = NormalMapped(N, i.Tangent.xyz, i.Tangent.w, sn);
 
     o.Norm = float4(N, r);
     // The albedo alpha carries the material occlusion for the hybrid compose; the albedo
@@ -2533,6 +2528,7 @@ Result<void, RenderError> MeshShaderSubsystem::ensureClusterPipeline(Impl& p, UI
 		bindS(D::SHADER_TYPE_MESH, "ScenePositions", srv(p.clPos));
 		bindS(D::SHADER_TYPE_MESH, "SceneNormals", srv(p.clNorm));
 		bindS(D::SHADER_TYPE_MESH, "SceneUVs", srv(p.clUV));
+		bindS(D::SHADER_TYPE_MESH, "SceneTangents", srv(p.clTan));
 		bindS(D::SHADER_TYPE_MESH, "Materials", srv(p.clMaterials));
 		if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_MESH, "cbSceneConstants")) v->Set(p.sceneCB);
 
@@ -2618,16 +2614,16 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 	// by createImmutable(), so they must be dropped here as well - a re-entrant
 	// call (the Demo re-registers once the asynchronously loaded model arrives)
 	// otherwise trips that assert on "MS ClPos".
-	p.scenePos.Release(); p.sceneNorm.Release(); p.sceneMeshlets.Release();
+	p.scenePos.Release(); p.sceneNorm.Release(); p.sceneTan.Release(); p.sceneMeshlets.Release();
 	p.sceneMeshletVerts.Release(); p.sceneMeshletTris.Release(); p.sceneMeshInfo.Release(); p.sceneTasks.Release();
-	p.clPos.Release(); p.clNorm.Release(); p.clUV.Release();
+	p.clPos.Release(); p.clNorm.Release(); p.clUV.Release(); p.clTan.Release();
 	p.clClusters.Release(); p.clClusterVerts.Release(); p.clClusterTris.Release();
 	p.clGroups.Release(); p.clMeshInfo.Release(); p.clMaterials.Release();
 	p.sceneMeshList = meshes;
 	p.sceneMeshCount = (UInt32)meshes.size();
 
 	// ---- CPU meshletization over the concatenated pools ----
-	std::vector<Vec4> poolPos, poolNorm;
+	std::vector<Vec4> poolPos, poolNorm, poolTan;
 	std::vector<SceneMeshlet> poolMeshlets;
 	std::vector<UInt32> poolMeshletVerts, poolMeshletTris;
 	std::vector<SceneMeshInfo> poolInfo;
@@ -2721,7 +2717,7 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 		// LOD0: original geometry.
 		{
 			const UInt32 vBase = (UInt32)poolPos.size();
-			for (const auto& v : *verts) { poolPos.push_back(Vec4(v.position, 1.0f)); poolNorm.push_back(Vec4(v.normal, 0.0f)); }
+			for (const auto& v : *verts) { poolPos.push_back(Vec4(v.position, 1.0f)); poolNorm.push_back(Vec4(v.normal, 0.0f)); poolTan.push_back(v.tangent); }
 			std::vector<UInt32> srcIdx(idxs->begin(), idxs->end());
 			addLod(vBase, nVerts, srcIdx, info.meshletBase[0], info.meshletCount[0]);
 			info.vertBase[0] = vBase;
@@ -2729,12 +2725,13 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 		}
 		// LOD1 / LOD2: vertex-clustering simplification (approx 55% / 30% of the vertices).
 		for (int li = 1; li <= 2; ++li) {
-			std::vector<Vec4> sPos, sNorm; std::vector<UInt32> sIdx;
-			buildClusteredLOD(*verts, *idxs, (li == 1) ? 0.55f : 0.30f, sPos, sNorm, sIdx);
+			std::vector<Vec4> sPos, sNorm, sTan; std::vector<UInt32> sIdx;
+			buildClusteredLOD(*verts, *idxs, (li == 1) ? 0.55f : 0.30f, sPos, sNorm, sTan, sIdx);
 			if (sIdx.size() >= 3 && !sPos.empty()) {
 				const UInt32 vBase = (UInt32)poolPos.size();
 				poolPos.insert(poolPos.end(), sPos.begin(), sPos.end());
 				poolNorm.insert(poolNorm.end(), sNorm.begin(), sNorm.end());
+				poolTan.insert(poolTan.end(), sTan.begin(), sTan.end());
 				addLod(vBase, (UInt32)sPos.size(), sIdx, info.meshletBase[li], info.meshletCount[li]);
 				info.vertBase[li] = vBase;
 				info.lodRadius[li] = radiusOfRange(vBase, sPos.size(), sphereC);
@@ -2819,6 +2816,7 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 	std::vector<Vec4> clPos; // pooled original vertices (positions)
 	std::vector<Vec4> clNorm;
 	std::vector<Vec4> clUV;  // pooled texture coordinates (xy)
+	std::vector<Vec4> clTan; // pooled per-vertex tangents (xyz + handedness)
 
 	// ---- Material palette -------------------------------------------------
 	// One slot per distinct (albedo texture, base colour) pair. A glTF mesh is
@@ -2902,6 +2900,7 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 				clPos.push_back(Vec4(v.position, 1.0f));
 				clNorm.push_back(Vec4(v.normal, 0.0f));
 				clUV.push_back(Vec4(v.texCoord, 0.0f, 0.0f));
+			clTan.push_back(v.tangent);
 			}
 
 			std::vector<float> positions(verts->size() * 3);
@@ -3110,6 +3109,7 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 	};
 	if (!createImmutable("MS ScenePos", poolPos.data(), poolPos.size() * sizeof(Vec4), sizeof(Vec4), p.scenePos) ||
 		!createImmutable("MS SceneNorm", poolNorm.data(), poolNorm.size() * sizeof(Vec4), sizeof(Vec4), p.sceneNorm) ||
+		!createImmutable("MS SceneTan", poolTan.data(), poolTan.size() * sizeof(Vec4), sizeof(Vec4), p.sceneTan) ||
 		!createImmutable("MS SceneMeshlets", poolMeshlets.data(), poolMeshlets.size() * sizeof(SceneMeshlet), sizeof(SceneMeshlet), p.sceneMeshlets) ||
 		!createImmutable("MS MeshletVerts", poolMeshletVerts.data(), poolMeshletVerts.size() * sizeof(UInt32), sizeof(UInt32), p.sceneMeshletVerts) ||
 		!createImmutable("MS MeshletTris", poolMeshletTris.data(), poolMeshletTris.size() * sizeof(UInt32), sizeof(UInt32), p.sceneMeshletTris) ||
@@ -3122,6 +3122,7 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 	if (!createImmutable("MS ClPos", clPos.data(), clPos.size() * sizeof(Vec4), sizeof(Vec4), p.clPos) ||
 		!createImmutable("MS ClNorm", clNorm.data(), clNorm.size() * sizeof(Vec4), sizeof(Vec4), p.clNorm) ||
 		!createImmutable("MS ClUV", clUV.data(), clUV.size() * sizeof(Vec4), sizeof(Vec4), p.clUV) ||
+		!createImmutable("MS ClTan", clTan.data(), clTan.size() * sizeof(Vec4), sizeof(Vec4), p.clTan) ||
 		!createImmutable("MS Clusters", clClusters.data(), clClusters.size() * sizeof(ClusterGPU), sizeof(ClusterGPU), p.clClusters) ||
 		!createImmutable("MS ClusterVerts", clClusterVerts.data(), clClusterVerts.size() * sizeof(UInt32), sizeof(UInt32), p.clClusterVerts) ||
 		!createImmutable("MS ClusterTris", clClusterTris.data(), clClusterTris.size() * sizeof(UInt32), sizeof(UInt32), p.clClusterTris) ||

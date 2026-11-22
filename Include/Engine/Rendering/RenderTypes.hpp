@@ -297,12 +297,6 @@ struct alignas(16) ObjectConstants {
 	/// (The mesh shader path carries the same flags in its material constant, which
 	/// is why it never had this problem.)
 	Vec4 mapFlags = Vec4(0.0f);
-	/// Sign applied to the decoded tangent-space normal map (xyz used, z = 1). The
-	/// classic path builds its tangent frame from screen-space derivatives, so which
-	/// sign turns an asset's tangent-space normal into that frame is a convention
-	/// rather than something derivable from the asset; it lives here so it can be
-	/// dialled in at run time (RenderSubsystem::setNormalMapSign).
-	Vec4 nmSign = Vec4(1.0f, -1.0f, 1.0f, 0.0f);
 };
 
 // ---------------------------------------------------------------------------

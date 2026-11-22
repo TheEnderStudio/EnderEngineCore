@@ -362,12 +362,7 @@ cbuffer Object : register(b2)
     float4   g_MetallicRough;
     float4   g_Emissive;
     float4   g_MapFlags;      // x = has normal map, y = has MR map, z = has emissive map, w = raw-sample debug
-    // Per-channel sign applied to the decoded tangent-space normal map (xyz used,
-    // z stays 1). A run-time value rather than a compile-time constant so the
-    // convention can be dialled in live (DebugUI "NM Flip X/Y") instead of by
-    // rebuilding - the tangent frame here is built from screen-space derivatives,
-    // so the sign is a property of that frame, not of the asset.
-    float4   g_NMSign;
+
 };
 
 struct PSIn
@@ -766,12 +761,7 @@ cbuffer Object : register(b2)
     float4   g_MetallicRough;
     float4   g_Emissive;
     float4   g_MapFlags;      // x = has normal map, y = has MR map, z = has emissive map, w = raw-sample debug
-    // Per-channel sign applied to the decoded tangent-space normal map (xyz used,
-    // z stays 1). A run-time value rather than a compile-time constant so the
-    // convention can be dialled in live (DebugUI "NM Flip X/Y") instead of by
-    // rebuilding - the tangent frame here is built from screen-space derivatives,
-    // so the sign is a property of that frame, not of the asset.
-    float4   g_NMSign;
+
 };
 
 struct PSIn
@@ -1103,7 +1093,6 @@ struct RenderSubsystem::RenderBackend {
 	/// that maps an asset's tangent-space normal into that frame is a convention
 	/// (glTF's +Y-up / +V-down textures give (1,-1)) rather than something derivable
 	/// from the asset. Kept as data so it can be dialled in live.
-	Vec4 nmSign = Vec4(1.0f, -1.0f, 1.0f, 0.0f);
 
 	// ---- Sky environment (specular IBL) --------------------------------
 	//
@@ -2153,7 +2142,7 @@ static Vec4 objectMetallicRough(const MaterialDesc& d, bool useOrmAsAo, F32 aoOv
 		for (UInt32 si = 0; si < (UInt32)md->sub.size(); si++) {
 			auto& s = md->sub[si];
 			auto* mt = materials.get(s.material.index, s.material.generation);
-			if (mt && mt->objCB) { ObjectConstants oc; oc.world = wm; oc.normalMat = nm; oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = objectMetallicRough(mt->desc, useOrmAsAo, aoOverride); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.nmSign = nmSign; oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
+			if (mt && mt->objCB) { ObjectConstants oc; oc.world = wm; oc.normalMat = nm; oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = objectMetallicRough(mt->desc, useOrmAsAo, aoOverride); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
 			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
 			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
 			if (mt && srb) {
@@ -2233,7 +2222,7 @@ static Vec4 objectMetallicRough(const MaterialDesc& d, bool useOrmAsAo, F32 aoOv
 
 		for (auto& s : md->sub) {
 			auto* mt = materials.get(s.material.index, s.material.generation);
-			if (mt && mt->objCB) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = objectMetallicRough(mt->desc, useOrmAsAo, aoOverride); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.nmSign = nmSign; oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
+			if (mt && mt->objCB) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = objectMetallicRough(mt->desc, useOrmAsAo, aoOverride); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m); if (m) { memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); } }
 			D::IShaderResourceBinding* srb = mt ? mt->srb.RawPtr() : nullptr;
 			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
 			if (mt && srb) {
@@ -2288,7 +2277,7 @@ static Vec4 objectMetallicRough(const MaterialDesc& d, bool useOrmAsAo, F32 aoOv
 
 			if (mt) {
 				void* m = nullptr; ctx->MapBuffer(mt->objCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
-				if (m) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = objectMetallicRough(mt->desc, useOrmAsAo, aoOverride); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.nmSign = nmSign; oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); }
+				if (m) { ObjectConstants oc; oc.world = Mat4(1.0f); oc.normalMat = Mat4(1.0f); oc.baseColor = mt->desc.baseColorFactor; oc.metallicRough = objectMetallicRough(mt->desc, useOrmAsAo, aoOverride); oc.emissive = Vec4(mt->desc.emissiveFactor, 1.0f); oc.mapFlags = Vec4(mt->desc.normalTexture.isValid() ? 1.0f : 0.0f, mt->desc.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f, mt->desc.emissiveTexture.isValid() ? 1.0f : 0.0f, normalMapDebug ? 1.0f : 0.0f); memcpy(m, &oc, sizeof(oc)); ctx->UnmapBuffer(mt->objCB, D::MAP_WRITE); }
 				if (auto* v = srb->GetVariableByName(D::SHADER_TYPE_VERTEX, "Object"))
 					v->Set(mt->objCB, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 			}
@@ -3005,8 +2994,6 @@ void RenderSubsystem::setNormalMapDebug(bool enable) { m_backend->normalMapDebug
 void RenderSubsystem::setShadowDebug(int mode) { m_backend->shadowDebug = mode < 0 ? 0 : mode; }
 int RenderSubsystem::shadowDebug() const { return m_backend->shadowDebug; }
 bool RenderSubsystem::normalMapDebug() const { return m_backend->normalMapDebug; }
-void RenderSubsystem::setNormalMapSign(Vec2 sign) { m_backend->nmSign = Vec4(sign.x, sign.y, 1.0f, 0.0f); }
-Vec2 RenderSubsystem::normalMapSign() const { return Vec2(m_backend->nmSign.x, m_backend->nmSign.y); }
 void RenderSubsystem::setSkyIBLEnabled(bool enable) { m_backend->envEnabled = enable; }
 bool RenderSubsystem::skyIBLEnabled() const { return m_backend->envEnabled; }
 void RenderSubsystem::setSkyIBLMipScale(F32 scale) { m_backend->envMipScale = std::clamp(scale, 0.0f, 4.0f); }
