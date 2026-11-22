@@ -848,12 +848,13 @@ struct ClusterMeshInfo { // 48 B
 };
 
 // M5: per-material constants, indexed by ClusterGPU::materialId.
-struct MaterialGPU { // 48 B
+struct MaterialGPU { // 64 B, matches the HLSL struct
 	Vec4 baseColor;         // glTF baseColorFactor
 	Vec4 emissive = Vec4(0, 0, 0, 1);  // rgb = emissiveFactor, a = emissive strength
 	Vec4 params = Vec4(1.0f, 1.0f, 0.0f, 0.0f); // x = metallic, y = roughness,
 	                                            // z = 1 when a normal map is bound,
 	                                            // w = 1 when a metallicRoughness map is bound
+	Vec4 params2 = Vec4(1.0f, 0.0f, 0.0f, 0.0f); // x = ambient occlusion override (1 = sampled)
 };
 
 // Material factors as the cluster pixel shader wants them. Shared by the initial
@@ -861,6 +862,9 @@ struct MaterialGPU { // 48 B
 static MaterialGPU packMaterial(const MaterialDesc& md) {
 	MaterialGPU g;
 	g.baseColor = md.baseColorFactor;
+	// The occlusion override is filled in by the caller (it is a renderer-wide debug knob,
+	// not a material property); 1 = use whatever the occlusion palette sampled.
+	g.params2 = Vec4(1.0f, 0.0f, 0.0f, 0.0f);
 	// glTF: emission = emissiveFactor * emissiveTexture. The emissive map's fallback
 	// is white (the multiplicative identity) rather than black, so a material that
 	// carries only a factor - the Demo's lamp cube - still glows; this matches the
@@ -872,6 +876,13 @@ static MaterialGPU packMaterial(const MaterialDesc& md) {
 		md.normalTexture.isValid() ? 1.0f : 0.0f,
 		md.metallicRoughnessTexture.isValid() ? 1.0f : 0.0f);
 	return g;
+}
+
+/// @brief The renderer-wide occlusion override (RenderSubsystem::setAoOverride), applied to
+/// a packed material. 1 = use the sampled occlusion; anything below replaces it, which is
+/// how the ambient occlusion path can be excercised on assets that carry none.
+static void applyAoOverride(MaterialGPU& g, const RenderSubsystem* renderer) {
+	g.params2.x = renderer ? renderer->aoOverride() : 1.0f;
 }
 
 // M3: vertex-clustering mesh simplification. Merges close vertices into cubic
@@ -1018,6 +1029,7 @@ void MeshShaderSubsystem::refreshMaterials() {
 		// slot was created (RenderSubsystem::setMaterial).
 		if (auto md = p.renderer->getMaterial(p.materialSlots[i].mat)) p.materialSlots[i].desc = md.value();
 		table[i] = packMaterial(p.materialSlots[i].desc);
+			applyAoOverride(table[i], p.renderer);
 	}
 	ctx->UpdateBuffer(p.clMaterials, 0, table.size() * sizeof(MaterialGPU), table.data(),
 		D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
@@ -1630,7 +1642,8 @@ struct ClusterGPU {
 struct MaterialGPU {
     float4 baseColor;
     float4 emissive;
-    float4 params;   // x = metallic, y = roughness, z = has normal map, w = has MR map
+    float4 params;   // x = metallic, y = roughness
+    float4 params2;  // x = ambient occlusion override (1 = use the sampled value)
 };
 StructuredBuffer<float4x4>        Instances;
 StructuredBuffer<ClusterMeshInfo> MeshInfos;
@@ -1820,7 +1833,8 @@ float3 SkyIrradiance(float3 n)
 struct MaterialGPU {
     float4 baseColor;
     float4 emissive;
-    float4 params;   // x = metallic, y = roughness, z/w unused
+    float4 params;   // x = metallic, y = roughness
+    float4 params2;  // x = ambient occlusion override (1 = use the sampled value)
 };
 
 Texture2D    g_Albedo[MAX_MATERIALS]   : register(t0);
@@ -2078,6 +2092,8 @@ float4 main(in PSInput i) : SV_TARGET {
     // Material occlusion: its own map, or (for assets without one) the ORM convention's R
     // channel - the palette is filled accordingly on the CPU.
     float  ao = saturate(g_AmbientOcclusion[id].Sample(g_AlbedoSampler, i.UV).r);
+    // Debug override: replaces the sampled occlusion with a constant (1 = use the sample).
+    ao = saturate(mat.params2.x < 0.999 ? mat.params2.x : ao);
 
     float3 N = normalize(i.Normal);
     float3 sn = g_NormalMap[id].Sample(g_AlbedoSampler, i.UV).xyz * 2.0 - 1.0;
@@ -2091,6 +2107,31 @@ float4 main(in PSInput i) : SV_TARGET {
     // still scales it), plus the specular lobe's share of the environment - without
     // that a metal has no ambient specular at all. A metal has no diffuse lobe, hence
     // the (1-m), and the occlusion only scales the two indirect terms.
+    // Diagnostic view of the cascaded shadow path (DebugUI: Shadow Debug View), the same
+    // four modes as the forward path: white is lit and black is shadowed, the others
+    // separate a wrong cascade from a lookup outside the map.
+    if (g_LightParams.y > 0.5)
+    {
+        float camZ = abs(mul(g_ViewProj, float4(i.WorldPos, 1.0)).w);
+        uint cs = 0;
+        if (camZ > g_CascadeSplits.x) cs = 1;
+        if (camZ > g_CascadeSplits.y) cs = 2;
+        if (camZ > g_CascadeSplits.z) cs = 3;
+        if (g_LightParams.y < 1.5)
+        {
+            const float s = SampleShadow(i.WorldPos, N, normalize(-g_LightDir.xyz));
+            return float4(s, s, s, 1.0);
+        }
+        if (g_LightParams.y < 2.5)
+        {
+            float3 col = (cs == 0) ? float3(1, 0, 0) : ((cs == 1) ? float3(0, 1, 0) : ((cs == 2) ? float3(0, 0, 1) : float3(1, 1, 0)));
+            return float4(col, 1.0);
+        }
+        float4 sc = mul(g_ShadowMapUVDepth[cs], float4(i.WorldPos, 1.0));
+        sc.xyz /= max(sc.w, 1e-6);
+        return float4(saturate(sc.x), saturate(sc.y), saturate(sc.z), 1.0);
+    }
+
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), bc, m);
     float3 col = (SkyIrradiance(N) * g_Ambient.a * bc * (1.0 - m) + SkySpecular(N, V, F0, r) * g_Ambient.a) * ao;
     {
@@ -2166,6 +2207,7 @@ struct MaterialGPU {
     float4 baseColor;
     float4 emissive;
     float4 params;   // x = metallic, y = roughness
+    float4 params2;  // x = ambient occlusion override (1 = use the sampled value)
 };
 
 Texture2D    g_Albedo[MAX_MATERIALS]      : register(t0);
@@ -2232,6 +2274,8 @@ PSOut main(in PSInput i) {
     // The albedo alpha carries the material occlusion for the hybrid compose; the albedo
     // RGB is the only part that compose reads otherwise.
     o.Color.a = saturate(g_AmbientOcclusion[id].Sample(g_AlbedoSampler, i.UV).r);
+    // Debug override (see the shaded variant); 1 = use the sampled value.
+    o.Color.a = saturate(mat.params2.x < 0.999 ? mat.params2.x : o.Color.a);
     // Metallic rides in the emissive target's alpha (rgb is the emissive itself): the
     // compose pass needs it for F0 = lerp(0.04, albedo, metallic), and there is no
     // spare channel left - roughness already owns the normal target's alpha.
@@ -2845,6 +2889,7 @@ Result<void, RenderError> MeshShaderSubsystem::setMeshes(const Vector<MeshHandle
 	for (size_t i = 0; i < matSlots.size() && i < kMaxMaterials; ++i) {
 		if (!matSlots[i].valid) continue;
 		clMaterials[i] = packMaterial(matSlots[i].desc);
+		applyAoOverride(clMaterials[i], p.renderer);
 	}
 	{
 		for (size_t mi = 0; mi < meshes.size(); ++mi) {
@@ -3423,7 +3468,8 @@ Result<void, RenderError> MeshShaderSubsystem::drawSceneImpl(const Vector<MeshDr
 		// Same for the shadow quality/bias knobs (PCF radius, cascade blend, bias).
 		cb.shadowParams = p.renderer->shadowParams();
 		cb.contactParams = p.renderer->contactShadowParams();
-		cb.lightParams = Vec4(p.renderer->diffuseWrap(), 0.0f, 0.0f, 0.0f);
+		// y is the raster shadow debug view; the cluster path shares the same DebugUI toggle.
+	cb.lightParams = Vec4(p.renderer->diffuseWrap(), (F32)p.renderer->shadowDebug(), 0.0f, 0.0f);
 		Vec3 sunDir(0); Vec4 sunColor(1, 1, 1, 1);
 		if (p.renderer->getPrimaryDirectionalLight(sunDir, sunColor)) {
 			cb.lightDir = Vec4(glm::normalize(sunDir), 0.0f);
@@ -3517,4 +3563,3 @@ Vector<MeshShaderSubsystem::MeshDrawGroup> MeshShaderSubsystem::singleGroup(cons
 }
 
 EE_NAMESPACE_RENDERING_END
-

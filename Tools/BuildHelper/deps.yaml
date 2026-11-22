@@ -338,3 +338,21 @@ dependencies:
     layout:
       - { configs: ["*"], from: "simdjson.h", to: "simdjson.h", source: stage}
       - { configs: ["*"], from: "simdjson.cpp", to: "simdjson.cpp", source: stage}
+
+  - name: RmlUi
+    kind: archive
+    url: https://github.com/mikke89/RmlUi/releases/download/6.3/RmlUi-vs2026-win64.zip
+    archiveFile: RmlUi-vs2026-win64.zip
+    build: none
+    target: Backends/RmlUi
+    layout:
+      - { configs: ["*"], from: "Backends", to: "Backends", source: stage}
+      - { configs: ["*"], from: "Bin-Dynamic/Debug", to: "Bin/Debug", source: stage}
+      - { configs: ["*"], from: "Bin-Dynamic/Release", to: "Bin/Release", source: stage}
+      - { configs: ["*"], from: "Include", to: "Include", source: stage}
+      - { configs: ["*"], from: "Build.txt", to: "Build.txt", source: stage}
+      - { configs: ["*"], from: "changelog.md", to: "changelog.md", source: stage}
+      - { configs: ["*"], from: "LICENSE.Core.ThirdParty.txt", to: "LICENSE.Core.ThirdParty.txt", source: stage}
+      - { configs: ["*"], from: "LICENSE.Debugger.ThirdParty.txt", to: "LICENSE.Debugger.ThirdParty.txt", source: stage}
+      - { configs: ["*"], from: "LICENSE.txt", to: "LICENSE.txt", source: stage}
+      - { configs: ["*"], from: "readme.md", to: "readme.md", source: stage}

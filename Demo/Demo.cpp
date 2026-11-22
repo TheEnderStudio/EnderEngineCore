@@ -582,6 +582,18 @@ float4 main(PSIn i) : SV_TARGET {
 	ComputeBuf counterBuf = compute.createStructuredBuffer(1, sizeof(UInt32), true);
 	ComputeSRV wmSRV = compute.getBufferSRV(worldMatBuf);
 	ComputeSRV idxSRV = compute.getBufferSRV(indicesBuf);
+	// Shadow pass: the compacted list above is culled against the *camera*, so reusing it
+	// for shadow casting drops every caster that left the view and its shadow vanishes as
+	// the camera approaches. These give the shadow pass every instance instead: an identity
+	// index list plus arguments whose instanceCount covers all of them.
+	ComputeBuf identityIdxBuf = compute.createStructuredBuffer(1000, sizeof(UInt32), true);
+	ComputeBuf shadowArgsBuf = compute.createIndirectArgsBuffer(8);
+	ComputeSRV identityIdxSRV = compute.getBufferSRV(identityIdxBuf);
+	{
+		Vector<UInt32> identity(1000);
+		for (UInt32 i = 0; i < 1000; ++i) identity[i] = i;
+		compute.updateBuffer(identityIdxBuf, identity.data(), static_cast<UInt32>(identity.size() * sizeof(UInt32)));
+	}
 
 	// Skybox with cubemap from 6 face images
 	TextureHandle skyCubeTexHandle;
@@ -993,7 +1005,12 @@ HALT
 				bool useOrm = renderer.useOrmAsAo();
 				if (debugUI.checkbox("AO from ORM R", &useOrm)) renderer.setUseOrmAsAo(useOrm);
 				F32 aoOverride = renderer.aoOverride();
-				if (debugUI.sliderFloat("AO Override (1 = sampled)", &aoOverride, 0.0f, 1.0f)) renderer.setAoOverride(aoOverride);
+				if (debugUI.sliderFloat("AO Override (1 = sampled)", &aoOverride, 0.0f, 1.0f)) {
+					renderer.setAoOverride(aoOverride);
+					// The mesh shader path keeps its own material palette, so the override has
+					// to be pushed into it as well (the raster path reads it per draw).
+					meshShader.refreshMaterials();
+				}
 			}
 			// Specular IBL: the prefiltered sky environment. Off falls back to the
 			// diffuse-only ambient, which is the quickest way to see what it adds
@@ -1080,6 +1097,27 @@ HALT
 				changed = true;
 			}
 			if (changed) renderer.setShadowParams(pcfRadius, cascadeBlend, biasBase, biasSlope);
+		}
+		// Caster reach: how much world distance is added to each cascade's light-space depth
+		// range. At 0 the box is fitted to the camera slice alone, so a caster just above a
+		// receiver is clipped out of the near cascades and its shadow fades away as the
+		// camera approaches; drag this while looking at a shadow close up.
+		{
+			F32 extension = shadow.casterExtension();
+			if (debugUI.sliderFloat("Shadow Casters Reach (units)", &extension, 0.0f, 100.0f)) {
+				shadow.setCasterExtension(extension);
+			}
+		}
+		// Shadow debug view (raster only): 1 = the shadow term itself, 2 = which cascade the
+		// pixel landed in, 3 = the shadow map UV/depth used for the lookup. A surface that
+		// lost its shadow is white in mode 1; the other two modes say why.
+		{
+			static int shadowDebugMode = 0;
+			static const char* kShadowDebugNames[] = { "Off", "Shadow Term", "Cascade", "Map UV" };
+			if (debugUI.button(fmt::format("Shadow Debug: {}", kShadowDebugNames[shadowDebugMode]).c_str())) {
+				shadowDebugMode = (shadowDebugMode + 1) % 4;
+				renderer.setShadowDebug(shadowDebugMode);
+			}
 		}
 		// ---- Contact shadows --------------------------------------------------
 		// A short ray march in shadow map space towards the light, with an epsilon that
@@ -1605,6 +1643,15 @@ HALT
 					argsTmpl[mi].baseVertex = static_cast<UInt32>(sub.vertexOffset);
 				}
 				compute.updateBuffer(argsBuf, argsTmpl, sizeof(argsTmpl));
+		// Same draws, but every instance: the shadow map must not inherit the camera cull.
+		IndirectDrawArgs shadowTmpl[8] = {};
+		for (UInt32 mi = 0; mi < meshCount; mi++) {
+			shadowTmpl[mi].indexCount = argsTmpl[mi].indexCount;
+			shadowTmpl[mi].firstIndex = argsTmpl[mi].firstIndex;
+			shadowTmpl[mi].baseVertex = argsTmpl[mi].baseVertex;
+			shadowTmpl[mi].instanceCount = 1000;
+		}
+		compute.updateBuffer(shadowArgsBuf, shadowTmpl, sizeof(shadowTmpl));
 				compute.updateCullingCB(cullCBBuf, fp, 1000,
 					argsTmpl[0].indexCount, argsTmpl[0].firstIndex, argsTmpl[0].baseVertex, meshCount);
 				// Clear the compaction counter before dispatch
@@ -1696,6 +1743,10 @@ HALT
 						d.indicesSRV = idxSRV;
 						d.indirectArgs = argsBuf;
 						d.argsByteOffset = static_cast<UInt32>(mi * sizeof(IndirectDrawArgs));
+						// Uncompacted pair for the shadow pass (see the buffer comment above).
+						d.shadowIndirectArgs = shadowArgsBuf;
+						d.shadowArgsByteOffset = static_cast<UInt32>(mi * sizeof(IndirectDrawArgs));
+						d.shadowInstanceIndicesSRV = identityIdxSRV;
 						frame.sceneDraws.push_back(std::move(d));
 					}
 				}
@@ -1766,7 +1817,10 @@ HALT
 				rayTracing.setSkybox(s_skyMode == 3, skyCubeTexHandle, s_skyCorners);
 				frame.rtConstants.lightDir = Vec4(glm::normalize(-frame.shadowLightDir), 0.0f);
 				frame.rtConstants.maxRayLength = 100.0f;
-				frame.rtConstants.ambientLight = 0.1f;
+				// rtConstants.ambientLight is filled by the pipeline from the renderer's ambient
+	// strength: the reflection hit point scales the sky irradiance by it, exactly like the
+	// raster path's indirect diffuse. A constant here would only darken reflections.
+	frame.rtConstants.ambientLight = 1.0f; // overwritten by RenderPipeline::render()
 				frame.rtConstants.lightIntensity = sunIntensity;
 				frame.rtConstants.lightColor = Vec4(sunColorR, sunColorG, sunColorB, 0.0f);
 				frame.rtConstants.shadowPCF = rtShadowPCF;

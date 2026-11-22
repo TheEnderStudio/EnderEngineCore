@@ -196,8 +196,17 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 				for (const Mat4& world : draw.matrices) renderer.renderShadowPass(shadow, draw.mesh, world);
 				break;
 			case SceneDraw::Kind::Indirect:
-				renderer.renderShadowPassIndirect(shadow, draw.mesh, draw.worldMatricesSRV,
-					draw.indicesSRV, draw.indirectArgs, draw.argsByteOffset);
+				// A GPU-culled instance list is built against the camera frustum, so a caster
+				// behind the viewer would not reach the shadow map at all. Use the caller's
+				// unculled overrides when it provides them.
+				if (draw.shadowInstanceIndicesSRV && draw.shadowIndirectArgs) {
+					renderer.renderShadowPassIndirect(shadow, draw.mesh, draw.worldMatricesSRV,
+						draw.shadowInstanceIndicesSRV, draw.shadowIndirectArgs, draw.shadowArgsByteOffset);
+				}
+				else {
+					renderer.renderShadowPassIndirect(shadow, draw.mesh, draw.worldMatricesSRV,
+						draw.indicesSRV, draw.indirectArgs, draw.argsByteOffset);
+				}
 				break;
 			}
 		}
@@ -542,6 +551,12 @@ Result<void, CoreError> RenderPipeline::render(RenderFrame& frame) {
 		const Vec4 env = m_impl->context.renderer->skyEnvParams();
 		const Vec4 ambient = m_impl->context.renderer->getAmbientLight();
 		frame.rtConstants.envParams = Vec4(env.x, env.y, env.w * ambient.w, 0.0f);
+		// The hit shading scales the sky's irradiance by this - the ambient *strength*, the
+		// same number the raster path uses as g_Ambient.a for its indirect diffuse. It has to
+		// come from here rather than from the caller, because a caller-chosen constant (the
+		// Demo used 0.1) only ever affected reflected geometry and made a floor seen in a
+		// mirror darker than the very same floor seen directly.
+		frame.rtConstants.ambientLight = ambient.w;
 	}
 
 	PipelineFrameContext context;

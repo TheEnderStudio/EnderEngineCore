@@ -68,6 +68,19 @@ struct SceneDraw {
 	ComputeSRV indicesSRV;
 	ComputeBuf indirectArgs;
 	UInt32 argsByteOffset = 0;
+
+	/**
+	 * @brief Optional shadow-pass overrides for the indirect case.
+	 *
+	 * A GPU-culled instance list is typically built against the *camera* frustum. Reusing
+	 * it for shadow casting silently drops every caster that happens to be off-screen -
+	 * which reads as "the shadow disappears when I walk up to it". When these are set the
+	 * shadow pass draws @p shadowInstanceIndicesSRV (an identity list, i.e. every instance)
+	 * with @p shadowIndirectArgs (whose instanceCount covers all of them) instead.
+	 */
+	ComputeSRV shadowInstanceIndicesSRV;
+	ComputeBuf shadowIndirectArgs;
+	UInt32 shadowArgsByteOffset = 0;
 };
 
 /**

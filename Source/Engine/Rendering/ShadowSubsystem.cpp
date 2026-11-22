@@ -1,4 +1,4 @@
-﻿#include <Rendering/ShadowSubsystem.hpp>
+#include <Rendering/ShadowSubsystem.hpp>
 #include <Rendering/RenderSubsystem.hpp>
 #include <Core/Log.hpp>
 #include <array>
@@ -20,7 +20,11 @@ struct ShadowSubsystem::Impl {
 	D::RefCntAutoPtr<D::ISampler> cmpSampler;
 	D::RefCntAutoPtr<D::IBuffer> frameCB;
 	Diligent::ShadowMapAttribs shadowAttribs;
+	/// Cascade transforms as handed to the shader: the manager's, with the optional
+	/// light-space depth extension already applied (see distribute()).
+	Mat4 cascadeXf[4] = {};
 	bool initialized = false;
+	bool loggedSplits = false; ///< One-shot: print the cascade split distances (unit check).
 };
 
 ShadowSubsystem::ShadowSubsystem() : Subsystem("Shadow"), m_impl(std::make_unique<Impl>()) {}
@@ -28,19 +32,20 @@ ShadowSubsystem::~ShadowSubsystem() = default;
 
 void ShadowSubsystem::attachToRenderer(RenderSubsystem* r) { m_impl->renderer = r; }
 void ShadowSubsystem::setConfig(const ShadowConfig& cfg) { m_impl->cfg = cfg; m_impl->initialized = false; }
+// The extension is read every frame in distribute(), so it can be changed live.
+void ShadowSubsystem::setCasterExtension(F32 worldUnits) { m_impl->cfg.casterExtension = worldUnits < 0.0f ? 0.0f : worldUnits; }
+F32 ShadowSubsystem::casterExtension() const { return m_impl->cfg.casterExtension; }
 
 TextureSRV ShadowSubsystem::getSRV() const { return m_impl->mgr.GetSRV(); }
 
 TextureDSV ShadowSubsystem::getCascadeDSV(UInt32 c) const { return m_impl->mgr.GetCascadeDSV(c); }
 
 Mat4 ShadowSubsystem::getCascadeTransform(UInt32 c) const {
-	const auto& xf = m_impl->mgr.GetCascadeTranform(c).WorldToLightProjSpace;
-	return *reinterpret_cast<const Mat4*>(&xf);
+	return m_impl->cascadeXf[c < 4 ? c : 0];
 }
 
 Mat4 ShadowSubsystem::getWorldToShadowMapUVDepth(UInt32 ci) const {
-	const auto& xf = m_impl->mgr.GetCascadeTranform(ci).WorldToLightProjSpace;
-	Mat4 wlp = *reinterpret_cast<const Mat4*>(&xf);
+	Mat4 wlp = m_impl->cascadeXf[ci < 4 ? ci : 0];
 	Mat4 p2uv = Mat4(1.0f);
 	p2uv[0][0] = 0.5f; p2uv[1][1] = -0.5f; p2uv[2][2] = 1.0f;
 	p2uv[3][0] = 0.5f; p2uv[3][1] = 0.5f;
@@ -130,6 +135,57 @@ void ShadowSubsystem::distribute(const Vec3& lightDir, const Vec3& eye, const Ve
 	di.StabilizeExtents = true;
 	di.EqualizeExtents = true;
 	p.mgr.DistributeCascades(di, p.shadowAttribs);
+
+	// Copy the cascades out, optionally growing their ortho boxes.
+	//
+	// DistributeCascades fits each cascade's box to the camera slice alone, and a caster
+	// does not have to sit inside that slice: geometry between the light and the receiver,
+	// or off to the side of it, projects outside the box and is clipped away. The shadow
+	// then disappears exactly when the camera gets close, because the near cascades have
+	// the tightest boxes - and widening only the depth range does nothing for a caster that
+	// is outside in x/y, which is why a z-only widening left the bug untouched.
+	//
+	// Growing the box uniformly is a remap of the matrix rows 0..2: NDC x/y/z are linear in
+	// world position for an orthographic light projection, so scaling a row about the NDC
+	// centre 0.5 enlarges that axis symmetrically: row' = row / s with the constant term
+	// ((row.w - 0.5) / s + 0.5). The world size of the box along a row is 1 / |row.xyz|, so
+	// asking for extension world units on every side gives s = 1 + 2 * extension / box.
+	// Rendering and sampling use these copies, so the two can never disagree.
+	for (UInt32 c = 0; c < p.cfg.numCascades && c < 4; ++c) {
+		const auto& src = p.mgr.GetCascadeTranform(c).WorldToLightProjSpace;
+		Mat4 m = *reinterpret_cast<const Mat4*>(&src);
+		const F32 extension = p.cfg.casterExtension;
+		if (extension > 0.0f) {
+			// glm is column major: element (row, col) is m[col][row].
+			const Vec4 rowX(m[0][0], m[1][0], m[2][0], m[3][0]);
+			const Vec4 rowY(m[0][1], m[1][1], m[2][1], m[3][1]);
+			const F32 gradient = std::max(std::sqrt(rowX.x * rowX.x + rowX.y * rowX.y + rowX.z * rowX.z),
+				std::sqrt(rowY.x * rowY.x + rowY.y * rowY.y + rowY.z * rowY.z));
+			if (gradient > 1e-8f) {
+				const F32 boxWorld = 1.0f / gradient;          // world size covered by the box
+				const F32 scale = 1.0f + 2.0f * extension / std::max(boxWorld, 1e-6f);
+				const F32 k = 1.0f / scale;
+				for (int r = 0; r < 3; ++r) {
+					const F32 x = m[0][r], y = m[1][r], z = m[2][r], w = m[3][r];
+					m[0][r] = x * k;
+					m[1][r] = y * k;
+					m[2][r] = z * k;
+					m[3][r] = (w - 0.5f) * k + 0.5f;
+				}
+			}
+		}
+		p.cascadeXf[c] = m;
+	}	for (UInt32 c = p.cfg.numCascades; c < 4; ++c) {
+		const UInt32 last = p.cfg.numCascades > 0 ? p.cfg.numCascades - 1 : 0;
+		p.cascadeXf[c] = p.cascadeXf[last];
+	}
+	if (!p.loggedSplits) {
+		p.loggedSplits = true;
+		const auto& a = p.shadowAttribs;
+		EInfo("Shadow: cascades end at camera Z {:.2f} / {:.2f} / {:.2f} / {:.2f} (caster extension {:.1f})",
+			a.fCascadeCamSpaceZEnd[0], a.fCascadeCamSpaceZEnd[1], a.fCascadeCamSpaceZEnd[2], a.fCascadeCamSpaceZEnd[3],
+			p.cfg.casterExtension);
+	}
 }
 
 EE_NAMESPACE_RENDERING_END

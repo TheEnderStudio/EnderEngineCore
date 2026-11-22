@@ -92,7 +92,7 @@ struct RTConstants {
     float4   LightDir;
     float4   CameraPos;
     float    MaxRayLength;
-    float    AmbientLight;
+    float    AmbientLight;       // ambient strength: scales the hit point's sky irradiance
     uint     ShadowPCF;
     float    LightIntensity;
     float4   LightColor;
@@ -287,6 +287,31 @@ float4 GetSkyColorLod(float3 Dir, float lod)
     return float4(lerp(c01, c23, w.z), 1.0);
 }
 
+// Diffuse irradiance of the analytic sky along n: the same closed form the forward and
+// compose shaders use (RenderSubsystem::g_PS, RayTracingSubsystem's compose). The 8-corner
+// sky is trilinear in the direction, so to first order it is A + dot(B, l) with A the corner
+// mean and B_i the mean of the corners carrying the i-th bit minus A; its cosine-weighted
+// average around n is A + (2/3) dot(B, n). A reflection hit needs this so the ambient it
+// receives is the same ambient the directly visible surface gets - the flat AmbientLight it
+// used to be multiplied by is a *strength*, not a colour.
+float3 SkyIrradianceRT(float3 n)
+{
+    float3 A = float3(0, 0, 0);
+    float3 B[3] = { float3(0, 0, 0), float3(0, 0, 0), float3(0, 0, 0) };
+    [unroll]
+    for (int j = 0; j < 8; ++j)
+    {
+        const float3 c = g_RTConstants.SkyCorners[j].rgb;
+        A += c * 0.125;
+        [unroll]
+        for (int i = 0; i < 3; ++i)
+            if (((j >> i) & 1) != 0) B[i] += c * 0.25;
+    }
+    [unroll]
+    for (int i = 0; i < 3; ++i) B[i] -= A;
+    return max(A + (2.0 / 3.0) * (B[0] * n.x + B[1] * n.y + B[2] * n.z), 0.0);
+}
+
 // -------------------------------------------------------------------
 // GGX terms.
 //
@@ -331,6 +356,8 @@ float SmithG2(float NdotV, float NdotL, float a)
 struct ReflectionResult {
     float4 BaseColor;
     float  NdotL;
+    float  Metallic; ///< Hit's metalness: the diffuse share of the ambient is (1 - this).
+    float3 Normal;   ///< Hit normal in world space (the irradiance is integrated over it).
     float3 Emissive; ///< Self-emission of the hit surface (not light-tinted).
     float3 Specular; ///< Direct + ambient specular of the hit surface.
     bool   Found;
@@ -409,6 +436,8 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
     ReflectionResult res;
     res.BaseColor = float4(0, 0, 0, 0);
     res.NdotL     = 0.0;
+    res.Metallic  = 0.0;
+    res.Normal    = float3(0, 1, 0);
     res.Emissive  = float3(0, 0, 0);
     res.Specular  = float3(0, 0, 0);
     res.Found     = false;
@@ -446,6 +475,8 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
         texLod = clamp(texLod * g_RTConstants.ReflectionCone, 0.0, 10.0);
 
         res.BaseColor = Mtr.BaseColorMask * g_Textures[NonUniformResourceIndex(Mtr.BaseColorTexInd)].SampleLevel(g_Sampler, UV, texLod);
+        res.Metallic  = Mtr.Metallic;
+        res.Normal    = Norm;
         // Note: no roughness-based attenuation here anymore - the GGX
         // importance sampling in CSMain weights the reflected radiance by the
         // Smith G geometry term (roughness energy), so a rough surface's
@@ -493,11 +524,13 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
             const float  denom = max(4.0 * NdotV * max(NdotL, 1e-3), 1e-4);
             res.Specular = F * (DG / denom) * g_RTConstants.LightColor.rgb
                          * g_RTConstants.LightIntensity * NdotL * shadowTerm;
-            // Ambient specular: the hit surface also mirrors its surroundings.
-            // Without an environment map at hand this is approximated with the
-            // ambient term tinted by F0, which is what keeps metal readable in
-            // shadow instead of flat.
-            res.Specular += F0 * g_RTConstants.AmbientLight * g_RTConstants.LightColor.rgb;
+            // Ambient specular: the hit surface mirrors the sky, so use the sky radiance
+            // along the hit's reflection of the incoming ray, scaled by the same
+            // env * ambient factor the raster path applies to its specular IBL
+            // (EnvParams.z). A fixed ambient tinted by the light colour is what made a
+            // reflected metal look nothing like the same metal seen directly.
+            const float3 Vrefl = reflect(-Vhit, Norm);
+            res.Specular += F0 * GetSkyColorLod(Vrefl, 0.0).rgb * g_RTConstants.EnvParams.z;
         }
 
         // Two-bounce: reflect again from the hit point on surfaces at or below
@@ -858,11 +891,19 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
             float3 rad = float3(0, 0, 0);
             if (refl.Found)
             {
-                // Reflection point lighting: ambient and direct tinted by the light
-                // color (consistent with the compose diffuse term); self-emission of
-                // the hit surface added afterwards, untinted.
-                float3 lit = (g_RTConstants.AmbientLight + max(0.0, refl.NdotL) * g_RTConstants.LightIntensity) * lightColor;
-                rad = refl.BaseColor.rgb * lit + refl.Emissive.rgb + refl.Specular;
+                // Reflection point lighting, made consistent with the directly visible
+                // surface: the ambient is the sky's irradiance along the hit normal scaled by
+                // the renderer's ambient strength - exactly what the compose pass uses for its
+                // indirect diffuse - instead of a flat fraction of the light colour, which is
+                // why a floor seen in a mirror came out darker than the same floor seen
+                // directly. Only the direct term keeps the light colour, and both diffuse
+                // terms carry the (1 - metallic) share the compose applies. The hit's own
+                // material occlusion is not applied: the RT material table carries only the
+                // base colour texture, so this is the AO = 1 case (the compose's aoTotal).
+                const float3 skyAmbient = SkyIrradianceRT(refl.Normal) * g_RTConstants.AmbientLight;
+                const float3 direct = max(0.0, refl.NdotL) * g_RTConstants.LightIntensity * lightColor;
+                rad = refl.BaseColor.rgb * (skyAmbient + direct) * (1.0 - refl.Metallic)
+                    + refl.Emissive.rgb + refl.Specular;
             }
             else
             {

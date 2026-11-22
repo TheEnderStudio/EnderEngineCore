@@ -217,6 +217,18 @@ struct ShadowConfig {
 	F32   depthBias      = 0.0025f;
 	UInt32 filterSize    = 5;     ///< PCF filter kernel size (3/5/7)
 	bool  visualizeCascades = false;
+	/**
+	 * @brief World distance added to each cascade's box on every side, for shadow casters.
+	 *
+	 * A cascade's orthographic box is fitted to the camera slice, and a caster need not sit
+	 * inside that slice: geometry between the light and the receiver, or off to the side of
+	 * it, projects outside the box and is clipped out of the shadow map. The shadow then
+	 * disappears exactly when the camera gets close, because the near cascades have the
+	 * tightest boxes. This grows every cascade's box by this many world units on each side,
+	 * trading shadow-map resolution for casters that would otherwise be missing.
+	 * 0 disables it and leaves the fitted box untouched.
+	 */
+	F32   casterExtension = 15.0f;
 };
 
 /// @brief Result from loading a model, containing meshes, materials and root transform.

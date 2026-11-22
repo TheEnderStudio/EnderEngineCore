@@ -497,6 +497,12 @@ public:
 	void setNormalMapDebug(bool enable);
 	EE_NODISCARD bool normalMapDebug() const;
 
+	/// @brief Raster-only diagnostic of the cascaded shadow path.
+	/// 0 = off, 1 = shadow term (white lit / black shadowed), 2 = selected cascade
+	/// (red/green/blue/yellow), 3 = shadow map UV and depth of the selected cascade.
+	void setShadowDebug(int mode);
+	EE_NODISCARD int shadowDebug() const;
+
 	/**
 	 * @brief Read material occlusion from the metallic-roughness texture's R channel.
 	 *

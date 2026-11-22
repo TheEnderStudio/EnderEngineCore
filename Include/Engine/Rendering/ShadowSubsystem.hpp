@@ -20,6 +20,10 @@ public:
 	/// @brief Configure shadows. Call before initialize().
 	void setConfig(const ShadowConfig& cfg);
 
+	/// @brief How far each cascade's light-space range is extended so casters stay in it.
+	void setCasterExtension(F32 worldUnits);
+	EE_NODISCARD F32 casterExtension() const;
+
 	/// @brief Distribute cascades each frame. Use D3D left-handed camera parameters.
 	void distribute(const Vec3& lightDir, const Vec3& eye, const Vec3& center, const Vec3& up, F32 fov, F32 aspect, F32 nearP, F32 farP);
 

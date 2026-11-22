@@ -256,7 +256,7 @@ cbuffer Frame : register(b0)
     float4   g_EnvParams;       // x = sky IBL on, y = mip scale, z = debug, w = intensity
     float4   g_ShadowParams;    // x = PCF radius, y = cascade blend, z/w = depth bias base/slope
     float4   g_ContactParams;   // x = normal offset, y = contact length, z = strength, w = fade distance
-    float4   g_LightParams;     // x = diffuse wrap (0 = Lambert, 1 = half-Lambert)
+    float4   g_LightParams;     // x = diffuse wrap (0 = Lambert, 1 = half-Lambert), y = shadow debug view
 };
 
 // Diffuse irradiance of the analytic sky (the same closed form the mesh shader and
@@ -679,6 +679,33 @@ float4 main(PSIn i) : SV_TARGET
     ao = saturate(g_MetallicRough.w < 0.999 ? g_MetallicRough.w : ao);
     // glTF emissive = factor * texture (w carries the strength).
     float3 emis = g_Emissive.rgb * g_Emissive.w * t_EmissiveMap.Sample(t_BC_sampler, i.UV).rgb;
+
+    // Diagnostic view of the cascaded shadow path (DebugUI: Shadow Debug View). White is
+    // lit and black is shadowed, so a surface that lost its shadow reads as pure white;
+    // the other modes tell the three causes apart - the wrong cascade selected, a lookup
+    // outside the map, or a caster that never made it into the map.
+    if (g_LightParams.y > 0.5)
+    {
+        float camZ = abs(mul(g_ViewProj, float4(i.WP, 1.0)).w);
+        uint cs = 0;
+        if (camZ > g_CascadeSplits.x) cs = 1;
+        if (camZ > g_CascadeSplits.y) cs = 2;
+        if (camZ > g_CascadeSplits.z) cs = 3;
+        if (g_LightParams.y < 1.5)
+        {
+            const float3 Ld = (g_LightCount > 0 && g_Lights[0].DT.a < 0.5) ? normalize(-g_Lights[0].DT.xyz) : float3(0, 1, 0);
+            const float s = SampleShadow(i.WP, N, Ld);
+            return float4(s, s, s, 1.0);
+        }
+        if (g_LightParams.y < 2.5)
+        {
+            float3 col = (cs == 0) ? float3(1, 0, 0) : ((cs == 1) ? float3(0, 1, 0) : ((cs == 2) ? float3(0, 0, 1) : float3(1, 1, 0)));
+            return float4(col, 1.0);
+        }
+        float4 sc = mul(g_ShadowMapUVDepth[cs], float4(i.WP, 1.0));
+        sc.xyz /= max(sc.w, 1e-6);
+        return float4(saturate(sc.x), saturate(sc.y), saturate(sc.z), 1.0);
+    }
 
     float3 lit = DoLight(i.WP, N, V, bc, m, r, ao);
     // Emissive is self-emission: added after lighting (not tinted by the light).
@@ -1108,6 +1135,12 @@ struct RenderSubsystem::RenderBackend {
 	Vec4 shadowParams = Vec4(1.0f, 0.15f, 0.002f, 2.0f);
 	/// Contact shadows + normal offset (FrameConstants::contactParams).
 	Vec4 contactParams = Vec4(1.5f, 24.0f, 0.5f, 50.0f);
+	/// Raster-only diagnostic view of the cascaded shadow path (FrameConstants::lightParams.y):
+	/// 0 = off, 1 = shadow term, 2 = selected cascade, 3 = shadow map UV and depth. It exists
+	/// because "the shadow vanishes up close" can come from the cascade selection, from the
+	/// lookup landing outside the map, or from a caster that never reached the map at all, and
+	/// the three look identical in a lit frame.
+	int shadowDebug = 0;
 	/// Diffuse wrap of the direct lights (FrameConstants::lightParams.x).
 	F32 diffuseWrap = 0.0f;
 
@@ -1138,7 +1171,7 @@ struct RenderSubsystem::RenderBackend {
 		fc.envParams = Vec4(envEnabled ? 1.0f : 0.0f, envMipScale, envDebug ? 1.0f : 0.0f, envIntensity);
 		fc.shadowParams = shadowParams;
 		fc.contactParams = contactParams;
-		fc.lightParams = Vec4(diffuseWrap, 0.0f, 0.0f, 0.0f);
+		fc.lightParams = Vec4(diffuseWrap, (F32)shadowDebug, 0.0f, 0.0f);
 	}
 
 	/// @brief View-projection that maps a direction onto cube face @p face.
@@ -2949,6 +2982,8 @@ void RenderSubsystem::getCameraMatrices(Mat4& view, Mat4& proj) const { view = m
 void RenderSubsystem::setSkybox(const SkyboxDesc& d) { m_backend->skyDesc = d; m_backend->envDirty = true; }
 void RenderSubsystem::clearSkybox() { m_backend->skyDesc.reset(); m_backend->envDirty = true; }
 void RenderSubsystem::setNormalMapDebug(bool enable) { m_backend->normalMapDebug = enable; }
+void RenderSubsystem::setShadowDebug(int mode) { m_backend->shadowDebug = mode < 0 ? 0 : mode; }
+int RenderSubsystem::shadowDebug() const { return m_backend->shadowDebug; }
 bool RenderSubsystem::normalMapDebug() const { return m_backend->normalMapDebug; }
 void RenderSubsystem::setNormalMapSign(Vec2 sign) { m_backend->nmSign = Vec4(sign.x, sign.y, 1.0f, 0.0f); }
 Vec2 RenderSubsystem::normalMapSign() const { return Vec2(m_backend->nmSign.x, m_backend->nmSign.y); }
