@@ -51,7 +51,19 @@ struct alignas(16) RayTraceConstants {
 	F32  reflectionCone = 1.0f;  ///< Ray-cone prefilter strength: 0 = sample texture/sky level 0, 1 = full lobe-matched level.
 	UInt32 reflectionShadowPCF = 1; ///< Shadow rays per reflection hit: 1 = a single ray (the lobe and the denoiser already blur it), >1 = full PCSS+PCF.
 	F32  diffuseWrap = 0.0f;      ///< Direct light falloff: 0 = Lambert, 1 = half-Lambert (RenderSubsystem::setDiffuseWrap).
-	F32  _padWrap0 = 0.0f, _padWrap1 = 0.0f, _padWrap2 = 0.0f; ///< Keep the constant buffer 16-byte aligned.
+	/**
+	 * @brief Temporal-accumulation knobs for the reflection ray budget.
+	 *
+	 * The accumulation pass reports, per pixel, how many frames its history has survived
+	 * (a disocclusion restarts it at 1). The trace pass spends fewer rays where that count
+	 * is high: the temporal filter has already averaged those samples, so the per-frame
+	 * noise contribution of one more ray matters less. historyTarget is the count at which
+	 * the budget reaches its floor, minRaysFraction that floor as a fraction of the
+	 * lobe-width budget (1.0 reproduces the old fixed behaviour).
+	 */
+	F32  reflectionHistoryTarget = 8.0f;
+	F32  reflectionMinRays = 0.35f;
+	F32  _padWrap2 = 0.0f; ///< Keep the constant buffer 16-byte aligned.
 };
 
 // The shader's cbuffer packs a float4 to a 16-byte boundary, so every Vec4 in the struct
@@ -217,6 +229,18 @@ public:
 
 	/// @brief Set the temporal history weight (0 = no history, 1 = full history).
 	void setDenoiseStrength(F32 historyWeight);
+
+	/// @brief Enable the temporal accumulation that runs in front of the denoiser.
+	///
+	/// It reprojects the previous accumulated frame and blends it in (clamped to the current
+	/// neighbourhood), which is what lets a low per-pixel ray budget stay clean: both the OIDN
+	/// path and the built-in SVGF-lite filter consume its output. Turn it off to A/B the
+	/// single-frame path (compare verageTraceMs() and the visible noise).
+	void setTemporalAccum(bool enable);
+	EE_NODISCARD bool temporalAccum() const;
+
+	/// @brief Path-traced reflections' mean GPU time over the last frames (see lastTraceMs).
+	EE_NODISCARD F32 averageTraceMs() const;
 
 	/// @brief Choose the OIDN pipeline when it is available: async (1-frame
 	///        latency, denoise overlaps with rendering) or sync (0 latency,

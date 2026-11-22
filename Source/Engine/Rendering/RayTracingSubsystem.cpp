@@ -115,8 +115,8 @@ struct RTConstants {
     float    ReflectionCone;     // 0 = sample level 0 (no prefilter), 1 = full ray cone
     uint     ReflectionShadowPCF;// shadow rays per reflection hit (1 = single ray)
     float    DiffuseWrap;        // direct light falloff: 0 = Lambert, 1 = half-Lambert
-    float    _padWrap0;
-    float    _padWrap1;
+    float    ReflectionHistoryTarget; // accumulated frames at which the ray budget hits its floor
+    float    ReflectionMinRays;  // floor of the ray budget as a fraction of the lobe-width budget
     float    _padWrap2;
 };
 
@@ -127,6 +127,7 @@ StructuredBuffer<Vertex>          g_VertexBuffer  : register(t3);
 StructuredBuffer<uint>            g_IndexBuffer   : register(t4);
 Texture2D<float4>                 g_GBufferNormal : register(t5);
 Texture2D<float>                  g_GBufferDepth  : register(t6);
+Texture2D<float>                  g_Confidence    : register(t25); ///< Accumulated frames per pixel (temporal budget)
 Texture2D<float4>                 g_Textures[16]  : register(t7);
 TextureCube<float4>               g_SkyCube       : register(t23);
 Texture2D<float4>                 g_GBufferColor  : register(t24);
@@ -711,13 +712,20 @@ float VndfWeight(float NdotV, float NdotL, float a)
 // samples collapse onto the mirror direction, so one ray is both exact and
 // noise free. Wide lobes need every sample to average out. Spending the budget
 // where the variance actually is lowers the visible noise at a fixed ray count.
-uint SampleBudget(float rough, uint maxSamples)
+uint SampleBudget(float rough, uint maxSamples, float historyLength)
 {
     if (maxSamples <= 1u)
         return 1u;
     float t = saturate((rough - 0.05) / 0.40); // 0 = mirror, 1 = rough
-    uint  n = (uint)round(lerp(1.0, (float)maxSamples, sqrt(t)));
-    return clamp(n, 1u, maxSamples);
+    float budget = lerp(1.0, (float)maxSamples, sqrt(t));
+    // History already averages the previous frames, so a converged pixel needs fewer rays
+    // than a freshly disoccluded one. sqrt keeps the falloff gentle (8 carried frames with
+    // a 0.35 floor land at ~0.66 of the budget rather than at the floor immediately).
+    const float target = max(g_RTConstants.ReflectionHistoryTarget, 1.0);
+    const float convergence = saturate(historyLength / target);
+    const float floorFraction = saturate(g_RTConstants.ReflectionMinRays);
+    budget *= lerp(1.0, floorFraction, sqrt(convergence));
+    return clamp((uint)round(budget), 1u, maxSamples);
 }
 
 [numthreads(8, 8, 1)]
@@ -838,7 +846,9 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
         float  NdotV = saturate(dot(ReflNormal, V));
         float  rough = clamp(roughness * g_RTConstants.ReflectionBlur, 0.001, 1.0);
         float  a = rough * rough;
-        uint   ns = SampleBudget(rough, clamp(g_RTConstants.ReflectionSamples, 1u, 16u));
+        // Temporal confidence of this pixel (RT-res, so DTid is the right index).
+    const float historyLength = g_Confidence.Load(int3(DTid, 0));
+    uint   ns = SampleBudget(rough, clamp(g_RTConstants.ReflectionSamples, 1u, 16u), historyLength);
         float3 T, B;
         BuildONB(ReflNormal, T, B);
         // View direction in tangent space (z = normal); the VNDF needs it to
@@ -1216,7 +1226,9 @@ Texture2D<float4> g_RTInput       : register(t0);
 Texture2D<float4> g_PrevDenoised  : register(t1);
 Texture2D<float4> g_GBufferNormal : register(t2);
 Texture2D<float>  g_GBufferDepth  : register(t3);
+Texture2D<float>  g_PrevConfidence: register(t4); ///< Accumulated frames per pixel, last frame.
 RWTexture2D<float4> g_OutDenoised : register(u0);
+RWTexture2D<float>  g_OutConfidence : register(u1);
 SamplerState      g_Sampler       : register(s0);
 cbuffer DenoiseCB : register(b0) {
     float4x4 g_ViewProjInv;      // current frame (unproject)
@@ -1225,6 +1237,10 @@ cbuffer DenoiseCB : register(b0) {
     float    g_NormalWeight;     // spatial normal exponent
     float    g_DepthScale;       // spatial depth sensitivity
     float    g_DisocclusionReject; // relative luminance rejection threshold
+    float    g_SpatialMix;       // 0 = temporal accumulation only, 1 = full spatial filter
+    float    _padMix0;
+    float    _padMix1;
+    float    _padMix2;
 };
 
 float Luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
@@ -1266,7 +1282,12 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
             wsum += w;
         }
     }
-    float4 spatial = sum / wsum;
+    // The same pass serves two roles: the full SVGF-lite filter (spatial + temporal) and,
+    // with g_SpatialMix = 0, the pure temporal accumulation that feeds Open Image Denoise.
+    // OIDN is a spatial denoiser - handed a single frame it can only trade noise for blur,
+    // and the raw reflection pass is exactly the noisy input it cannot fix - so accumulating
+    // the reprojected history first is what makes a low per-pixel ray budget viable.
+    float4 spatial = lerp(raw, sum / wsum, saturate(g_SpatialMix));
 
     // ---- 3x3 neighborhood of the raw input (history clamp range) ----
     float4 mn = raw, mx = raw;
@@ -1297,8 +1318,16 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
     // every noisy frame count as disocclusion and caused constant flicker).
     float4 clamped = clamp(history, mn, mx);
     float rej = abs(Luminance(clamped.rgb) - Luminance(spatial.rgb)) / max(Luminance(spatial.rgb), 0.01f);
-    float alpha = g_HistoryWeight * saturate(g_DisocclusionReject - rej);
+    float acceptance = saturate(g_DisocclusionReject - rej);
+    float alpha = g_HistoryWeight * acceptance;
     g_OutDenoised[DTid] = lerp(spatial, clamped, alpha);
+
+    // History length for the trace pass's ray budget: one more frame for every pixel whose
+    // history survived reprojection and the neighbourhood clamp, back to 1 on a
+    // disocclusion. Capped so an old, stale history cannot drive the budget to nothing.
+    const float prevConfidence = g_PrevConfidence.Load(int3(p, 0));
+    const float carried = (inBounds && g_HistoryWeight > 0.0) ? prevConfidence * acceptance : 0.0;
+    g_OutConfidence[DTid] = min(carried + 1.0, 64.0);
 }
 )";
 
@@ -1353,6 +1382,7 @@ struct RayTracingSubsystem::Impl {
 	D::RefCntAutoPtr<D::IQuery> traceQuery; ///< GPU duration query for trace().
 	bool traceQueryEnded = false;          ///< Whether the query was ended at least once (GetData guard).
 	float lastTraceMs = 0.0f;
+	float traceMsAvg = 0.0f; ///< Rolling mean of the trace pass GPU time (DebugUI benchmark line).
 
 	// Skybox for the reflection miss shader (matches the rendered background).
 	bool skyUseCubemap = false;
@@ -1368,11 +1398,20 @@ struct RayTracingSubsystem::Impl {
 	D::RefCntAutoPtr<D::IPipelineState> denoisePSO;
 	D::RefCntAutoPtr<D::IShaderResourceBinding> denoiseSRB;
 	D::RefCntAutoPtr<D::IBuffer> denoiseCB;
-	D::RefCntAutoPtr<D::ITexture> denoiseTex[2];       ///< Ping-pong buffers.
+	D::RefCntAutoPtr<D::ITexture> denoiseTex[2];       ///< Ping-pong buffers (temporal history + OIDN input).
+	D::RefCntAutoPtr<D::ITexture> confTex[2];          ///< Per-pixel history length (frames survived).
 	D::RefCntAutoPtr<D::ITextureView> denoiseSRV[2];   ///< SRVs of the ping-pong buffers.
 	D::RefCntAutoPtr<D::ITextureView> denoiseUAV[2];   ///< UAVs of the ping-pong buffers.
+	D::RefCntAutoPtr<D::ITextureView> confSRV[2];      ///< SRVs of the per-pixel history length.
+	D::RefCntAutoPtr<D::ITextureView> confUAV[2];      ///< UAVs of the per-pixel history length.
 	UInt32 denoiseFlip = 0;                            ///< Index of the last written frame.
 	bool  denoiseHasPrev = false;                      ///< History valid (false on first frame / resize).
+	/// 1x1 R32F stand-in for the confidence buffer when there is no history yet (reads as
+	/// zero accumulated frames, i.e. the full ray budget).
+	D::RefCntAutoPtr<D::ITextureView> confFallbackSRV;
+	/// Temporal accumulation in front of the denoiser; the DebugUI toggle exists to A/B it
+	/// against the single-frame path (the trace timing and the noise are the comparison).
+	bool  temporalAccum = true;
 	Mat4  denoisePrevVP = Mat4(1.0f);                  ///< Previous frame view-projection.
 	F32   denoiseHistoryWeight = 0.9f;                 ///< Temporal blend strength (0..1).
 	UInt32 traceFrameCounter = 0;                      ///< Frame counter (rotates the GGX sample pattern).
@@ -1857,6 +1896,12 @@ Result<void, RenderError> RayTracingSubsystem::trace(const RayTraceConstants& c,
 	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutRT")) v->Set(static_cast<D::ITextureView*>(outRT), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutAlbedo")) v->Set(static_cast<D::ITextureView*>(outAlbedo), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutNormal")) v->Set(static_cast<D::ITextureView*>(outNormal), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	// Temporal confidence of the previous frame: it scales the per-pixel ray budget, so a
+	// converged pixel spends fewer rays than a freshly disoccluded one.
+	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_Confidence")) {
+		D::ITextureView* conf = (p.denoiseHasPrev && p.confSRV[p.denoiseFlip]) ? p.confSRV[p.denoiseFlip].RawPtr() : p.confFallbackSRV.RawPtr();
+		if (conf) v->Set(conf, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	}
 	// Bind the skybox cubemap (or the white CUBEMAP fallback when not in cubemap mode).
 	if (auto* v = p.rtSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_SkyCube")) {
 		D::ITextureView* srv = p.whiteCubeSRV.RawPtr();
@@ -1874,6 +1919,9 @@ Result<void, RenderError> RayTracingSubsystem::trace(const RayTraceConstants& c,
 		D::QueryDataDuration qd;
 		if (p.traceQuery->GetData(&qd, sizeof(qd), false) && qd.Frequency != 0) {
 			p.lastTraceMs = (float)((double)qd.Duration / (double)qd.Frequency * 1000.0);
+			// Rolling mean for the DebugUI readout: a single frame is far too noisy to compare
+			// two configurations with.
+			p.traceMsAvg = p.traceMsAvg * 0.9f + p.lastTraceMs * 0.1f;
 		}
 	}
 
@@ -2391,14 +2439,18 @@ Result<void, RenderError> RayTracingSubsystem::denoise(void* rtSRV, void* gBuffe
 		p.oidnAttempted = true;
 		tryInitOIDN(width, height);
 	}
-	if (p.oidnReady && !p.oidnDisabled) {
-		p.lastWasOIDN = true;
-		oidnDenoise(rtSRV, gBufferAlbedoSRV, gBufferNormalSRV, width, height);
-		return {};
-	}
-	p.lastWasOIDN = false;
+	// A frame that switches between the two denoisers must not carry history across: the
+	// OIDN path accumulates the *unfiltered* radiance, the fallback path accumulates its own
+	// filtered output, and mixing the two shows up as a one-frame ghost.
+	const bool wantOIDN = p.oidnReady && !p.oidnDisabled;
+	if (wantOIDN != p.lastWasOIDN && (wantOIDN || p.denoiseHasPrev)) p.denoiseHasPrev = false;
+	p.lastWasOIDN = wantOIDN;
 
-	// ---- Temporal + spatial (SVGF-lite) fallback ----
+	// The denoise pass also is the temporal accumulation stage: with the spatial filter
+	// turned off (g_SpatialMix = 0) it only reprojects and blends the history, which is what
+	// runs in front of OIDN. Without it OIDN sees one noisy frame per frame and can only
+	// trade the noise for blur - it cannot average it away, which is why the ray budget had
+	// to stay high. This is the pass that makes fewer rays viable.
 	if (!p.denoisePSO || !p.denoiseSRB) return RenderError::OperationFailed;
 
 	// (Re)create the ping-pong buffers when the RT resolution changed.
@@ -2408,8 +2460,10 @@ Result<void, RenderError> RayTracingSubsystem::denoise(void* rtSRV, void* gBuffe
 	const UInt32 w = td.Width, h = td.Height;
 	if (!p.denoiseTex[0] || p.denoiseTex[0]->GetDesc().Width != w || p.denoiseTex[0]->GetDesc().Height != h) {
 		for (int i = 0; i < 2; ++i) {
-			D::TextureDesc tdd; tdd.Name = "RT Denoise"; tdd.Type = D::RESOURCE_DIM_TEX_2D;
-			tdd.Width = w; tdd.Height = h; tdd.Format = D::TEX_FORMAT_RGBA16_FLOAT;
+			D::TextureDesc tdd; tdd.Name = "RT Accum"; tdd.Type = D::RESOURCE_DIM_TEX_2D;
+			// RGBA32F: this buffer is also the Open Image Denoise input (OIDN has no 16-bit
+			// format), and it doubles as the temporal history the next frame reprojects.
+			tdd.Width = w; tdd.Height = h; tdd.Format = D::TEX_FORMAT_RGBA32_FLOAT;
 			tdd.BindFlags = D::BIND_SHADER_RESOURCE | D::BIND_UNORDERED_ACCESS; tdd.Usage = D::USAGE_DEFAULT;
 			p.denoiseTex[i].Release(); p.denoiseSRV[i].Release(); p.denoiseUAV[i].Release();
 			dev->CreateTexture(tdd, nullptr, &p.denoiseTex[i]);
@@ -2417,37 +2471,79 @@ Result<void, RenderError> RayTracingSubsystem::denoise(void* rtSRV, void* gBuffe
 				p.denoiseSRV[i] = p.denoiseTex[i]->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
 				p.denoiseUAV[i] = p.denoiseTex[i]->GetDefaultView(D::TEXTURE_VIEW_UNORDERED_ACCESS);
 			}
+			// Per-pixel history length, read by the trace pass to spend its ray budget.
+			D::TextureDesc tcd; tcd.Name = "RT Confidence"; tcd.Type = D::RESOURCE_DIM_TEX_2D;
+			tcd.Width = w; tcd.Height = h; tcd.Format = D::TEX_FORMAT_R32_FLOAT;
+			tcd.BindFlags = D::BIND_SHADER_RESOURCE | D::BIND_UNORDERED_ACCESS; tcd.Usage = D::USAGE_DEFAULT;
+			p.confTex[i].Release(); p.confSRV[i].Release(); p.confUAV[i].Release();
+			dev->CreateTexture(tcd, nullptr, &p.confTex[i]);
+			if (p.confTex[i]) {
+				p.confSRV[i] = p.confTex[i]->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
+				p.confUAV[i] = p.confTex[i]->GetDefaultView(D::TEXTURE_VIEW_UNORDERED_ACCESS);
+			}
 		}
 		p.denoiseHasPrev = false; // history from another resolution is invalid
 	}
 
 	// CB: current inverse VP (unproject) + previous frame VP (reproject).
-	struct { Mat4 viewProjInv; Mat4 prevViewProj; float historyWeight; float normalWeight; float depthScale; float disocclusionReject; } cb;
+	struct {
+		Mat4 viewProjInv; Mat4 prevViewProj;
+		float historyWeight; float normalWeight; float depthScale; float disocclusionReject;
+		float spatialMix; float _pad0; float _pad1; float _pad2;
+	} cb;
 	cb.viewProjInv = viewProjInv;
 	cb.prevViewProj = p.denoiseHasPrev ? p.denoisePrevVP : viewProj;
-	cb.historyWeight = p.denoiseHasPrev ? p.denoiseHistoryWeight : 0.0f;
+	cb.historyWeight = (p.denoiseHasPrev && p.temporalAccum) ? p.denoiseHistoryWeight : 0.0f;
 	cb.normalWeight = 64.0f;
 	cb.depthScale = 16.0f;
 	cb.disocclusionReject = 3.0f; // relative-luminance threshold below which history is kept (noise keeps full history)
-	void* m = nullptr;
-	ctx->MapBuffer(p.denoiseCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
-	if (m) { memcpy(m, &cb, sizeof(cb)); ctx->UnmapBuffer(p.denoiseCB, D::MAP_WRITE); }
+	cb.spatialMix = 1.0f;
+	cb._pad0 = cb._pad1 = cb._pad2 = 0.0f;
 
-	const UInt32 prevIdx = p.denoiseFlip;      // last written denoised frame
+	const UInt32 prevIdx = p.denoiseFlip;      // last written frame
 	const UInt32 outIdx  = p.denoiseFlip ^ 1;  // write the other buffer
 
-	if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_RTInput")) v->Set(rtView, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
-	if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_PrevDenoised")) v->Set(p.denoiseSRV[prevIdx], D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
-	if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_GBufferNormal")) v->Set(static_cast<D::ITextureView*>(gBufferNormalSRV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
-	if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_GBufferDepth")) v->Set(static_cast<D::ITextureView*>(gBufferDepthSRV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
-	if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutDenoised")) v->Set(p.denoiseUAV[outIdx], D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	/// Runs the temporal/spatial pass and returns the SRV it wrote.
+	const auto runFilter = [&](float spatialMix) -> D::ITextureView* {
+		cb.spatialMix = spatialMix;
+		void* mapped = nullptr;
+		ctx->MapBuffer(p.denoiseCB, D::MAP_WRITE, D::MAP_FLAG_DISCARD, mapped);
+		if (mapped) { memcpy(mapped, &cb, sizeof(cb)); ctx->UnmapBuffer(p.denoiseCB, D::MAP_WRITE); }
 
-	D::DispatchComputeAttribs da;
-	da.ThreadGroupCountX = (width + 7) / 8;
-	da.ThreadGroupCountY = (height + 7) / 8;
-	ctx->SetPipelineState(p.denoisePSO);
-	ctx->CommitShaderResources(p.denoiseSRB, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	ctx->DispatchCompute(da);
+		if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_RTInput")) v->Set(rtView, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+		if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_PrevDenoised")) v->Set(p.denoiseSRV[prevIdx], D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+		if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_PrevConfidence")) {
+			D::ITextureView* conf = p.confSRV[prevIdx] ? p.confSRV[prevIdx].RawPtr() : p.confFallbackSRV.RawPtr();
+			v->Set(conf, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+		}
+		if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_GBufferNormal")) v->Set(static_cast<D::ITextureView*>(gBufferNormalSRV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+		if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_GBufferDepth")) v->Set(static_cast<D::ITextureView*>(gBufferDepthSRV), D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+		if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutDenoised")) v->Set(p.denoiseUAV[outIdx], D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+		if (auto* v = p.denoiseSRB->GetVariableByName(D::SHADER_TYPE_COMPUTE, "g_OutConfidence")) v->Set(p.confUAV[outIdx], D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+
+		D::DispatchComputeAttribs da;
+		da.ThreadGroupCountX = (width + 7) / 8;
+		da.ThreadGroupCountY = (height + 7) / 8;
+		ctx->SetPipelineState(p.denoisePSO);
+		ctx->CommitShaderResources(p.denoiseSRB, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		ctx->DispatchCompute(da);
+		return p.denoiseSRV[outIdx].RawPtr();
+	};
+
+	if (wantOIDN) {
+		// Accumulate first (spatial filter off), then let OIDN clean up what is left.
+		D::ITextureView* accumulated = p.temporalAccum ? runFilter(0.0f) : nullptr;
+		if (accumulated) {
+			oidnDenoise(accumulated, gBufferAlbedoSRV, gBufferNormalSRV, width, height);
+		}
+		else {
+			// Accumulation disabled: hand OIDN the raw frame, i.e. the old behaviour.
+			oidnDenoise(rtSRV, gBufferAlbedoSRV, gBufferNormalSRV, width, height);
+		}
+	}
+	else {
+		runFilter(1.0f); // full SVGF-lite: temporal + spatial in one pass
+	}
 
 	p.denoiseFlip = outIdx;
 	p.denoisePrevVP = viewProj;
@@ -2471,6 +2567,16 @@ bool RayTracingSubsystem::oidnActive() const {
 void RayTracingSubsystem::setDenoiseStrength(F32 historyWeight) {
 	m_impl->denoiseHistoryWeight = glm::clamp(historyWeight, 0.0f, 1.0f);
 }
+
+void RayTracingSubsystem::setTemporalAccum(bool enable) {
+	auto& p = *m_impl;
+	if (p.temporalAccum != enable) p.denoiseHasPrev = false; // the two modes accumulate different signals
+	p.temporalAccum = enable;
+}
+
+bool RayTracingSubsystem::temporalAccum() const { return m_impl->temporalAccum; }
+
+F32 RayTracingSubsystem::averageTraceMs() const { return m_impl->traceMsAvg; }
 
 void RayTracingSubsystem::setOIDNAsync(bool enable) {
 	// Only meaningful when the async pipeline is available; the blocking
@@ -2506,6 +2612,19 @@ Result<void, CoreError> RayTracingSubsystem::onInitialize() {
 		D::RefCntAutoPtr<D::ITexture> tex;
 		dev->CreateTexture(td, &tdata, &tex);
 		if (tex) p.whiteSRV = tex->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
+	}
+
+	// 1x1 zero confidence texture: bound to g_Confidence before the first accumulation frame
+	// exists, where it reads as "no history" and therefore leaves the ray budget untouched.
+	{
+		D::TextureDesc td; td.Name = "RT ConfidenceZero"; td.Type = D::RESOURCE_DIM_TEX_2D; td.Width = 1; td.Height = 1;
+		td.Format = D::TEX_FORMAT_R32_FLOAT; td.BindFlags = D::BIND_SHADER_RESOURCE; td.Usage = D::USAGE_IMMUTABLE;
+		F32 zero = 0.0f;
+		D::TextureSubResData srd; srd.pData = &zero; srd.Stride = 4;
+		D::TextureData tdata; tdata.pSubResources = &srd; tdata.NumSubresources = 1;
+		D::RefCntAutoPtr<D::ITexture> tex;
+		dev->CreateTexture(td, &tdata, &tex);
+		if (tex) p.confFallbackSRV = tex->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE);
 	}
 
 	// 1x1 white CUBEMAP (fallback for g_SkyCube so the bound dimension always
@@ -2680,7 +2799,8 @@ Result<void, CoreError> RayTracingSubsystem::onInitialize() {
 			if (!p.denoisePSO) { EError("RayTracing: failed to create denoise PSO - temporal denoising disabled"); }
 			else {
 				p.denoisePSO->CreateShaderResourceBinding(&p.denoiseSRB, true);
-				D::BufferDesc bd; bd.Name = "RT Denoise CB"; bd.Size = sizeof(Mat4) * 2 + sizeof(float) * 4;
+				// Two matrices + 8 floats (history / normal / depth / reject / spatial mix / pad).
+				D::BufferDesc bd; bd.Name = "RT Denoise CB"; bd.Size = sizeof(Mat4) * 2 + sizeof(float) * 8;
 				bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DYNAMIC; bd.CPUAccessFlags = D::CPU_ACCESS_WRITE;
 				dev->CreateBuffer(bd, nullptr, &p.denoiseCB);
 				if (p.denoiseSRB) {
@@ -2713,6 +2833,8 @@ void RayTracingSubsystem::onShutdown() {
 	p.sceneMeshKeys.clear(); p.sceneMeshFirstVertex.clear(); p.sceneMeshFirstIndex.clear();
 	p.sceneTextureSRVs.clear();
 	p.whiteSRV.Release(); p.whiteCubeSRV.Release(); p.linearSampler.Release();
+	p.confFallbackSRV.Release();
+	for (int i = 0; i < 2; ++i) { p.confTex[i].Release(); p.confSRV[i].Release(); p.confUAV[i].Release(); }
 	p.ok = false;
 	EInfo("RayTracing subsystem shut down.");
 }

@@ -403,7 +403,10 @@ float4 main(PSIn i) : SV_TARGET {
 	F32  msClusterBudget = 262144.0f; // hard cap on cluster mesh groups dispatched per frame
 	int  msDebugTri = 0;         // MS diagnostic: 0 = off, 1 = fixed triangle, 2 = albedo only
 	int  msMeshFilter = 5;       // MS diagnostic: 0..4 = only that mesh, >4 = all
-	UInt32 rtReflectionSamples = 8; // GGX VNDF reflection ray budget per pixel (1..8); smooth surfaces spend fewer
+	UInt32 rtReflectionSamples = 8;
+	// Floor of the reflection ray budget once a pixel's temporal history has converged
+	// (1.0 = no temporal budgeting, i.e. every pixel pays the full lobe-width budget).
+	F32  rtMinRaysFraction = 0.35f;
 	F32 rtReflectionCone = 1.0f;    // ray-cone prefilter strength (0 = offset-free LOD0 sampling, 1 = lobe-matched mip)
 	UInt32 rtReflectionShadowPCF = 1; // shadow rays per reflection hit (1 = single ray; >1 = PCSS+PCF)
 	float rtResScale = 0.5f; // RT resolution scale (0.5 / 1.0)
@@ -1078,6 +1081,21 @@ HALT
 			debugUI.text("Render pipeline: UNAVAILABLE (no frame is being drawn)");
 		}
 		debugUI.text("Mode: {} (F9)", hybridRT ? "Hybrid RT" : "Raster");
+		// Reflection quality/performance: the temporal accumulation in front of the denoiser is
+		// what lets a low ray budget stay clean, so it is worth an A/B switch plus the mean
+		// trace time it was bought with. Turn accumulation off and the same ray count is
+		// visibly noisier; keep it on and the ray count can drop for the same noise.
+		{
+			bool accum = rayTracing.temporalAccum();
+			if (debugUI.checkbox("Reflection Temporal Accum", &accum)) rayTracing.setTemporalAccum(accum);
+			// Floor of the ray budget once the pixel's history has converged; 1.0 turns the
+			// temporal budgeting off (every pixel pays the full lobe-width budget).
+			static F32 minRaysFraction = 0.35f;
+			if (debugUI.sliderFloat("Reflection Min Rays (converged)", &minRaysFraction, 0.1f, 1.0f)) {
+				rtMinRaysFraction = minRaysFraction;
+			}
+			debugUI.text("RT trace: {:.2f} ms (mean)", rayTracing.averageTraceMs());
+		}
 		// ---- Cascaded shadows: quality and bias -------------------------------
 		// Four knobs, because the right values depend on the scene's scale and on how
 		// much the shadow map is stretched over the cascades: the PCF radius sets the
@@ -1831,6 +1849,7 @@ HALT
 				frame.rtConstants.maxBounces = rtMaxBounces;
 				frame.rtConstants.bounceRoughness = rtBounceRoughness;
 				frame.rtConstants.reflectionSamples = rtReflectionSamples;
+	frame.rtConstants.reflectionMinRays = rtMinRaysFraction;
 				frame.rtConstants.reflectionCone = rtReflectionCone;
 				frame.rtConstants.reflectionShadowPCF = rtReflectionShadowPCF;
 				// One pixel's angular size: seeds the reflection ray cone whose
