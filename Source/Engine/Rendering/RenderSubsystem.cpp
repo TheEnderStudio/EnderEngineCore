@@ -4,6 +4,7 @@
 #include <Rendering/Errors.hpp>
 #include <Rendering/RenderEvents.hpp>
 #include <Rendering/ShadowSubsystem.hpp>
+#include <Rendering/TangentSpace.hpp>
 #include <Resource/ResourcesManager.hpp>
 #include <Utilities/ImageLoader.hpp>
 
@@ -86,6 +87,7 @@ struct VSOut
     float3 WP  : TEXCOORD0;
     float3 N   : TEXCOORD1;
     float2 UV  : TEXCOORD2;
+    float4 T   : TEXCOORD3;   // xyz = tangent, w = handedness
 };
 
 VSOut main(VSIn i)
@@ -94,7 +96,11 @@ VSOut main(VSIn i)
     float4 worldPos = mul(g_World, float4(i.Pos, 1.0));
     o.WP = worldPos.xyz;
     o.Pos = mul(g_ViewProj, worldPos);
-    o.N = normalize(mul((float3x3)g_Normal, i.Nrm));
+    const float3x3 nrmMat = (float3x3)g_Normal;
+    o.N = normalize(mul(nrmMat, i.Nrm));
+    // The tangent is a direction too, so it goes through the same normal matrix; a mirrored
+    // (negative determinant) transform flips the handedness with it.
+    o.T = float4(mul(nrmMat, i.Tan.xyz), i.Tan.w * (determinant(nrmMat) < 0.0 ? -1.0 : 1.0));
     o.UV = i.UV;
     return o;
 }
@@ -109,7 +115,7 @@ struct VSIn {
     float3 Pos : ATTRIB0; float3 Nrm : ATTRIB1; float2 UV : ATTRIB2; float4 Tan : ATTRIB3;
     float4 IW0 : ATTRIB4; float4 IW1 : ATTRIB5; float4 IW2 : ATTRIB6; float4 IW3 : ATTRIB7;
 };
-struct VSOut { float4 Pos : SV_POSITION; float3 WP : TEXCOORD0; float3 N : TEXCOORD1; float2 UV : TEXCOORD2; };
+struct VSOut { float4 Pos : SV_POSITION; float3 WP : TEXCOORD0; float3 N : TEXCOORD1; float2 UV : TEXCOORD2; float4 T : TEXCOORD3; };
 VSOut main(VSIn i) {
     VSOut o;
     // HLSL float4x4{} treats args as rows. IW0-3 = glm columns.
@@ -119,7 +125,11 @@ VSOut main(VSIn i) {
     float4 worldPos = mul(iw, float4(i.Pos, 1));
     o.WP = worldPos.xyz;
     o.Pos = mul(g_ViewProj, worldPos);
-    o.N = normalize(mul((float3x3)iw, i.Nrm));
+    const float3x3 iw3 = (float3x3)iw;
+    o.N = normalize(mul(iw3, i.Nrm));
+    // The pixel shader's TBN needs the tangent as well; a mirrored instance matrix flips
+    // the handedness with it (see the forward vertex shader).
+    o.T = float4(mul(iw3, i.Tan.xyz), i.Tan.w * (determinant(iw3) < 0.0 ? -1.0 : 1.0));
     o.UV = i.UV;
     return o;
 }
@@ -132,7 +142,7 @@ cbuffer Object : register(b2) { float4x4 g_World; float4x4 g_Normal; float4 g_Ba
 StructuredBuffer<float4x4> g_WorldMatrices : register(t5);
 StructuredBuffer<uint> g_Indices : register(t6);
 struct VSIn { float3 Pos : ATTRIB0; float3 Nrm : ATTRIB1; float2 UV : ATTRIB2; float4 Tan : ATTRIB3; };
-struct VSOut { float4 Pos : SV_POSITION; float3 WP : TEXCOORD0; float3 N : TEXCOORD1; float2 UV : TEXCOORD2; };
+struct VSOut { float4 Pos : SV_POSITION; float3 WP : TEXCOORD0; float3 N : TEXCOORD1; float2 UV : TEXCOORD2; float4 T : TEXCOORD3; };
 VSOut main(VSIn i, uint instID : SV_InstanceID) {
     VSOut o;
     uint origIdx = g_Indices[instID];
@@ -140,7 +150,11 @@ VSOut main(VSIn i, uint instID : SV_InstanceID) {
     float4 worldPos = mul(iw, float4(i.Pos, 1));
     o.WP = worldPos.xyz;
     o.Pos = mul(g_ViewProj, worldPos);
-    o.N = normalize(mul((float3x3)iw, i.Nrm));
+    const float3x3 iw3 = (float3x3)iw;
+    o.N = normalize(mul(iw3, i.Nrm));
+    // The pixel shader's TBN needs the tangent as well; a mirrored instance matrix flips
+    // the handedness with it (see the forward vertex shader).
+    o.T = float4(mul(iw3, i.Tan.xyz), i.Tan.w * (determinant(iw3) < 0.0 ? -1.0 : 1.0));
     o.UV = i.UV;
     return o;
 }
@@ -362,6 +376,7 @@ struct PSIn
     float3 WP  : TEXCOORD0;
     float3 N   : TEXCOORD1;
     float2 UV  : TEXCOORD2;
+    float4 T   : TEXCOORD3;   // xyz = tangent, w = handedness
 };
 
 // ---------------------------------------------------------------------------
@@ -606,27 +621,27 @@ float3 DoLight(float3 wp, float3 N, float3 V, float3 bc, float m, float r, float
     return col;
 }
 
-// Normal mapping from the sampled tangent-space normal.
+// Normal mapping from the sampled tangent-space normal, using the mesh's own tangent.
 //
-// The tangent frame is built from screen-space derivatives (a cotangent frame)
-// rather than from the mesh's TANGENT attribute, so the sign that converts the
-// asset's tangent-space convention into this frame is not derivable from the asset
-// alone: it comes from g_NMSign, which the DebugUI exposes live ("NM Flip X/Y").
-// The mesh shader path (MeshShaderSubsystem) carries the same note.
-float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
-    float3 dp1 = ddx(wp);
-    float3 dp2 = ddy(wp);
-    float2 duv1 = ddx(uv);
-    float2 duv2 = ddy(uv);
-    float3 dp2perp = cross(dp2, N);
-    float3 dp1perp = cross(N, dp1);
-    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
-    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
-    // Epsilon: degenerate UVs give a zero frame and rsqrt(0) would make the normal
-    // NaN, which renders as black.
-    float invmax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
-    float3 n = sampledNormal * g_NMSign.xyz;
-    return normalize(mul(n, float3x3(T * invmax, B * invmax, N)));
+// The frame used to be rebuilt from screen-space derivatives, which has no defined
+// handedness: the sign that maps the asset's tangent space into it had to be guessed per
+// asset (the "NM Flip X/Y" knobs). With a per-vertex tangent - read from the glTF
+// TANGENT_0 attribute, or generated from the UV layout when the asset has none - the
+// frame is the asset's own, so mirrored UVs, back faces and grazing angles are all
+// correct without a switch.
+float3 NormalMapped(float3 N, float3 tangent, float handedness, float3 sampledNormal) {
+    // The interpolation does not preserve orthogonality, so re-orthogonalize (Gram-Schmidt)
+    // exactly like the tangent generator does per vertex.
+    float3 T = tangent - N * dot(N, tangent);
+    const float len2 = dot(T, T);
+    // Degenerate input (no UVs, or a tangent parallel to the normal): any perpendicular
+    // direction keeps the frame non-singular instead of producing NaN.
+    if (len2 < 1e-8)
+        T = normalize(cross(abs(N.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0), N));
+    else
+        T *= rsqrt(len2);
+    const float3 B = cross(N, T) * (handedness < 0.0 ? -1.0 : 1.0);
+    return normalize(T * sampledNormal.x + B * sampledNormal.y + N * sampledNormal.z);
 }
 
 float4 main(PSIn i) : SV_TARGET
@@ -646,10 +661,9 @@ float4 main(PSIn i) : SV_TARGET
 
     float3 N = normalize(i.N);
     if (g_MapFlags.x > 0.5) {
-        // Decode the texel to tangent space, then rotate it into the frame the
-        // derivative-built tangent/bitangent spans.
+        // Decode the texel to tangent space, then rotate it into the mesh's own frame.
         float3 sn = t_NormalMap.Sample(t_BC_sampler, i.UV).xyz * 2.0 - 1.0;
-        N = NormalMapped(N, i.WP, i.UV, sn);
+        N = NormalMapped(N, i.T.xyz, i.T.w, sn);
     }
 
     float3 V = normalize(g_CameraPos.xyz - i.WP);
@@ -766,6 +780,7 @@ struct PSIn
     float3 WP  : TEXCOORD0;
     float3 N   : TEXCOORD1;
     float2 UV  : TEXCOORD2;
+    float4 T   : TEXCOORD3;   // xyz = tangent, w = handedness (from the shared vertex shader)
 };
 
 struct PSOut
@@ -775,20 +790,16 @@ struct PSOut
     float4 Emis  : SV_Target2; ///< Emissive in rgb, metallic in alpha (RGBA16_FLOAT).
 };
 
-// Same note as in the forward shader: the sign belongs to the derivative-built
-// tangent frame, not to the asset, and comes from g_NMSign at run time.
-float3 NormalMapped(float3 N, float3 wp, float2 uv, float3 sampledNormal) {
-    float3 dp1 = ddx(wp);
-    float3 dp2 = ddy(wp);
-    float2 duv1 = ddx(uv);
-    float2 duv2 = ddy(uv);
-    float3 dp2perp = cross(dp2, N);
-    float3 dp1perp = cross(N, dp1);
-    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
-    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
-    float invmax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
-    float3 n = sampledNormal * g_NMSign.xyz;
-    return normalize(mul(n, float3x3(T * invmax, B * invmax, N)));
+// Same frame as the forward shader: the mesh's own tangent, no sign knobs.
+float3 NormalMapped(float3 N, float3 tangent, float handedness, float3 sampledNormal) {
+    float3 T = tangent - N * dot(N, tangent);
+    const float len2 = dot(T, T);
+    if (len2 < 1e-8)
+        T = normalize(cross(abs(N.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0), N));
+    else
+        T *= rsqrt(len2);
+    const float3 B = cross(N, T) * (handedness < 0.0 ? -1.0 : 1.0);
+    return normalize(T * sampledNormal.x + B * sampledNormal.y + N * sampledNormal.z);
 }
 
 PSOut main(PSIn i)
@@ -811,7 +822,7 @@ PSOut main(PSIn i)
     float3 N = normalize(i.N);
     if (g_MapFlags.x > 0.5) {
         float3 sn = t_NormalMap.Sample(t_BC_sampler, i.UV).xyz * 2.0 - 1.0;
-        N = NormalMapped(N, i.WP, i.UV, sn);
+        N = NormalMapped(N, i.T.xyz, i.T.w, sn);
     }
     // The hybrid path takes its shading from the ray trace, but it reads three things
     // from here: the reflection lobe's roughness (the normal target's alpha), the
@@ -2663,14 +2674,23 @@ static Vec4 objectMetallicRough(const MaterialDesc& d, bool useOrmAsAo, F32 aoOv
 				auto tcIt = prim.findAttribute("TEXCOORD_0");
 				if (tcIt != prim.attributes.end()) { auto& acc = asset.accessors[tcIt->accessorIndex]; fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec2>(asset, acc, [&](fastgltf::math::fvec2 t, size_t j) { uv[(UInt32)j] = Vec2(t.x(), t.y()); }); }
 				ETrace("  Prim[{}]: {}v {}i uvs={}", pi, vc, prim.indicesAccessor.has_value() ? "indexed" : "none", tcIt != prim.attributes.end() ? "yes" : "no");
-				// glTF TANGENT_0 is optional. The shaders currently build their tangent
-				// frame from screen-space derivatives, but the attribute is carried
-				// through (rather than the dummy (1,0,0,1) every vertex used to get) so
-				// it can be used - and so the mesh round-trips - once the frames switch
-				// to the asset's tangent, which is what the spec defines.
+				// TANGENT_0 is optional. When the asset ships it, it *defines* the tangent
+				// space (glTF's convention, MikkTSpace-compatible) and is used as-is; when it
+				// is missing, one is generated from the UV layout here, per primitive. Either
+				// way the shaders get real per-vertex tangents, which is what removes the
+				// screen-space-derivative TBN and its per-asset sign guesses.
 				Vector<Vec4> tan(vc, Vec4(1, 0, 0, 1));
 				auto tanIt = prim.findAttribute("TANGENT");
-				if (tanIt != prim.attributes.end()) { auto& acc = asset.accessors[tanIt->accessorIndex]; fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec4>(asset, acc, [&](fastgltf::math::fvec4 t, size_t j) { tan[(UInt32)j] = Vec4(t.x(), t.y(), t.z(), t.w()); }); }
+				if (tanIt != prim.attributes.end()) {
+					auto& acc = asset.accessors[tanIt->accessorIndex];
+					fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec4>(asset, acc, [&](fastgltf::math::fvec4 t, size_t j) { tan[(UInt32)j] = Vec4(t.x(), t.y(), t.z(), t.w()); });
+				}
+				else if (tcIt != prim.attributes.end()) {
+					Vector<UInt32> primIndices;
+					if (prim.indicesAccessor.has_value()) readIndices(asset, asset.accessors[prim.indicesAccessor.value()], primIndices, 0);
+					generateTangents(pos, nrm, uv, primIndices, tan);
+					ETrace("  Prim[{}]: generated {} tangent(s) from the UV layout", pi, tan.size());
+				}
 				UInt32 base = (UInt32)allVerts.size();
 				for (UInt32 v = 0; v < vc; ++v) { allVerts.push_back({ pos[v], nrm[v], uv[v], tan[v] }); }
 				if (prim.indicesAccessor.has_value()) readIndices(asset, asset.accessors[prim.indicesAccessor.value()], allIdx, base);
