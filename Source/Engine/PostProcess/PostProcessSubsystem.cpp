@@ -1,4 +1,4 @@
-﻿#include <PostProcess/PostProcessSubsystem.hpp>
+#include <PostProcess/PostProcessSubsystem.hpp>
 #include <Core/Log.hpp>
 
 #include <DiligentCore/Graphics/GraphicsEngine/interface/RenderDevice.h>
@@ -24,13 +24,23 @@ VSOut main(uint vid : SV_VertexID) {
 
 static const char* g_ToneMapPS = R"(
 Texture2D g_HDR : register(t0); Texture2D g_Bloom : register(t1); SamplerState g_HDR_sampler : register(s0);
-cbuffer PP : register(b0) { uint g_Mode; float g_Exp; float g_Gamma; float g_Vig; float g_Sat; float g_Contrast; float g_BloomI; float g_BloomT; float g_BloomR; };
+// Volumetric scattering: rgb = in-scattering, a = transmittance (Rendering::VolumetricSubsystem).
+Texture2D g_Fog : register(t2);
+cbuffer PP : register(b0) { uint g_Mode; float g_Exp; float g_Gamma; float g_Vig; float g_Sat; float g_Contrast; float g_BloomI; float g_BloomT; float g_BloomR; float4 g_FogParams; };
 float3 Reinhard(float3 c) { return c/(1.0+c); }
 float3 Uncharted2(float3 c) { float3 a=c*(c*0.15+0.025)+0.004; float3 b=c*(c*0.15+0.5)+1.0; return a/b; }
 float3 ACES(float3 c) { float3 a=c*(c*2.51+0.03); float3 b=c*(c*2.43+0.59)+0.14; return saturate(a/b); }
 struct PSIn { float4 Pos : SV_POSITION; float2 UV : TEXCOORD0; };
 float4 main(PSIn i) : SV_TARGET {
-    float3 c = g_HDR.Sample(g_HDR_sampler,i.UV).rgb*g_Exp + g_Bloom.Sample(g_HDR_sampler,i.UV).rgb*g_BloomI;
+    // Fog first, bloom second: the scattering is part of the scene's radiance, so the
+    // scene behind it is attenuated and the in-scattered light is added before the bloom
+    // contribution (which was already computed from the unfogged HDR target).
+    float3 scene = g_HDR.Sample(g_HDR_sampler,i.UV).rgb*g_Exp;
+    if (g_FogParams.x > 0.5) {
+        const float4 fog = g_Fog.Sample(g_HDR_sampler, i.UV);
+        scene = scene * fog.a + fog.rgb;
+    }
+    float3 c = scene + g_Bloom.Sample(g_HDR_sampler,i.UV).rgb*g_BloomI;
     if(g_Mode==1)c=Reinhard(c);else if(g_Mode==2)c=Uncharted2(c);else if(g_Mode==3)c=ACES(c);
     float lum=dot(c,float3(0.299,0.587,0.114)); c=lerp(float3(lum,lum,lum),c,g_Sat);
     c = (c - 0.5) * g_Contrast + 0.5;
@@ -77,6 +87,9 @@ struct PostProcessSubsystem::Impl {
 	D::RefCntAutoPtr<D::IPipelineState> psoTM, psoBright, psoBlur;
 	D::RefCntAutoPtr<D::IShaderResourceBinding> srbTM, srbBright, srbBlur;
 	D::RefCntAutoPtr<D::IBuffer>        cbTM, cbBloom, cbBlur;
+	/// Volumetric scattering input for the composite (rgb = in-scattering, a = transmittance).
+	D::ITextureView* fogSRV = nullptr;
+	bool fogEnabled = false;
 
 	UInt32 w=0, h=0; PostProcessConfig cfg; bool ok=false;
 
@@ -106,14 +119,23 @@ struct PostProcessSubsystem::Impl {
 		{	const char* psSrc = cfg.customShader.empty() ? g_ToneMapPS : cfg.customShader.c_str();
 		const char* psName = cfg.customShader.empty() ? "ToneMapPS" : "CustomPS";
 		auto ps = mkShader(psSrc, D::SHADER_TYPE_PIXEL, psName);
-			D::ShaderResourceVariableDesc vv[] = {{D::SHADER_TYPE_PIXEL,"g_HDR",D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},{D::SHADER_TYPE_PIXEL,"g_Bloom",D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE}};
+			// Every per-frame texture has to be listed MUTABLE: the layout's default is STATIC
+		// (basePSO), and a STATIC variable is owned by the PSO, so GetVariableByName() does
+		// not return it and the Set() in execute() silently does nothing - Diligent then
+		// reports "No resource is bound to variable 'g_Fog'" at every draw. The custom
+		// shader variant keeps the same list, so it is safe to declare all three.
+		D::ShaderResourceVariableDesc vv[] = {
+			{D::SHADER_TYPE_PIXEL,"g_HDR",D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+			{D::SHADER_TYPE_PIXEL,"g_Bloom",D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+			{D::SHADER_TYPE_PIXEL,"g_Fog",D::SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+		};
 			D::SamplerDesc smp; smp.MinFilter=D::FILTER_TYPE_LINEAR; smp.MagFilter=D::FILTER_TYPE_LINEAR;
 			D::ImmutableSamplerDesc im[] = {{D::SHADER_TYPE_PIXEL,"g_HDR",smp}};
 			psoTM.Release();
 		auto ci = basePSO("ToneMapPSO",vs,ps,EE_ARRAY_SIZE(vv),vv,im,EE_ARRAY_SIZE(im));
 			dev->CreateGraphicsPipelineState(ci, &psoTM);
 			if (!psoTM) { EError("Failed to create ToneMap PSO"); return; }
-			D::BufferDesc bd; bd.Name="ppCB"; bd.Size=48; bd.BindFlags=D::BIND_UNIFORM_BUFFER; bd.Usage=D::USAGE_DYNAMIC; bd.CPUAccessFlags=D::CPU_ACCESS_WRITE;
+			D::BufferDesc bd; bd.Name="ppCB"; bd.Size=64; bd.BindFlags=D::BIND_UNIFORM_BUFFER; bd.Usage=D::USAGE_DYNAMIC; bd.CPUAccessFlags=D::CPU_ACCESS_WRITE;
 			cbTM.Release();
 		dev->CreateBuffer(bd,nullptr,&cbTM);
 			auto* sv = psoTM->GetStaticVariableByName(D::SHADER_TYPE_PIXEL,"PP");
@@ -224,12 +246,28 @@ void PostProcessSubsystem::resize(UInt32 ww, UInt32 wh) {
 void PostProcessSubsystem::execute() {
 	auto&p=*m_impl; if(!p.ok||!p.hdrRTV) return;
 	auto* rtvP = p.sc->GetCurrentBackBufferRTV();
+	// Volumetric scattering is composited in the tone-mapping shader, so it has to be bound
+	// on every path through this function - including the post-processing-disabled
+	// passthrough below, which otherwise draws with the variable unbound and makes Diligent
+	// report "No resource is bound to variable 'g_Fog'" every frame. When volumes are off the
+	// flag in the CB is 0 and the shader never samples it, so the HDR colour serves as the
+	// stand-in binding.
+	// The stand-in has to be *single-sample*: g_Fog is declared as Texture2D, and with MSAA on
+	// the HDR texture's own SRV is multisampled, which Diligent rejects at bind time
+	// ("single-sample texture is expected"). The resolved HDR target is the right fallback.
+	if (auto* pv = p.srbTM ? p.srbTM->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_Fog") : nullptr) {
+		// With MSAA the resolved target is the only single-sample view; if it is not there yet
+		// the bind is skipped rather than handing Diligent a multisampled view.
+		D::ITextureView* fallback = p.cfg.sampleCount > 1 ? p.resSRV.RawPtr() : p.hdrSRV;
+		D::ITextureView* fog = (p.fogEnabled && p.fogSRV) ? p.fogSRV : fallback;
+		if (fog) pv->Set(fog, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
+	}
 	if(!p.cfg.enabled) {
 		// Passthrough: copy HDR target to swap chain without effects
 		p.ctx->SetRenderTargets(1, &rtvP, nullptr, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		p.ctx->SetPipelineState(p.psoTM);
 		{ void*m=nullptr; p.ctx->MapBuffer(p.cbTM, D::MAP_WRITE, D::MAP_FLAG_DISCARD, m);
-		  if(m){float b[12]={0,1.0f,2.2f,0,1.0f,1.0f,0,0,0,0,0,0}; memcpy(m,b,48); p.ctx->UnmapBuffer(p.cbTM, D::MAP_WRITE);} }
+		  if(m){float b[16]={0,1.0f,2.2f,0,1.0f,1.0f,0,0,0,0,0,0,0,0,0,0}; memcpy(m,b,64); p.ctx->UnmapBuffer(p.cbTM, D::MAP_WRITE);} }
 	p.ctx->CommitShaderResources(p.srbTM, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	D::DrawAttribs da; da.NumVertices=3; da.Flags=D::DRAW_FLAG_VERIFY_ALL; p.ctx->Draw(da);
 		return;
@@ -252,12 +290,18 @@ void PostProcessSubsystem::execute() {
 		pv = p.srbBright->GetVariableByName(D::SHADER_TYPE_PIXEL, "g_In");
 		if (pv) pv->Set(p.resSRV, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	}
+
 	p.exeBloom();
 	{ void*m=nullptr; p.ctx->MapBuffer(p.cbTM,D::MAP_WRITE,D::MAP_FLAG_DISCARD,m);
-		if(m){float b[12]={(float)(UInt32)p.cfg.toneMap.mode,p.cfg.toneMap.exposure,p.cfg.toneMap.gamma,p.cfg.toneMap.vignette,p.cfg.toneMap.saturation,p.cfg.toneMap.contrast,p.cfg.bloom.intensity,p.cfg.bloom.threshold,p.cfg.bloom.radius,0,0,0}; memcpy(m,b,48); p.ctx->UnmapBuffer(p.cbTM,D::MAP_WRITE);} }
+		if(m){float b[16]={(float)(UInt32)p.cfg.toneMap.mode,p.cfg.toneMap.exposure,p.cfg.toneMap.gamma,p.cfg.toneMap.vignette,p.cfg.toneMap.saturation,p.cfg.toneMap.contrast,p.cfg.bloom.intensity,p.cfg.bloom.threshold,p.cfg.bloom.radius,0,0,0,(p.fogEnabled?1.0f:0.0f),0,0,0}; memcpy(m,b,64); p.ctx->UnmapBuffer(p.cbTM,D::MAP_WRITE);} }
 	p.ctx->SetRenderTargets(1,&rtvP,nullptr,D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	p.ctx->SetPipelineState(p.psoTM); p.ctx->CommitShaderResources(p.srbTM,D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	D::DrawAttribs da; da.NumVertices=3; da.Flags=D::DRAW_FLAG_VERIFY_ALL; p.ctx->Draw(da);
+}
+
+void PostProcessSubsystem::setFogInput(void* scatteringSRV, bool enabled) {
+	m_impl->fogSRV = enabled ? static_cast<D::ITextureView*>(scatteringSRV) : nullptr;
+	m_impl->fogEnabled = enabled && scatteringSRV != nullptr;
 }
 
 void PostProcessSubsystem::present() {

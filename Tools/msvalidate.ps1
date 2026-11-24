@@ -40,6 +40,12 @@ $sources = @{
         @{ name = 'g_ComposeVS';        profile = 'vs_6_5' },
         @{ name = 'g_ComposePS';        profile = 'ps_6_5' }
     )
+    'Source/Engine/Rendering/VolumetricSubsystem.cpp' = @(
+        # The depth declaration is prepended per variant (single-sample / MSAA), so the
+        # script composes the same source the runtime does.
+        @{ name = 'g_VolumetricBody';   profile = 'cs_6_5'; prefix = 'g_DepthPrologueSingle' },
+        @{ name = 'g_VolumetricBody';   profile = 'cs_6_5'; prefix = 'g_DepthPrologueMsaa'; as = 'g_VolumetricBody_MSAA' }
+    )
     'Source/Engine/Rendering/RenderSubsystem.cpp' = @(
         @{ name = 'g_VS';               profile = 'vs_6_5' },
         @{ name = 'g_VS_Inst';          profile = 'vs_6_5' },
@@ -69,8 +75,15 @@ foreach ($rel in $sources.Keys) {
         $count++
         $m = [regex]::Match($src, 'static const char\* ' + $t.name + ' = R"\((?s)(.*?)\)";')
         if (-not $m.Success) { Write-Host ("MISSING  {0}" -f $t.name) -ForegroundColor Red; $fail++; continue }
-        $file = Join-Path $tmp ($t.name + '.hlsl')
-        Set-Content -Path $file -Value $m.Groups[1].Value -Encoding UTF8 -NoNewline
+        $shaderText = $m.Groups[1].Value
+        if ($t.prefix) {
+            $pm = [regex]::Match($src, 'static const char\* ' + $t.prefix + ' = R"\((?s)(.*?)\)";')
+            if (-not $pm.Success) { Write-Host ("MISSING  {0}" -f $t.prefix) -ForegroundColor Red; $fail++; continue }
+            $shaderText = $pm.Groups[1].Value + $shaderText
+        }
+        $label = if ($t.as) { $t.as } else { $t.name }
+        $file = Join-Path $tmp ($label + '.hlsl')
+        Set-Content -Path $file -Value $shaderText -Encoding UTF8 -NoNewline
         $entry = if ($t.entry) { $t.entry } else { 'main' }
         # Run dxc through cmd: PowerShell turns a native command's stderr into a
         # terminating error under ErrorActionPreference=Stop, which used to abort the
@@ -80,17 +93,17 @@ foreach ($rel in $sources.Keys) {
         $out = cmd /c $cmd
         $code = $LASTEXITCODE
         if ($code -ne 0) {
-            Write-Host ("FAIL     {0} ({1})" -f $t.name, $t.profile) -ForegroundColor Red
+            Write-Host ("FAIL     {0} ({1})" -f $label, $t.profile) -ForegroundColor Red
             $out | ForEach-Object { Write-Host "         $_" }
             $fail++
         } elseif ($out -match 'warning') {
             # Valid, but worth surfacing: they are the hints that a shader is doing
             # something implicitly (vector truncation, uninitialised value, ...).
             $warn++
-            Write-Host ("ok(warn) {0} ({1})" -f $t.name, $t.profile) -ForegroundColor Yellow
+            Write-Host ("ok(warn) {0} ({1})" -f $label, $t.profile) -ForegroundColor Yellow
             $out | Where-Object { $_ -match 'warning' } | ForEach-Object { Write-Host "         $_" -ForegroundColor DarkYellow }
         } else {
-            Write-Host ("ok       {0} ({1})" -f $t.name, $t.profile) -ForegroundColor Green
+            Write-Host ("ok       {0} ({1})" -f $label, $t.profile) -ForegroundColor Green
         }
     }
 }

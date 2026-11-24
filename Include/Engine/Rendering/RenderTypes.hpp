@@ -231,6 +231,28 @@ struct ShadowConfig {
 	F32   casterExtension = 15.0f;
 };
 
+/**
+ * @brief Volumetric fog parameters (see Rendering::VolumetricSubsystem).
+ *
+ * The medium is an exponential height fog: the extinction at a world height y is
+ * density * exp(-(y - baseHeight) / heightScale). The march then accumulates single
+ * scattering with a Henyey-Greenstein phase function and the sun's shadow visibility, which
+ * is what turns the shadow map into visible shafts.
+ */
+struct VolumetricConfig {
+	bool  enabled      = false;
+	F32   density      = 0.02f;   ///< Extinction at baseHeight (1 / world unit).
+	F32   baseHeight   = 0.0f;    ///< Height at which the medium has full density.
+	F32   heightScale  = 12.0f;   ///< e-folding height of the density falloff (world units).
+	F32   anisotropy   = 0.6f;    ///< Henyey-Greenstein g: > 0 scatters forward (sun halo).
+	F32   maxDistance  = 120.0f;  ///< Longest marched distance (sky included, as fog over sky).
+	UInt32 steps       = 24;      ///< Ray march steps (more = smoother shafts, more expensive).
+	F32   sunScattering = 1.0f;   ///< Scale of the sun's in-scattering.
+	F32   ambientScattering = 0.25f; ///< Scale of the sky irradiance in-scattering.
+	bool  sunShafts    = true;    ///< Sample the shadow map per step (off = uniform fog).
+	F32   sunIntensity = 1.0f;    ///< Multiplied into the sun colour (set by the caller each frame).
+};
+
 /// @brief Result from loading a model, containing meshes, materials and root transform.
 struct ModelLoadResult { Vector<MeshHandle> meshes; Vector<MaterialHandle> materials; Transform rootTransform; };
 

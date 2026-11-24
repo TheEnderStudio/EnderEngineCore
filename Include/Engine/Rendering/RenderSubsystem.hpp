@@ -203,6 +203,9 @@ public:
 
 	/// @brief Get the renderer's internal (MSAA) depth-stencil view.
 	TextureDSV getDepthStencil() const;
+	/// @brief Shader-resource view of the same depth texture (multisampled when MSAA is on).
+	/// Null when the depth texture cannot provide one.
+	TextureSRV getDepthSRV() const;
 
 	// -------------------------------------------------------------------
 	// G-buffer pass (for hybrid ray tracing)

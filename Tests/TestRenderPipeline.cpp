@@ -64,6 +64,7 @@ const std::vector<const char*>& allPasses() {
 	static const std::vector<const char*> names = {
 		RenderPass::Shadow, RenderPass::RtScene, RenderPass::Scene, RenderPass::GBuffer,
 		RenderPass::Resolve, RenderPass::Trace, RenderPass::Denoise, RenderPass::Compose,
+		RenderPass::Volumetric,
 		RenderPass::UiPost, RenderPass::PostExecute, RenderPass::UiLate, RenderPass::DebugUi,
 		RenderPass::Present,
 	};
@@ -141,11 +142,14 @@ TEST(RenderPipelineTest, DependenciesProduceTheExpectedLevels) {
 	EXPECT_EQ(levelOf(RenderPass::Trace), 2u);
 	EXPECT_EQ(levelOf(RenderPass::Denoise), 3u);
 	EXPECT_EQ(levelOf(RenderPass::Compose), 4u);
-	EXPECT_EQ(levelOf(RenderPass::UiPost), 5u);
-	EXPECT_EQ(levelOf(RenderPass::PostExecute), 6u);
-	EXPECT_EQ(levelOf(RenderPass::UiLate), 7u);
-	EXPECT_EQ(levelOf(RenderPass::DebugUi), 8u);
-	EXPECT_EQ(levelOf(RenderPass::Present), 9u);
+	// The volumetric pass waits for the raster scene *or* the hybrid compose, so it lands one
+	// level above the later of the two rather than in the chain above.
+	EXPECT_EQ(levelOf(RenderPass::Volumetric), 5u);
+	EXPECT_EQ(levelOf(RenderPass::UiPost), 6u);
+	EXPECT_EQ(levelOf(RenderPass::PostExecute), 7u);
+	EXPECT_EQ(levelOf(RenderPass::UiLate), 8u);
+	EXPECT_EQ(levelOf(RenderPass::DebugUi), 9u);
+	EXPECT_EQ(levelOf(RenderPass::Present), 10u);
 
 	EXPECT_EQ(pipeline.lastRunStats().levelCount, 0u) << "nothing has run yet";
 }

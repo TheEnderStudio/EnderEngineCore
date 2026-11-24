@@ -25,6 +25,7 @@
 #include <Engine/Rendering/DenoisingSubsystem.hpp>
 #include <Engine/Rendering/MeshShaderSubsystem.hpp>
 #include <Engine/Rendering/RenderPipeline.hpp>
+#include <Engine/Rendering/VolumetricSubsystem.hpp>
 
 #include <HelloWorld/HelloWorldExt.hpp>
 #include <EngineExt/AdaptiveMusic.hpp>
@@ -345,9 +346,15 @@ float4 main(PSIn i) : SV_TARGET {
 
 	// --- Shadows ---
 	ShadowSubsystem shadow;
+	VolumetricSubsystem volumetric;
 	shadow.attachToRenderer(&renderer);
 	shadow.setConfig(ShadowConfig{ .enabled = true, .resolution = 8192, .numCascades = 4, .partitioning = 0.95f });
 	shadow.initialize();
+	// V1 of the volumetric plan: single-scattering height fog with shadowed sun shafts.
+	// Starts disabled; the DebugUI section below owns the parameters.
+	volumetric.attachToRenderer(&renderer);
+	volumetric.setConfig(VolumetricConfig{ .enabled = false });
+	volumetric.initialize();
 
 	// --- Compute ---
 	ComputeSubsystem compute;
@@ -504,6 +511,7 @@ float4 main(PSIn i) : SV_TARGET {
 		rpContext.meshShader = &meshShader;
 		rpContext.rayTracing = &rayTracing;
 		rpContext.denoising = &denoising;
+		rpContext.volumetric = &volumetric;
 		rpContext.postProcess = &postProcess;
 		rpContext.ui = &ui;
 		rpContext.debugUI = &debugUI;
@@ -1110,6 +1118,41 @@ HALT
 				shadow.setCasterExtension(extension);
 			}
 		}
+		// ---- Volumetric fog (V1: height fog + shadowed sun shafts) --------------
+		// The medium is an exponential height fog; the sun's in-scattering is shadowed by the
+		// cascade map, which is what turns the shadow silhouettes into visible shafts. The
+		// composite happens in the post-process chain, so it applies to both render modes.
+		{
+			VolumetricConfig vc = volumetric.config();
+			bool changed = false;
+			if (debugUI.checkbox("Volumetric Fog", &vc.enabled)) changed = true;
+			changed |= debugUI.sliderFloat("Fog Density", &vc.density, 0.0f, 0.2f);
+			changed |= debugUI.sliderFloat("Fog Height Scale", &vc.heightScale, 1.0f, 60.0f);
+			changed |= debugUI.sliderFloat("Fog Base Height", &vc.baseHeight, -40.0f, 40.0f);
+			changed |= debugUI.sliderFloat("Fog Anisotropy", &vc.anisotropy, -0.9f, 0.9f);
+			changed |= debugUI.sliderFloat("Fog Distance", &vc.maxDistance, 10.0f, 400.0f);
+			changed |= debugUI.sliderFloat("Fog Sun", &vc.sunScattering, 0.0f, 4.0f);
+			changed |= debugUI.sliderFloat("Fog Ambient", &vc.ambientScattering, 0.0f, 2.0f);
+			float stepsF = (float)vc.steps;
+			if (debugUI.sliderFloat("Fog Steps", &stepsF, 4.0f, 96.0f)) { vc.steps = (UInt32)(stepsF + 0.5f); changed = true; }
+			if (debugUI.checkbox("Fog Sun Shafts", &vc.sunShafts)) changed = true;
+			if (debugUI.button("Reset fog")) {
+				vc = VolumetricConfig{}; vc.enabled = true;
+				changed = true;
+			}
+			if (changed) volumetric.setConfig(vc);
+			if (vc.enabled) {
+				// The state that decides whether the pass can run at all: a missing depth SRV
+				// or shadow map is the common cause of "nothing happens", and both are silent.
+				debugUI.text("Fog: {:.2f} ms | depth {} | shadow {} | target {} | msaa {}",
+					volumetric.lastRenderMs(),
+					renderer.getDepthSRV() ? "ok" : "MISSING",
+					renderer.getShadowSRV() ? "ok" : "MISSING",
+					volumetric.getScatteringSRV() ? "ok" : "MISSING",
+					(int)renderer.msaaSamples());
+			}
+		}
+
 		// Shadow debug view (raster only): 1 = the shadow term itself, 2 = which cascade the
 		// pixel landed in, 3 = the shadow map UV/depth used for the lookup. A surface that
 		// lost its shadow is white in mode 1; the other two modes say why.
@@ -1775,7 +1818,9 @@ HALT
 			// Fog cloud around the camera.
 			{
 				if (st.wasKeyPressedThisFrame(KeyCode::Num1)) { fogEnabled = !fogEnabled; EInfo("Fog: {}", fogEnabled ? "ON" : "OFF"); }
-				if (fogEnabled && !hybridRT) {
+				// The 240 billboard quads were the old stand-in for fog; the volumetric medium replaces
+		// them when it is on, so the two never stack up.
+		if (fogEnabled && !hybridRT && !volumetric.config().enabled) {
 					static constexpr int N = 240;
 					static Vector<RenderSubsystem::BillboardDesc> fogs(N);
 					F32 t = (F32)(gameTick * 0.015);

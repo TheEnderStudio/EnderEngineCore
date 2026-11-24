@@ -10,6 +10,7 @@
 #include <Engine/Rendering/MeshShaderSubsystem.hpp>
 #include <Engine/Rendering/RayTracingSubsystem.hpp>
 #include <Engine/Rendering/DenoisingSubsystem.hpp>
+#include <Engine/Rendering/VolumetricSubsystem.hpp>
 #include <Engine/PostProcess/PostProcessSubsystem.hpp>
 #include <Engine/Rendering/DebugUISubsystem.hpp>
 #include <Engine/Rendering/ComputeSubsystem.hpp>
@@ -33,6 +34,7 @@ namespace RenderPass {
 	inline constexpr const char* Trace = "trace";            ///< Ray trace (hybrid).
 	inline constexpr const char* Denoise = "denoise";        ///< NRD / OIDN / temporal (hybrid).
 	inline constexpr const char* Compose = "compose";        ///< RT compose into the HDR target (hybrid).
+	inline constexpr const char* Volumetric = "volumetric";  ///< Volumetric fog scattering (both modes).
 	inline constexpr const char* UiPost = "uiPost";          ///< UI layers that receive post-processing.
 	inline constexpr const char* PostExecute = "postExecute";///< Post-processing chain.
 	inline constexpr const char* UiLate = "uiLate";          ///< UI layers drawn after post-processing.
@@ -153,6 +155,11 @@ struct RenderFrame {
 	F32 shadowAspect = 1.0f;                       ///< Cascade fitting: aspect ratio.
 	F32 shadowNear = 0.01f;                        ///< Cascade fitting: near plane.
 	F32 shadowFar = 100.0f;                        ///< Cascade fitting: far plane.
+	/// Written by the shadow pass and read by the volumetric pass: the fog's shafts have to
+	/// use the same cascade transforms the shading does, or they would not line up with the
+	/// shadows on the ground.
+	Mat4 shadowUVDepth[4] = {};
+	Vec4 shadowCascadeSplits = Vec4(0.0f);
 
 	// ------------------------------------------------------------------
 	// Hybrid ray tracing
@@ -204,6 +211,7 @@ struct RenderPipelineContext {
 	MeshShaderSubsystem* meshShader = nullptr;///< Required.
 	RayTracingSubsystem* rayTracing = nullptr;///< Required.
 	DenoisingSubsystem* denoising = nullptr;  ///< Required.
+	VolumetricSubsystem* volumetric = nullptr;///< Optional: enables the fog pass when set.
 	PostProcess::PostProcessSubsystem* postProcess = nullptr; ///< Required.
 	UI::UISubsystem* ui = nullptr;            ///< Required.
 	DebugUISubsystem* debugUI = nullptr;      ///< Required.

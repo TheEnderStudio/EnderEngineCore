@@ -47,6 +47,15 @@ public:
 	void* getHDRSRV() const;
 	/// @brief Get the HDR render target view.
 	void* getHDRRTV() const;
+	/**
+	 * @brief Volumetric scattering to composite before tone mapping.
+	 *
+	 * @param scatteringSRV rgb = in-scattering, a = transmittance (see
+	 *                      Rendering::VolumetricSubsystem::getScatteringSRV).
+	 * @param enabled       False removes the composite (the flag is uploaded per frame).
+	 */
+	void setFogInput(void* scatteringSRV, bool enabled);
+
 	/// @brief Execute the post-process pipeline.
 	void execute();
 	/// @brief Present the final result to the swap chain.

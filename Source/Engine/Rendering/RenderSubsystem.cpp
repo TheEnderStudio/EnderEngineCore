@@ -1046,6 +1046,10 @@ struct RenderSubsystem::RenderBackend {
 	D::RefCntAutoPtr<D::IDeviceContext> ctx;
 	D::RefCntAutoPtr<D::ISwapChain>     sc;
 	D::RefCntAutoPtr<D::ITextureView>   dsv;
+	/// Shader-resource view of the same depth texture, created once with it: the volumetric
+	/// fog pass reads the scene depth, and asking for a fresh view every frame was both
+	/// wasteful and occasionally came back null.
+	D::RefCntAutoPtr<D::ITextureView>   depthSRV;
 	void* wnd = nullptr;
 	UInt32 w = 1280, h = 720;
 	RenderBackendType backendType = RenderBackendType::Auto;
@@ -1372,8 +1376,9 @@ struct RenderSubsystem::RenderBackend {
 			}
 		}
 
-		D::TextureDesc td; td.Name = "Depth"; td.Type = D::RESOURCE_DIM_TEX_2D; td.Width = scd.Width; td.Height = scd.Height; td.Format = scd.DepthBufferFormat; td.BindFlags = D::BIND_DEPTH_STENCIL; td.Usage = D::USAGE_DEFAULT; td.SampleCount = msaaSamples;
-		D::RefCntAutoPtr<D::ITexture> dt; device->CreateTexture(td, nullptr, &dt); if (dt) dsv = dt->GetDefaultView(D::TEXTURE_VIEW_DEPTH_STENCIL);
+		// BIND_SHADER_RESOURCE: the volumetric pass reads the scene depth to bound its march.
+		D::TextureDesc td; td.Name = "Depth"; td.Type = D::RESOURCE_DIM_TEX_2D; td.Width = scd.Width; td.Height = scd.Height; td.Format = scd.DepthBufferFormat; td.BindFlags = D::BIND_DEPTH_STENCIL | D::BIND_SHADER_RESOURCE; td.Usage = D::USAGE_DEFAULT; td.SampleCount = msaaSamples;
+		D::RefCntAutoPtr<D::ITexture> dt; device->CreateTexture(td, nullptr, &dt); if (dt) { dsv = dt->GetDefaultView(D::TEXTURE_VIEW_DEPTH_STENCIL); depthSRV = dt->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE); }
 		return {};
 	}
 
@@ -3236,6 +3241,12 @@ Result<void, RenderError> RenderSubsystem::resolveGBufferMSAA(void* colorSRV, vo
 }
 
 TextureDSV RenderSubsystem::getDepthStencil() const { return m_backend->dsv.RawPtr(); }
+TextureSRV RenderSubsystem::getDepthSRV() const {
+	auto& b = *m_backend;
+	// Cached at creation: asking the texture for a view every frame was both wasteful and,
+	// on the MSAA depth, the reason the volumetric pass occasionally found no view at all.
+	return b.ok ? b.depthSRV.RawPtr() : nullptr;
+}
 
 void RenderSubsystem::beginGBuffer(TextureRTV colorRT, TextureRTV normalRT, TextureRTV emissiveRT, TextureDSV depthDSV) {
 	if (!m_backend->ok || !colorRT || !normalRT || !emissiveRT || !depthDSV) return;
@@ -3272,12 +3283,16 @@ void RenderSubsystem::resize(UInt32 ww, UInt32 wh) {
 	{
 		D::TextureDesc td; td.Name = "Depth"; td.Type = D::RESOURCE_DIM_TEX_2D;
 		td.Width = ww; td.Height = wh; td.Format = D::TEX_FORMAT_D32_FLOAT;
-		td.BindFlags = D::BIND_DEPTH_STENCIL; td.Usage = D::USAGE_DEFAULT;
+		// BIND_SHADER_RESOURCE has to match createSwapChainTextures(): the volumetric fog reads
+		// this depth, and a resize used to drop the flag, leaving the cached SRV null and
+		// silently disabling the pass.
+		td.BindFlags = D::BIND_DEPTH_STENCIL | D::BIND_SHADER_RESOURCE; td.Usage = D::USAGE_DEFAULT;
 		td.SampleCount = m_backend->msaaSamples;
 		D::RefCntAutoPtr<D::ITexture> dt;
 		m_backend->device->CreateTexture(td, nullptr, &dt);
 		m_backend->dsv.Release();
-		if (dt) m_backend->dsv = dt->GetDefaultView(D::TEXTURE_VIEW_DEPTH_STENCIL);
+	m_backend->depthSRV.Release();
+		if (dt) { m_backend->dsv = dt->GetDefaultView(D::TEXTURE_VIEW_DEPTH_STENCIL); m_backend->depthSRV = dt->GetDefaultView(D::TEXTURE_VIEW_SHADER_RESOURCE); }
 	}
 
 	if (m_backend->camHandle.isValid()) { auto* c = m_backend->cameras.get(m_backend->camHandle.index, m_backend->camHandle.generation); if (c) { c->aspect = (F32)ww / (F32)wh; c->desc.w = (F32)ww; c->desc.h = (F32)wh; c->proj = glm::perspective(glm::radians(c->desc.fov), c->aspect, c->desc.nearP, c->desc.farP); m_backend->cam = *c; } }

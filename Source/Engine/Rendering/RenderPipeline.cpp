@@ -1,4 +1,8 @@
 #include <Engine/Rendering/RenderPipeline.hpp>
+#include <Engine/Rendering/VolumetricSubsystem.hpp>
+#include <Engine/PostProcess/PostProcessSubsystem.hpp>
+
+#include <glm/gtc/matrix_inverse.hpp>
 #include <Engine/Core/Log.hpp>
 
 #include <DiligentCore/Graphics/GraphicsEngine/interface/RenderDevice.h>
@@ -216,6 +220,9 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 		for (UInt32 i = 0; i < 4; ++i) cascadeUV[i] = shadow.getWorldToShadowMapUVDepth(i);
 		const Vec4 splits = shadow.getCascadeSplitDistances();
 		renderer.setShadowData(cascadeUV, splits);
+		// The volumetric pass marches the same cascades, so hand it the same data.
+		for (UInt32 i = 0; i < 4; ++i) frame.shadowUVDepth[i] = cascadeUV[i];
+		frame.shadowCascadeSplits = splits;
 		// The mesh shader's pixel shader uses the forward lighting model, so it
 		// needs the same cascades.
 		c->meshShader->setShadowMap(renderer.getShadowSRV(), cascadeUV, splits);
@@ -456,6 +463,95 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 	impl->link(compose, denoise);
 
 	// ------------------------------------------------------------------
+	// volumetric - single-scattering fog (height fog + shadowed sun shafts).
+	//
+	// Runs after the pass that wrote the scene depth (the raster scene, or the hybrid
+	// compose) and hands its result to the post-process chain, which composites it as
+	// scene * transmittance + scattering right before the tone curve. It only needs the
+	// depth, the cascade shadow map and the primary light, so it is mode independent.
+	// ------------------------------------------------------------------
+	PipelineTaskId volumetric = addTask(RenderPass::Volumetric, impl->timed([this, c](const PipelineFrameContext& context) -> Result<void, CoreError> {
+		RenderFrame& frame = *static_cast<RenderFrame*>(context.payload);
+		RenderSubsystem& renderer = *c->renderer;
+		// One-shot diagnostic for the "I enabled it and nothing happened" case: say which gate
+		// stopped the pass instead of returning silently.
+		static bool loggedSkip = false;
+		if (!c->volumetric || !c->volumetric->config().enabled) {
+			if (!loggedSkip) {
+				loggedSkip = true;
+				EInfo("Volumetric: pass skipped (subsystem {}, enabled {})",
+					c->volumetric ? "present" : "missing",
+					c->volumetric ? (c->volumetric->config().enabled ? "yes" : "no") : "n/a");
+			}
+			c->postProcess->setFogInput(nullptr, false);
+			return {};
+		}
+
+		// Depth source: the hybrid path already resolves the G-buffer depth to a single
+		// sample; the raster path reads the renderer's own depth, which is multisampled
+		// when MSAA is on (the shader has a variant for that).
+		void* depthSRV = nullptr;
+		bool in_restoreDepth = false;
+		UInt32 depthSamples = renderer.msaaSamples();
+		if (frame.hybrid) {
+			if (frame.resolveDepth.isValid()) depthSRV = renderer.getTextureSRV(frame.resolveDepth);
+			else if (frame.gBufferDepth.isValid()) depthSRV = renderer.getTextureSRV(frame.gBufferDepth);
+			depthSamples = 1;
+		}
+		else {
+			depthSRV = renderer.getDepthSRV();
+			// Owned by the framebuffer: the pass has to restore it to DEPTH_WRITE afterwards.
+			in_restoreDepth = true;
+		}
+		if (!depthSRV || !renderer.getShadowSRV()) {
+			static bool loggedNoInputs = false;
+			if (!loggedNoInputs) {
+				loggedNoInputs = true;
+				EError("Volumetric: no {} available, fog disabled",
+					depthSRV ? "shadow map" : "scene depth SRV");
+			}
+			c->postProcess->setFogInput(nullptr, false);
+			return {};
+		}
+
+		VolumetricInput in{};
+		in.depthSRV = depthSRV;
+		in.depthSamples = depthSamples;
+		in.restoreDepthState = in_restoreDepth;
+		in.shadowSRV = renderer.getShadowSRV();
+		in.width = frame.width;
+		in.height = frame.height;
+		in.viewProj = frame.proj * frame.view;
+		in.viewProjInv = glm::inverse(in.viewProj);
+		in.cameraPos = frame.cameraPos;
+		in.timeSec = frame.timeSec;
+		// The sun: the volumetric pass owns the intensity scale, so take the colour and the
+		// direction from the scene's primary directional light.
+		Vec3 sunDir(0.0f, -1.0f, 0.0f);
+		Vec4 sunColor(1.0f);
+		if (!renderer.getPrimaryDirectionalLight(sunDir, sunColor)) {
+			sunDir = frame.shadowLightDir;
+			sunColor = Vec4(1.0f);
+		}
+		in.sunDir = sunDir;
+		in.sunColor = sunColor;
+		in.cascadeSplits = frame.shadowCascadeSplits;
+		for (UInt32 i = 0; i < 4; ++i) in.shadowUVDepth[i] = frame.shadowUVDepth[i];
+		renderer.getSkyboxCorners(in.skyCorners);
+		in.ambient = renderer.getAmbientLight();
+
+		const Result<void, CoreError> result = c->volumetric->render(in);
+		if (result.isErr()) return result.error();
+		c->postProcess->setFogInput(c->volumetric->getScatteringSRV(), true);
+		return {};
+	}), PipelineTaskMode::MainThread, c->renderer);
+	// One link with both: the frame runs either the raster scene or the hybrid compose, and
+	// two separate links would leave this pass waiting on the one that never ran (a real
+	// deadlock - it hung the pipeline's frame loop).
+	impl->link(volumetric, { scene, compose });
+	impl->link(compose, denoise);
+
+	// ------------------------------------------------------------------
 	// Shared tail. uiPost waits for the scene and for compose, but either may be
 	// disabled by the frame mode; a skipped dependency is not a failure, so the
 	// tail always runs.
@@ -465,7 +561,7 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 		c->ui->endFrame();
 		return {};
 	}), PipelineTaskMode::MainThread, c->ui);
-	impl->link(uiPost, { scene, compose });
+	impl->link(uiPost, { scene, compose, volumetric });
 
 	PipelineTaskId postExecute = addTask(RenderPass::PostExecute, impl->timed([c](const PipelineFrameContext&) -> Result<void, CoreError> {
 		c->postProcess->execute();
