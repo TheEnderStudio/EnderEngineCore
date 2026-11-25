@@ -118,6 +118,7 @@ struct RTConstants {
     float    ReflectionHistoryTarget; // accumulated frames at which the ray budget hits its floor
     float    ReflectionMinRays;  // floor of the ray budget as a fraction of the lobe-width budget
     float    _padWrap2;
+    float4   FogParams;          // x = density, y = base height, z = height scale, w = far distance
 };
 
 RaytracingAccelerationStructure g_TLAS            : register(t0);
@@ -358,6 +359,7 @@ struct ReflectionResult {
     float4 BaseColor;
     float  NdotL;
     float  Metallic; ///< Hit's metalness: the diffuse share of the ambient is (1 - this).
+    float  Distance; ///< Ray distance to the hit (or the far distance on a miss), for the fog.
     float3 Normal;   ///< Hit normal in world space (the irradiance is integrated over it).
     float3 Emissive; ///< Self-emission of the hit surface (not light-tinted).
     float3 Specular; ///< Direct + ambient specular of the hit surface.
@@ -438,6 +440,7 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
     res.BaseColor = float4(0, 0, 0, 0);
     res.NdotL     = 0.0;
     res.Metallic  = 0.0;
+    res.Distance  = 0.0;
     res.Normal    = float3(0, 1, 0);
     res.Emissive  = float3(0, 0, 0);
     res.Specular  = float3(0, 0, 0);
@@ -477,6 +480,7 @@ ReflectionResult Reflect(float3 Origin, float3 ReflDir, float MaxReflLen, float 
 
         res.BaseColor = Mtr.BaseColorMask * g_Textures[NonUniformResourceIndex(Mtr.BaseColorTexInd)].SampleLevel(g_Sampler, UV, texLod);
         res.Metallic  = Mtr.Metallic;
+        res.Distance  = q.CommittedRayT();
         res.Normal    = Norm;
         // Note: no roughness-based attenuation here anymore - the GGX
         // importance sampling in CSMain weights the reflected radiance by the
@@ -929,8 +933,21 @@ void CSMain(uint2 DTid : SV_DispatchThreadID)
                 rad = (g_RTConstants.EnvParams.x > 0.5)
                     ? GetSkyColorLod(L, skyLod).rgb * g_RTConstants.EnvParams.z
                     : float3(0, 0, 0);
+                refl.Distance = g_RTConstants.FogParams.w;
             }
 
+            // Aerial perspective along the reflection ray: attenuate by the height fog's
+            // transmittance over the segment, using the average altitude of the two ends. The
+            // composite applies the camera-to-surface part; this is the part behind the
+            // surface, so a reflection of a distant floor fades like the floor itself.
+            if (g_RTConstants.FogParams.x > 0.0)
+            {
+                const float3 hitPoint = (refl.Found ? (origin + L * refl.Distance) : (origin + L * g_RTConstants.FogParams.w));
+                const float yMid = 0.5 * (origin.y + hitPoint.y);
+                const float sigma = g_RTConstants.FogParams.x *
+                    exp(-(yMid - g_RTConstants.FogParams.y) / max(g_RTConstants.FogParams.z, 1e-3));
+                rad *= exp(-sigma * refl.Distance);
+            }
             acc += rad * VndfWeight(NdotV, NdotL, a);
         }
         Color = float4(acc / (float)ns, 1.0);

@@ -54,7 +54,9 @@ public:
 	 *                      Rendering::VolumetricSubsystem::getScatteringSRV).
 	 * @param enabled       False removes the composite (the flag is uploaded per frame).
 	 */
-	void setFogInput(void* scatteringSRV, bool enabled);
+	/// @param debugMode 0 composites the fog normally; 1..3 replace the image with the
+	///                  medium's own terms (in-scattering / transmittance / both).
+	void setFogInput(void* scatteringSRV, bool enabled, UInt32 debugMode = 0);
 
 	/// @brief Execute the post-process pipeline.
 	void execute();

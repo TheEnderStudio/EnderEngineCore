@@ -1,5 +1,6 @@
 #include <Engine/Rendering/RenderPipeline.hpp>
 #include <Engine/Rendering/VolumetricSubsystem.hpp>
+#include <Engine/Rendering/RenderSelfCheck.hpp>
 #include <Engine/PostProcess/PostProcessSubsystem.hpp>
 
 #include <glm/gtc/matrix_inverse.hpp>
@@ -369,6 +370,16 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 		RenderFrame& frame = *static_cast<RenderFrame*>(context.payload);
 		RenderSubsystem& renderer = *c->renderer;
 
+		// The reflection path fogs what it sees with the same medium the volumetric pass uses,
+		// so a mirrored floor fades with distance instead of staying perfectly clear. Filled
+		// here, from the task's own subsystem pointer: reading the pipeline's stored context
+		// is not safe (a caller may have passed a temporary).
+		if (c->volumetric) {
+			const VolumetricConfig& fog = c->volumetric->config();
+			frame.rtConstants.fogParams = fog.enabled
+				? Vec4(fog.density, fog.baseHeight, fog.heightScale, fog.maxDistance)
+				: Vec4(0.0f);
+		}
 		const Result<void, RenderError> result = c->rayTracing->trace(frame.rtConstants,
 			renderer.getTextureSRV(frame.sourceNormal), renderer.getTextureSRV(frame.sourceDepth),
 			renderer.getTextureSRV(frame.sourceColor),
@@ -539,10 +550,13 @@ RenderPipeline::RenderPipeline(Jobs::JobExecutor& executor, const RenderPipeline
 		for (UInt32 i = 0; i < 4; ++i) in.shadowUVDepth[i] = frame.shadowUVDepth[i];
 		renderer.getSkyboxCorners(in.skyCorners);
 		in.ambient = renderer.getAmbientLight();
+		// Local lights: the fog scatters them with the same descriptors the shading uses, so a
+		// lamp's halo sits exactly on the geometry it lights.
+		renderer.getActiveLights(in.lights, in.lightCount);
 
 		const Result<void, CoreError> result = c->volumetric->render(in);
 		if (result.isErr()) return result.error();
-		c->postProcess->setFogInput(c->volumetric->getScatteringSRV(), true);
+		c->postProcess->setFogInput(c->volumetric->getScatteringSRV(), true, c->volumetric->config().debugMode);
 		return {};
 	}), PipelineTaskMode::MainThread, c->renderer);
 	// One link with both: the frame runs either the raster scene or the hybrid compose, and
@@ -653,6 +667,7 @@ Result<void, CoreError> RenderPipeline::render(RenderFrame& frame) {
 		// Demo used 0.1) only ever affected reflected geometry and made a floor seen in a
 		// mirror darker than the very same floor seen directly.
 		frame.rtConstants.ambientLight = ambient.w;
+
 	}
 
 	PipelineFrameContext context;
@@ -671,6 +686,25 @@ Result<void, CoreError> RenderPipeline::render(RenderFrame& frame) {
 	}
 
 	const Result<void, CoreError> result = run(context);
+
+	// Startup self-check (EE_RENDER_SELF_CHECK): after the first frame every pass has bound
+	// its resources once, so this is the earliest point at which "declared but never bound"
+	// can be told apart from "not bound yet". The audit names the engine resources features
+	// depend on as well - a missing scene depth SRV, for instance, is otherwise only visible
+	// as a feature that quietly does nothing.
+	if (context.frameIndex == 0) {
+		RenderSubsystem& renderer = *m_impl->context.renderer;
+		// Only meaningful for a renderer that actually has render targets: a headless fixture
+		// (the pipeline tests) has no swap chain, and reporting its missing depth there would
+		// be noise, not a finding.
+		if (renderer.getDepthStencil() != nullptr) {
+			checkResourceAvailable("volumetric fog", "scene depth SRV", renderer.getDepthSRV());
+			checkResourceAvailable("volumetric fog", "shadow map SRV", renderer.getShadowSRV());
+		}
+	}
+	if (context.frameIndex == 1) {
+		renderSelfCheckSummary();
+	}
 	if (m_impl->gpuTiming && context.frameIndex == 240 && !m_impl->anyGpuMeasured()) {
 		// The queries exist but never became readable: say so instead of leaving a
 		// silent column of zeros in the statistics.

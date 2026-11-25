@@ -344,6 +344,34 @@ float4 main(PSIn i) : SV_TARGET {
 		auto r = renderer.createLight(sun); if (r.isOk()) sunHandle = r.value();
 	}
 
+	// A local light for testing the volumetric scattering: a point light by default, switchable
+	// to a spot, placed next to the wall and movable from the DebugUI. Without one there is
+	// nothing for a point/spot light's fog halo to come from.
+	LightHandle testLightHandle;
+	LightDesc  testLight;
+	{
+		testLight.type = LightType::Point;
+		testLight.color = Vec3(1.0f, 0.55f, 0.18f);
+		testLight.intensity = 12.0f;
+		testLight.pos = Vec3(20.0f, -16.0f, 24.0f);
+		testLight.range = 20.0f;
+		testLight.dir = Vec3(0.0f, -1.0f, 0.0f);
+		// Cone angles as cosines: innerCone must stay *above* outerCone, or the shader's
+		// (ca - outer) / (inner - outer) term inverts the falloff.
+		testLight.innerCone = cosf(glm::radians(16.0f));
+		testLight.outerCone = cosf(glm::radians(25.0f));
+		if (auto lr = renderer.createLight(testLight); lr.isOk()) testLightHandle = lr.value();
+	}
+	// State the DebugUI edits; applied to the light and its marker every frame.
+	bool testLightEnabled = true;
+	bool testLightSpot = false;
+	bool testLightOrbit = true;
+	Vec3 testLightPos = Vec3(20.0f, -16.0f, 24.0f);
+	F32  testLightIntensity = 12.0f;
+	F32  testLightRange = 20.0f;
+	F32  testLightCone = 25.0f; // outer half-angle of the spot, in degrees
+	Vec3 testLightColor = Vec3(1.0f, 0.55f, 0.18f);
+
 	// --- Shadows ---
 	ShadowSubsystem shadow;
 	VolumetricSubsystem volumetric;
@@ -1126,6 +1154,23 @@ HALT
 			VolumetricConfig vc = volumetric.config();
 			bool changed = false;
 			if (debugUI.checkbox("Volumetric Fog", &vc.enabled)) changed = true;
+			// Algorithm switch: the two backends trade cost for quality (the froxel quantises
+			// the fog to its grid, the march spends a shadow fetch per step).
+			{
+				bool froxel = vc.mode == VolumetricConfig::Mode::Froxel;
+				if (debugUI.checkbox("Fog: froxel (off = screen space)", &froxel)) {
+					vc.mode = froxel ? VolumetricConfig::Mode::Froxel : VolumetricConfig::Mode::ScreenSpace;
+					changed = true;
+				}
+			}
+			changed |= debugUI.sliderFloat("Fog Render Scale (screen space)", &vc.renderScale, 0.25f, 1.0f);
+			{
+				float slices = (float)vc.froxelSlices;
+				if (debugUI.sliderFloat("Fog Froxel Slices", &slices, 16.0f, 512.0f)) {
+					vc.froxelSlices = (UInt32)(slices + 0.5f);
+					changed = true;
+				}
+			}
 			changed |= debugUI.sliderFloat("Fog Density", &vc.density, 0.0f, 0.2f);
 			changed |= debugUI.sliderFloat("Fog Height Scale", &vc.heightScale, 1.0f, 60.0f);
 			changed |= debugUI.sliderFloat("Fog Base Height", &vc.baseHeight, -40.0f, 40.0f);
@@ -1133,19 +1178,47 @@ HALT
 			changed |= debugUI.sliderFloat("Fog Distance", &vc.maxDistance, 10.0f, 400.0f);
 			changed |= debugUI.sliderFloat("Fog Sun", &vc.sunScattering, 0.0f, 4.0f);
 			changed |= debugUI.sliderFloat("Fog Ambient", &vc.ambientScattering, 0.0f, 2.0f);
+			// Local light shadows: screen-space occlusion along the ray towards the light, so a
+			// wall between the light and the fog cuts the halo.
+			if (debugUI.checkbox("Fog Light Shadows", &vc.localLightShadows)) changed = true;
+			{
+				float ls = (float)vc.localShadowSteps;
+				if (debugUI.sliderFloat("Fog Light Shadow Steps", &ls, 1.0f, 8.0f)) {
+					vc.localShadowSteps = (UInt32)(ls + 0.5f);
+					changed = true;
+				}
+			}
 			float stepsF = (float)vc.steps;
 			if (debugUI.sliderFloat("Fog Steps", &stepsF, 4.0f, 96.0f)) { vc.steps = (UInt32)(stepsF + 0.5f); changed = true; }
 			if (debugUI.checkbox("Fog Sun Shafts", &vc.sunShafts)) changed = true;
+			// Temporal accumulation (shared by both backends) and the adaptive-quality governor.
+			if (debugUI.checkbox("Fog Temporal Accum", &vc.temporal)) changed = true;
+			changed |= debugUI.sliderFloat("Fog History Weight", &vc.temporalWeight, 0.0f, 0.98f);
+			if (debugUI.checkbox("Fog Adaptive Quality", &vc.adaptiveQuality)) changed = true;
+			changed |= debugUI.sliderFloat("Fog Target ms", &vc.targetMs, 0.2f, 4.0f);
+			// Medium detail: a scrolling 3D noise field breaking up the shafts.
+			changed |= debugUI.sliderFloat("Fog Noise", &vc.noiseStrength, 0.0f, 1.0f);
+			changed |= debugUI.sliderFloat("Fog Noise Scale", &vc.noiseScale, 0.01f, 0.4f);
+			changed |= debugUI.sliderFloat("Fog Noise Speed", &vc.noiseSpeed, 0.0f, 2.0f);
+			// Debug views: 0 = lit scene, 1 = in-scattering, 2 = transmittance, 3 = both.
+			{
+				static const char* kFogDebugNames[] = { "Off", "In-Scattering", "Transmittance", "Both" };
+				if (debugUI.button(fmt::format("Fog Debug View: {}", kFogDebugNames[vc.debugMode % 4]).c_str())) {
+					vc.debugMode = (vc.debugMode + 1) % 4;
+					changed = true;
+				}
+			}
 			if (debugUI.button("Reset fog")) {
 				vc = VolumetricConfig{}; vc.enabled = true;
 				changed = true;
 			}
 			if (changed) volumetric.setConfig(vc);
 			if (vc.enabled) {
+				debugUI.text("Fog backend: {}", volumetric.backendName());
 				// The state that decides whether the pass can run at all: a missing depth SRV
 				// or shadow map is the common cause of "nothing happens", and both are silent.
-				debugUI.text("Fog: {:.2f} ms | depth {} | shadow {} | target {} | msaa {}",
-					volumetric.lastRenderMs(),
+				debugUI.text("Fog: {:.2f} ms (mean {:.2f}, quality {:.2f}) | depth {} | shadow {} | target {} | msaa {}",
+					volumetric.lastRenderMs(), volumetric.averageRenderMs(), volumetric.qualityScale(),
 					renderer.getDepthSRV() ? "ok" : "MISSING",
 					renderer.getShadowSRV() ? "ok" : "MISSING",
 					volumetric.getScatteringSRV() ? "ok" : "MISSING",
@@ -1324,6 +1397,37 @@ HALT
 			}
 			debugUI.endWindow();
 		}
+
+		debugUI.beginWindow("Light Test");
+		// ---- Local test light -------------------------------------------------
+		// A point light (switchable to a spot) next to the wall, with its own marker cube. It
+		// exists so the fog's local-light scattering has something to show: the sun alone
+		// cannot produce a light's halo in the volume.
+		{
+			bool changed = false;
+			if (debugUI.checkbox("Test Light Enabled", &testLightEnabled)) changed = true;
+			if (debugUI.checkbox("Test Light Spot", &testLightSpot)) changed = true;
+			if (debugUI.checkbox("Test Light Orbit", &testLightOrbit)) changed = true;
+			changed |= debugUI.sliderFloat("Light Intensity", &testLightIntensity, 0.0f, 60.0f);
+			changed |= debugUI.sliderFloat("Light Range", &testLightRange, 1.0f, 60.0f);
+			changed |= debugUI.sliderFloat("Spot Outer Angle (deg)", &testLightCone, 5.0f, 80.0f);
+			if (!testLightOrbit) {
+				changed |= debugUI.sliderFloat("Light X", &testLightPos.x, -40.0f, 60.0f);
+				changed |= debugUI.sliderFloat("Light Y", &testLightPos.y, -30.0f, 30.0f);
+				changed |= debugUI.sliderFloat("Light Z", &testLightPos.z, -40.0f, 60.0f);
+			}
+			changed |= debugUI.sliderFloat("Light Color R", &testLightColor.x, 0.0f, 1.0f);
+			changed |= debugUI.sliderFloat("Light Color G", &testLightColor.y, 0.0f, 1.0f);
+			changed |= debugUI.sliderFloat("Light Color B", &testLightColor.z, 0.0f, 1.0f);
+			if (debugUI.button("Reset test light")) {
+				testLightEnabled = true; testLightSpot = false; testLightOrbit = true;
+				testLightIntensity = 12.0f; testLightRange = 20.0f; testLightCone = 25.0f;
+				testLightColor = Vec3(1.0f, 0.55f, 0.18f);
+				changed = true;
+			}
+			(void)changed; // applied every frame from the state below
+		}
+		debugUI.endWindow();
 
 		debugUI.beginWindow("Game Settings");
 		{
@@ -1608,6 +1712,28 @@ HALT
 			renderer.updateLight(sunHandle, ld);
 		}
 
+	// Test light: orbit it (default) or use the position the DebugUI set, then push the state
+	// into the light the renderer scatters.
+	{
+		if (testLightOrbit) {
+			const F32 t = (F32)gameTick * 0.6f;
+			testLightPos = Vec3(20.0f + cosf(t) * 6.0f, -16.0f, 20.0f + sinf(t) * 6.0f);
+		}
+		LightDesc tl = testLight;
+		tl.type = testLightSpot ? LightType::Spot : LightType::Point;
+		tl.pos = testLightPos;
+		tl.color = testLightColor;
+		tl.intensity = testLightEnabled ? testLightIntensity : 0.0f;
+		tl.range = testLightRange;
+		// testLightCone is the outer half-angle in degrees; the inner one is 65% of it, so the
+		// spotlight's soft edge keeps the ordering the shader expects (inner cos > outer cos).
+		tl.outerCone = cosf(glm::radians(testLightCone));
+		tl.innerCone = cosf(glm::radians(testLightCone * 0.65f));
+		tl.dir = glm::normalize(Vec3(0.25f, -1.0f, -0.25f));
+		if (testLightHandle.isValid()) renderer.updateLight(testLightHandle, tl);
+		testLight = tl;
+	}
+
 		fly.update(input, dt, &physicsBodies);
 		renderer.updateCamera(camHandle.value(), fly.toDesc(ww, wh));
 
@@ -1772,6 +1898,14 @@ HALT
 			if (emissiveCubeMesh.isValid()) {
 				SceneDraw d; d.kind = SceneDraw::Kind::Single; d.mesh = emissiveCubeMesh;
 				d.transform = emissiveCubeTf;
+	if (emissiveCubeMesh.isValid() && testLightEnabled) {
+		// Marker so the light has a visible position: a shrunken emissive cube, drawn with the
+		// same mesh (and therefore the same emissive material) as the scene's lamp.
+		SceneDraw d; d.kind = SceneDraw::Kind::Single; d.mesh = emissiveCubeMesh;
+		d.transform.position = testLightPos;
+		d.transform.scale = Vec3(0.25f);
+		frame.sceneDraws.push_back(std::move(d));
+	}
 				frame.sceneDraws.push_back(std::move(d));
 			}
 			if (!model.empty() && modelLoadCompleted.load(std::memory_order_acquire)) {

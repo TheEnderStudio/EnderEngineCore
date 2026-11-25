@@ -64,6 +64,16 @@ struct alignas(16) RayTraceConstants {
 	F32  reflectionHistoryTarget = 8.0f;
 	F32  reflectionMinRays = 0.35f;
 	F32  _padWrap2 = 0.0f; ///< Keep the constant buffer 16-byte aligned.
+	/**
+	 * @brief Fog parameters for the reflection path's aerial perspective.
+	 *
+	 * x = density, y = base height, z = height scale, w = the distance at which a ray that
+	 * misses everything is considered fully fogged. The reflected radiance is attenuated by
+	 * the analytic height-fog transmittance over the reflection segment, so a floor seen in a
+	 * mirror fades with distance exactly like the directly visible floor (the composite
+	 * handles the camera-to-surface segment; this is the surface-to-reflection one).
+	 */
+	Vec4 fogParams = Vec4(0.0f);
 };
 
 // The shader's cbuffer packs a float4 to a 16-byte boundary, so every Vec4 in the struct

@@ -40,11 +40,30 @@ $sources = @{
         @{ name = 'g_ComposeVS';        profile = 'vs_6_5' },
         @{ name = 'g_ComposePS';        profile = 'ps_6_5' }
     )
-    'Source/Engine/Rendering/VolumetricSubsystem.cpp' = @(
-        # The depth declaration is prepended per variant (single-sample / MSAA), so the
-        # script composes the same source the runtime does.
-        @{ name = 'g_VolumetricBody';   profile = 'cs_6_5'; prefix = 'g_DepthPrologueSingle' },
-        @{ name = 'g_VolumetricBody';   profile = 'cs_6_5'; prefix = 'g_DepthPrologueMsaa'; as = 'g_VolumetricBody_MSAA' }
+    # Both volumetric backends prepend a depth prologue per variant (single-sample / MSAA),
+    # so the script composes the same source the runtime does.
+    # Post-process shaders were previously only ever compiled at runtime by the backend.
+    'Source/Engine/PostProcess/PostProcessSubsystem.cpp' = @(
+        @{ name = 'g_FS_VS';     profile = 'vs_6_5' },
+        @{ name = 'g_ToneMapPS'; profile = 'ps_6_5' },
+        @{ name = 'g_BrightPS';  profile = 'ps_6_5' },
+        @{ name = 'g_BlurPS';    profile = 'ps_6_5' }
+    )
+    'Source/Engine/Rendering/VolumetricScreenSpace.cpp' = @(
+        @{ name = 'g_ScreenMarchBody';    profile = 'cs_6_5'; prefix = 'g_DepthPrologueSingle' },
+        @{ name = 'g_ScreenMarchBody';    profile = 'cs_6_5'; prefix = 'g_DepthPrologueMsaa'; as = 'g_ScreenMarchBody_MSAA' },
+        @{ name = 'g_ScreenUpsampleBody'; profile = 'cs_6_5'; prefix = 'g_DepthPrologueSingle'; as = 'g_ScreenUpsampleBody_SP' },
+        @{ name = 'g_ScreenUpsampleBody'; profile = 'cs_6_5'; prefix = 'g_DepthPrologueMsaa'; as = 'g_ScreenUpsampleBody_MSAA' }
+    )
+    'Source/Engine/Rendering/VolumetricTemporal.cpp' = @(
+        @{ name = 'g_ResolveBody'; profile = 'cs_6_5'; prefix = 'g_DepthPrologueSingle'; as = 'g_ResolveBody_SP' },
+        @{ name = 'g_ResolveBody'; profile = 'cs_6_5'; prefix = 'g_DepthPrologueMsaa'; as = 'g_ResolveBody_MSAA' }
+    )
+    'Source/Engine/Rendering/VolumetricFroxel.cpp' = @(
+        @{ name = 'g_FroxelInjectBody';    profile = 'cs_6_5'; prefixes = @('g_FroxelCommon', 'g_DepthPrologueSingle'); as = 'g_FroxelInject_SP' },
+        @{ name = 'g_FroxelInjectBody';    profile = 'cs_6_5'; prefixes = @('g_FroxelCommon', 'g_DepthPrologueMsaa'); as = 'g_FroxelInject_MSAA' },
+        @{ name = 'g_FroxelIntegrateBody'; profile = 'cs_6_5'; prefixes = @('g_FroxelCommon', 'g_DepthPrologueSingle'); as = 'g_FroxelIntegrate_SP' },
+        @{ name = 'g_FroxelIntegrateBody'; profile = 'cs_6_5'; prefixes = @('g_FroxelCommon', 'g_DepthPrologueMsaa'); as = 'g_FroxelIntegrate_MSAA' }
     )
     'Source/Engine/Rendering/RenderSubsystem.cpp' = @(
         @{ name = 'g_VS';               profile = 'vs_6_5' },
@@ -75,10 +94,12 @@ foreach ($rel in $sources.Keys) {
         $count++
         $m = [regex]::Match($src, 'static const char\* ' + $t.name + ' = R"\((?s)(.*?)\)";')
         if (-not $m.Success) { Write-Host ("MISSING  {0}" -f $t.name) -ForegroundColor Red; $fail++; continue }
+        # The shader body itself, then the prefixes are prepended in list order.
         $shaderText = $m.Groups[1].Value
-        if ($t.prefix) {
-            $pm = [regex]::Match($src, 'static const char\* ' + $t.prefix + ' = R"\((?s)(.*?)\)";')
-            if (-not $pm.Success) { Write-Host ("MISSING  {0}" -f $t.prefix) -ForegroundColor Red; $fail++; continue }
+        $prefixList = if ($t.prefixes) { $t.prefixes } elseif ($t.prefix) { @($t.prefix) } else { @() }
+        foreach ($pfx in $prefixList) {
+            $pm = [regex]::Match($src, 'static const char\* ' + $pfx + ' = R"\((?s)(.*?)\)";')
+            if (-not $pm.Success) { Write-Host ("MISSING  {0}" -f $pfx) -ForegroundColor Red; $fail++; continue }
             $shaderText = $pm.Groups[1].Value + $shaderText
         }
         $label = if ($t.as) { $t.as } else { $t.name }

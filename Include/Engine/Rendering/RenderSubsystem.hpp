@@ -328,6 +328,16 @@ public:
 	EE_NODISCARD Vec4 getAmbientLight() const;
 
 	/**
+	 * @brief Copies the lights as the shading paths receive them.
+	 *
+	 * The volumetric pass scatters them too, and it has to use the same descriptors - the
+	 * same falloff and cone, or a light's fog halo would not sit on top of its lit geometry.
+	 * @param out   Receives the light data (see LightData for the packed layout).
+	 * @param count Receives how many entries are valid.
+	 */
+	void getActiveLights(LightConstants& out, UInt32& count) const;
+
+	/**
 	 * @brief Direction and colour of the first directional light in the scene.
 	 *
 	 * Lets alternative geometry paths (the mesh shader pipeline) shade with the

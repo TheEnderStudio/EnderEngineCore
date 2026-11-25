@@ -240,6 +240,12 @@ struct ShadowConfig {
  * is what turns the shadow map into visible shafts.
  */
 struct VolumetricConfig {
+	/// @brief Which algorithm the fog runs (see Rendering::VolumetricSubsystem).
+	enum class Mode : UInt8 {
+		ScreenSpace = 0, ///< March each pixel's view ray (optionally at reduced resolution).
+		Froxel = 1,      ///< Fill a view-space 3D grid, then integrate per pixel column.
+	};
+
 	bool  enabled      = false;
 	F32   density      = 0.02f;   ///< Extinction at baseHeight (1 / world unit).
 	F32   baseHeight   = 0.0f;    ///< Height at which the medium has full density.
@@ -251,6 +257,55 @@ struct VolumetricConfig {
 	F32   ambientScattering = 0.25f; ///< Scale of the sky irradiance in-scattering.
 	bool  sunShafts    = true;    ///< Sample the shadow map per step (off = uniform fog).
 	F32   sunIntensity = 1.0f;    ///< Multiplied into the sun colour (set by the caller each frame).
+
+	// ---- algorithm selection, and the knobs only one of the two uses --------------
+	/// Default is the froxel volume: measured at roughly a third of the screen-space march's
+	/// cost in the Demo scene, and its integration pass does not grow with the march length.
+	Mode  mode = Mode::Froxel;
+	/// Fraction of the render resolution the screen-space march runs at (0.25..1). Its result
+	/// is upsampled with a depth-guided filter, so 0.5 halves the march cost per axis.
+	F32   renderScale = 0.5f;
+	/// Depth slices of the froxel volume. The injection pass costs
+	/// width * height * froxelSlices / 64 threads, the integration one thread per pixel.
+	UInt32 froxelSlices = 64;
+
+	// ---- local light shadows -------------------------------------------------------
+	/**
+	 * @brief Whether local lights are occluded by geometry.
+	 *
+	 * Implemented as a short ray march toward the light, projected into the scene depth
+	 * buffer (screen-space occlusion): it needs no per-light shadow map and works in both
+	 * render modes, but only occluders inside the view take part - a wall behind the camera
+	 * does not block the light. That is why the result is a soft factor, not a hard shadow.
+	 */
+	bool  localLightShadows = true;
+	/// Samples along the light ray per froxel (or per march step). 4 is enough for a halo
+	/// that stops at a silhouette; the cost is one depth fetch per sample.
+	UInt32 localShadowSteps = 4;
+
+	// ---- temporal accumulation and adaptive quality -------------------------------
+	/// Blend the reprojected previous frame into this one. The accumulation is shared by both
+	/// backends and averages banding (low step count) and the froxel grid's quantisation.
+	bool  temporal = true;
+	/// History weight: 0 disables the blend, 0.9 keeps a long average. A disocclusion (a
+	/// depth mismatch after reprojection) drops the history regardless of this value.
+	F32   temporalWeight = 0.9f;
+	/// Scale the step/slice counts to hold a frame-time target (see targetMs).
+	bool  adaptiveQuality = false;
+	/// Target GPU time of the scattering pass in milliseconds; 0 disables the governor.
+	F32   targetMs = 1.0f;
+
+	// ---- medium detail and debugging ----------------------------------------------
+	/// Break the medium up with a tileable 3D noise field, so shafts and cones get a natural
+	/// texture instead of being perfectly smooth volumes. 0 disables it.
+	F32   noiseStrength = 0.4f;
+	/// World-space frequency of the noise: larger values give smaller wisps.
+	F32   noiseScale = 0.08f;
+	/// How fast the noise scrolls, in world units per second (it drifts along +Y).
+	F32   noiseSpeed = 0.35f;
+	/// Debug view composited instead of the lit scene: 0 = off, 1 = in-scattering,
+	/// 2 = transmittance, 3 = both side by side.
+	UInt32 debugMode = 0;
 };
 
 /// @brief Result from loading a model, containing meshes, materials and root transform.

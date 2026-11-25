@@ -4,6 +4,7 @@
 #include <Rendering/Errors.hpp>
 #include <Rendering/RenderEvents.hpp>
 #include <Rendering/ShadowSubsystem.hpp>
+#include <Rendering/RenderSelfCheck.hpp>
 #include <Rendering/TangentSpace.hpp>
 #include <Resource/ResourcesManager.hpp>
 #include <Utilities/ImageLoader.hpp>
@@ -1221,6 +1222,8 @@ struct RenderSubsystem::RenderBackend {
 	D::RefCntAutoPtr<D::IBuffer> frameCB, lightCB, instanceCB, bboardVB, bboardIB;
 	UInt64 fn = 0; UInt32 dc = 0; bool ok = false; bool wireframe = false;
 	bool gBufferActive = false; ///< When true, draw()/drawInstanced() write the G-buffer instead of shaded color.
+	/// One-shot gate for the material binding self-check (EE_RENDER_SELF_CHECK).
+	bool selfCheckedMaterial = false;
 	UInt8 msaaSamples = 1;
 	// G-buffer MSAA resolve (compute pass, created lazily).
 	D::RefCntAutoPtr<D::IPipelineState> resolvePSO;
@@ -2058,7 +2061,10 @@ struct RenderSubsystem::RenderBackend {
 		auto* p = psos.get(po.index, po.generation); if (!p) return RenderError::InvalidHandle;
 		auto a = materials.allocate(); auto* dd = materials.getUnchecked(a.index); dd->desc = d; dd->pso = po;
 		{ D::BufferDesc bd; bd.Name = "ObjCB"; bd.Size = sizeof(ObjectConstants); bd.BindFlags = D::BIND_UNIFORM_BUFFER; bd.Usage = D::USAGE_DYNAMIC; bd.CPUAccessFlags = D::CPU_ACCESS_WRITE; device->CreateBuffer(bd, nullptr, &dd->objCB); }
-		auto bindSRB = [&](D::RefCntAutoPtr<D::IShaderResourceBinding>& srb, D::IPipelineState* pso, bool bindShadowDummy) {
+		// Startup self-check (EE_RENDER_SELF_CHECK): the per-material SRBs are where the t_AO bug
+	// lived - a map the shader declared, never listed as MUTABLE, so the Set() below found no
+	// variable and the texture was never bound. Checked once for the first material.
+	auto bindSRB = [&](D::RefCntAutoPtr<D::IShaderResourceBinding>& srb, D::IPipelineState* pso, bool bindShadowDummy) {
 			pso->CreateShaderResourceBinding(&srb, true);
 			if (!srb) return;
 			if (dd->objCB) {
@@ -2152,6 +2158,21 @@ static Vec4 objectMetallicRough(const MaterialDesc& d, bool useOrmAsAo, F32 aoOv
 			if (gBufferActive && mt) srb = mt->gbufSRB.RawPtr();
 			if (mt && srb) {
 				if (!gBufferActive) bindShadow(srb, shadowSRV ? shadowSRV : shadowDummy);
+				// Startup self-check (EE_RENDER_SELF_CHECK): once, right before the first draw - the
+				// point at which every variable of this SRB has been bound. Checking earlier (in mkMat)
+				// would flag g_ShadowMap here, which draw() only binds a few lines above this.
+				if (!selfCheckedMaterial && mt) {
+					selfCheckedMaterial = true;
+					// Shader handles come from the engine's own pipeline description: the backend's PSO
+					// does not expose the shaders it was built from.
+					void* materialShaders[2] = { nullptr, nullptr };
+					const auto* materialPso = psos.get(gBufferActive ? gbufPSO.index : mt->pso.index, gBufferActive ? gbufPSO.generation : mt->pso.generation);
+					if (materialPso) {
+						if (auto* vs = shaders.get(materialPso->desc.vs.index, materialPso->desc.vs.generation)) materialShaders[0] = vs->shader.RawPtr();
+						if (auto* ps = shaders.get(materialPso->desc.ps.index, materialPso->desc.ps.generation)) materialShaders[1] = ps->shader.RawPtr();
+						checkShaderBindings(gBufferActive ? "PBR G-buffer SRB" : "PBR material SRB", materialPso->pso, srb, materialShaders, 2);
+					}
+					}
 				ctx->CommitShaderResources(srb, D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 			}
 			D::DrawIndexedAttribs da; da.IndexType = D::VT_UINT32; da.NumIndices = s.indexCount; da.FirstIndexLocation = s.indexOffset; da.BaseVertex = (D::Uint32)s.vertexOffset; da.Flags = D::DRAW_FLAG_VERIFY_ALL;
@@ -3241,6 +3262,12 @@ Result<void, RenderError> RenderSubsystem::resolveGBufferMSAA(void* colorSRV, vo
 }
 
 TextureDSV RenderSubsystem::getDepthStencil() const { return m_backend->dsv.RawPtr(); }
+
+void RenderSubsystem::getActiveLights(LightConstants& out, UInt32& count) const {
+	auto& b = *m_backend;
+	out = b.lcBuf;
+	count = static_cast<UInt32>(std::min<size_t>(b.activeLights.size(), MaxLights));
+}
 TextureSRV RenderSubsystem::getDepthSRV() const {
 	auto& b = *m_backend;
 	// Cached at creation: asking the texture for a view every frame was both wasteful and,

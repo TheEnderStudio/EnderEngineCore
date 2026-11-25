@@ -1,4 +1,5 @@
 #include <PostProcess/PostProcessSubsystem.hpp>
+#include <Rendering/RenderSelfCheck.hpp>
 #include <Core/Log.hpp>
 
 #include <DiligentCore/Graphics/GraphicsEngine/interface/RenderDevice.h>
@@ -38,6 +39,13 @@ float4 main(PSIn i) : SV_TARGET {
     float3 scene = g_HDR.Sample(g_HDR_sampler,i.UV).rgb*g_Exp;
     if (g_FogParams.x > 0.5) {
         const float4 fog = g_Fog.Sample(g_HDR_sampler, i.UV);
+        // Debug views (VolumetricConfig::debugMode): replace the image with the medium's own
+        // terms and skip the tone curve, so they can be read as linear values.
+        if (g_FogParams.y > 0.5) {
+            if (g_FogParams.y < 1.5) return float4(fog.rgb, 1.0);              // in-scattering
+            if (g_FogParams.y < 2.5) return float4(fog.a, fog.a, fog.a, 1.0);  // transmittance
+            return float4(fog.rgb * 0.5 + fog.a, 1.0);                         // both, tinted
+        }
         scene = scene * fog.a + fog.rgb;
     }
     float3 c = scene + g_Bloom.Sample(g_HDR_sampler,i.UV).rgb*g_BloomI;
@@ -86,10 +94,16 @@ struct PostProcessSubsystem::Impl {
 
 	D::RefCntAutoPtr<D::IPipelineState> psoTM, psoBright, psoBlur;
 	D::RefCntAutoPtr<D::IShaderResourceBinding> srbTM, srbBright, srbBlur;
+	/// Kept for the startup binding check (EE_RENDER_SELF_CHECK): it enumerates the shaders'
+	/// resource lists and compares them with what the SRBs actually hold.
+	D::RefCntAutoPtr<D::IShader> shaderVS, shaderTM, shaderBright, shaderBlur;
+	bool selfChecked = false;
 	D::RefCntAutoPtr<D::IBuffer>        cbTM, cbBloom, cbBlur;
 	/// Volumetric scattering input for the composite (rgb = in-scattering, a = transmittance).
 	D::ITextureView* fogSRV = nullptr;
 	bool fogEnabled = false;
+	/// VolumetricConfig::debugMode, uploaded to the composite (0 = composite normally).
+	UInt32 fogDebugMode = 0;
 
 	UInt32 w=0, h=0; PostProcessConfig cfg; bool ok=false;
 
@@ -116,9 +130,11 @@ struct PostProcessSubsystem::Impl {
 
 	void createAllPSOs() {
 		auto vs = mkShader(g_FS_VS, D::SHADER_TYPE_VERTEX, "FS_VS");
+	shaderVS = vs;
 		{	const char* psSrc = cfg.customShader.empty() ? g_ToneMapPS : cfg.customShader.c_str();
 		const char* psName = cfg.customShader.empty() ? "ToneMapPS" : "CustomPS";
 		auto ps = mkShader(psSrc, D::SHADER_TYPE_PIXEL, psName);
+		shaderTM = ps;
 			// Every per-frame texture has to be listed MUTABLE: the layout's default is STATIC
 		// (basePSO), and a STATIC variable is owned by the PSO, so GetVariableByName() does
 		// not return it and the Set() in execute() silently does nothing - Diligent then
@@ -291,17 +307,31 @@ void PostProcessSubsystem::execute() {
 		if (pv) pv->Set(p.resSRV, D::SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	}
 
+	// Startup self-check (EE_RENDER_SELF_CHECK): after the first full binding pass, verify that
+	// every resource the tone-mapping shader declares is actually bound. This is the check
+	// that would have caught g_Fog being absent from the resource layout - the failure mode
+	// was a stream of Diligent errors per draw and no fog, with nothing pointing at the cause.
+	if (!p.selfChecked) {
+		p.selfChecked = true;
+		// The shaders are passed as opaque handles: the self-check header does not expose the
+		// backend types.
+		void* shaders[] = { p.shaderVS.RawPtr(), p.shaderTM.RawPtr() };
+		Rendering::checkShaderBindings("ToneMapPSO", p.psoTM.RawPtr(), p.srbTM.RawPtr(), shaders, 2);
+		Rendering::checkResourceAvailable("post-process", "HDR colour SRV", p.hdrSRV.RawPtr());
+	}
+
 	p.exeBloom();
 	{ void*m=nullptr; p.ctx->MapBuffer(p.cbTM,D::MAP_WRITE,D::MAP_FLAG_DISCARD,m);
-		if(m){float b[16]={(float)(UInt32)p.cfg.toneMap.mode,p.cfg.toneMap.exposure,p.cfg.toneMap.gamma,p.cfg.toneMap.vignette,p.cfg.toneMap.saturation,p.cfg.toneMap.contrast,p.cfg.bloom.intensity,p.cfg.bloom.threshold,p.cfg.bloom.radius,0,0,0,(p.fogEnabled?1.0f:0.0f),0,0,0}; memcpy(m,b,64); p.ctx->UnmapBuffer(p.cbTM,D::MAP_WRITE);} }
+		if(m){float b[16]={(float)(UInt32)p.cfg.toneMap.mode,p.cfg.toneMap.exposure,p.cfg.toneMap.gamma,p.cfg.toneMap.vignette,p.cfg.toneMap.saturation,p.cfg.toneMap.contrast,p.cfg.bloom.intensity,p.cfg.bloom.threshold,p.cfg.bloom.radius,0,0,0,(p.fogEnabled?1.0f:0.0f),(float)p.fogDebugMode,0,0}; memcpy(m,b,64); p.ctx->UnmapBuffer(p.cbTM,D::MAP_WRITE);} }
 	p.ctx->SetRenderTargets(1,&rtvP,nullptr,D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	p.ctx->SetPipelineState(p.psoTM); p.ctx->CommitShaderResources(p.srbTM,D::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	D::DrawAttribs da; da.NumVertices=3; da.Flags=D::DRAW_FLAG_VERIFY_ALL; p.ctx->Draw(da);
 }
 
-void PostProcessSubsystem::setFogInput(void* scatteringSRV, bool enabled) {
+void PostProcessSubsystem::setFogInput(void* scatteringSRV, bool enabled, UInt32 debugMode) {
 	m_impl->fogSRV = enabled ? static_cast<D::ITextureView*>(scatteringSRV) : nullptr;
 	m_impl->fogEnabled = enabled && scatteringSRV != nullptr;
+	m_impl->fogDebugMode = enabled ? debugMode : 0u;
 }
 
 void PostProcessSubsystem::present() {
